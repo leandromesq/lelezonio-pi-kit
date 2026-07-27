@@ -9,6 +9,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 - Fixed-bottom editor with a compact custom dashboard and color-coded thinking level
 - GitHub Dark Default theme
 - Named Pi/Codex subagent profiles with configurable models and thinking effort
+- Fast Codex CLI account saving and switching with `/codex`
 - Multi-agent workflows with phased and parallel execution
 - Background terminals for servers, watchers, and long-running commands
 - First-class `fd` and `rg` tools
@@ -24,6 +25,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 | `ask-user`             | Interactive multiple-choice questions with a free-form option               |
 | `background-terminals` | Background process tools and the `/ps` dashboard                            |
 | `copy-all`             | `/copy-all` conversation export                                             |
+| `codex-accounts`       | Save and switch Codex CLI accounts with `/codex`                            |
 | `file-search`          | Typed `fd` and `rg` model tools                                             |
 | `git-info`             | Branch/PR dashboard state, `/lg`, and `/pr`                                 |
 | `git-pr`               | `/yeet` and guarded `/git <target-branch>` workflows                        |
@@ -62,6 +64,15 @@ Profiles live in [`subagents.json`](subagents.json):
 Explicit spawn fields override profile values. Profile values override per-harness defaults. The concurrency cap is also configured in this file.
 
 These model names reflect my accounts and preferences. Replace them with models available from `pi --list-models` and your Codex CLI installation.
+
+Save the Codex CLI account that is currently authenticated, then repeat after logging into each account you use:
+
+```text
+/codex save personal
+/codex save work
+```
+
+Run `/codex` to select an account. The switch updates Codex CLI credentials for new Codex processes, including future Codex subagents. Saved credentials remain private under `~/.codex/accounts/` (or `$CODEX_HOME/accounts/`).
 
 ## Git workflows
 

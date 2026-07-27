@@ -105,6 +105,18 @@ pi --list-models
 
 Reload Pi after editing the configuration.
 
+### Codex account switching
+
+Authenticate Codex CLI normally, then save the current credentials with a portable account name:
+
+```text
+/codex save personal
+```
+
+Repeat after authenticating other Codex accounts. Run `/codex` to choose a saved account. The selected credentials apply to new Codex CLI processes and future Codex subagents; already-running processes are unchanged.
+
+Credential snapshots are stored under `~/.codex/accounts/`, or under `$CODEX_HOME/accounts/` when `CODEX_HOME` is set. They contain secrets and must not be committed or shared.
+
 ## `fd` and `rg`
 
 The file-search extension registers `fd` and `rg` as model tools. At startup it prefers system-installed binaries, then existing fallback binaries under `~/.pi/agent/bin/`. When neither exists, it can download official release binaries on supported platforms.
