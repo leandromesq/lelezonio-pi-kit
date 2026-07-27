@@ -1,9 +1,8 @@
 /**
  * End-to-end smoke tests: manager behavior through a real ManagedRuntime,
- * exactly as the tool handlers drive it. The registry is test-only: scripted
- * stub sessions registered under the claude/codex names (the production
- * backends launch real processes and have their own live test files), plus
- * the real pi backend for its cheap registry precondition.
+ * exactly as the tool handlers drive it. The registry is test-only: a
+ * scripted Codex session (the production backend launches a real process),
+ * plus the real Pi backend for its cheap registry precondition.
  */
 
 import assert from "node:assert/strict";
@@ -14,8 +13,8 @@ import { piBackend } from "./src/backends/pi.ts";
 import { makeStubBackend } from "./src/backends/stub.ts";
 import type { BackendName, ParentContext, SpawnTask } from "./src/domain.ts";
 import {
+  makeSubagentManagerLayer,
   SubagentManager,
-  SubagentManagerLive,
   type SubagentManagerShape,
 } from "./src/manager.ts";
 import { runTool } from "./src/runtime.ts";
@@ -23,13 +22,6 @@ import { runTool } from "./src/runtime.ts";
 const TestRegistryLive = Layer.sync(BackendRegistry, () => {
   const backends: SubagentBackend[] = [
     piBackend,
-    makeStubBackend({
-      backend: "claude",
-      defaultModelLabel: "claude/sonnet",
-      contextWindow: 200_000,
-      toolName: "Bash",
-      cadenceMs: 40,
-    }),
     makeStubBackend({
       backend: "codex",
       defaultModelLabel: "codex/gpt-5-codex",
@@ -43,9 +35,9 @@ const TestRegistryLive = Layer.sync(BackendRegistry, () => {
   );
 });
 
-const createTestRuntime = () =>
+const createTestRuntime = (maxRunning = 4) =>
   ManagedRuntime.make(
-    SubagentManagerLive.pipe(Layer.provide(TestRegistryLive)),
+    makeSubagentManagerLayer(maxRunning).pipe(Layer.provide(TestRegistryLive)),
   );
 
 const parent: ParentContext = {
@@ -62,8 +54,9 @@ async function withManager(
     manager: SubagentManagerShape,
     runtime: ReturnType<typeof createTestRuntime>,
   ) => Promise<void>,
+  maxRunning = 4,
 ) {
-  const runtime = createTestRuntime();
+  const runtime = createTestRuntime(maxRunning);
   try {
     const manager = await runtime.runPromise(SubagentManager);
     await run(manager, runtime);
@@ -81,10 +74,10 @@ test("stub subagent completes and delivers a final result", async () => {
 
     const snap = await runTool(
       runtime,
-      manager.spawn("claude", task("Say hello to the tests")),
+      manager.spawn("codex", task("Say hello to the tests")),
     );
     assert.equal(snap.status, "running");
-    assert.equal(snap.backend, "claude");
+    assert.equal(snap.backend, "codex");
     assert.ok(snap.meta.sessionFilePath);
 
     await runTool(runtime, manager.waitFor([snap.id]));
@@ -93,7 +86,7 @@ test("stub subagent completes and delivers a final result", async () => {
     assert.equal(done.status, "done");
     assert.match(
       done.finalText,
-      /\[stub:claude\] completed: Say hello to the tests/,
+      /\[stub:codex\] completed: Say hello to the tests/,
     );
     assert.ok(done.turns >= 2);
     assert.ok(done.transcript.some((item) => item.kind === "toolResult"));
@@ -128,7 +121,7 @@ test("cancel interrupts a running stub subagent", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
       runtime,
-      manager.spawn("claude", task("Long running task")),
+      manager.spawn("codex", task("Long running task")),
     );
     const report = await runTool(runtime, manager.cancel([snap.id]));
     assert.deepEqual(report, [
@@ -151,7 +144,7 @@ test("spawn origin propagates to ids, snapshots, and settlement", async () => {
     );
     const btw = await runTool(
       runtime,
-      manager.spawn("claude", { ...task("side question"), origin: "btw" }),
+      manager.spawn("codex", { ...task("side question"), origin: "btw" }),
     );
 
     assert.match(model.id, /^sa-/);
@@ -198,6 +191,17 @@ test("the global concurrency cap includes by-the-way sessions", async () => {
   });
 });
 
+test("a configured concurrency cap limits running subagents", async () => {
+  await withManager(async (manager, runtime) => {
+    await runTool(runtime, manager.spawn("codex", task("Task 1")));
+    await runTool(runtime, manager.spawn("codex", task("Task 2")));
+    await assert.rejects(
+      runTool(runtime, manager.spawn("codex", task("Task 3"))),
+      /Max 2 subagents/,
+    );
+  }, 2);
+});
+
 test("the concurrency cap rejects a fifth running subagent", async () => {
   await withManager(async (manager, runtime) => {
     const spawns = await runTool(
@@ -233,7 +237,7 @@ test("idle restarts respect the concurrency cap", async () => {
     // Settle one subagent, then fill all four slots with running ones.
     const settled = await runTool(
       runtime,
-      manager.spawn("claude", task("early finisher")),
+      manager.spawn("codex", task("early finisher")),
     );
     await runTool(runtime, manager.waitFor([settled.id]));
     await runTool(
@@ -257,7 +261,7 @@ test("send steers an idle subagent into another turn", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
       runtime,
-      manager.spawn("claude", task("First turn")),
+      manager.spawn("codex", task("First turn")),
     );
     await runTool(runtime, manager.waitFor([snap.id]));
     const afterFirst = manager.view.get(snap.id);

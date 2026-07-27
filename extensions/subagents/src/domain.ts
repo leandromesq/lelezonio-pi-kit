@@ -2,15 +2,15 @@
  * Domain model for subagents.
  *
  * Everything downstream of a backend (manager, tools, UI) speaks only these
- * types. Backends translate their native streams (pi session events, Claude
- * Agent SDK messages, Codex app-server JSON-RPC notifications) into the
- * normalized `SubagentEvent` union.
+ * types. Backends translate their native streams (pi session events and
+ * Codex app-server JSON-RPC notifications) into the normalized
+ * `SubagentEvent` union.
  */
 
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { Data } from "effect";
 
-export const BACKEND_NAMES = ["pi", "claude", "codex"] as const;
+export const BACKEND_NAMES = ["pi", "codex"] as const;
 export type BackendName = (typeof BACKEND_NAMES)[number];
 
 /** Who initiated the session. User asides stay out of model-facing tooling. */
@@ -18,9 +18,9 @@ export type SubagentOrigin = "model" | "btw";
 
 /**
  * Shared reasoning-effort scale (pi's thinking levels). Each backend maps a
- * value to its nearest native equivalent: pi uses it directly, codex
- * translates to its reasoning-effort slugs, claude translates to thinking
- * budgets. Omitted = backend default (pi inherits the parent level).
+ * value to its nearest native equivalent: pi uses it directly and codex
+ * translates to its reasoning-effort slugs. Omitted = backend default
+ * (pi inherits the parent level).
  */
 export const REASONING_EFFORTS = [
   "off",
@@ -54,8 +54,8 @@ export interface SpawnTask {
   readonly cwd: string;
   /**
    * Generic model hint, interpreted per backend:
-   * pi: "provider/model-id" or bare model id; claude: model alias;
-   * codex: model slug. Omitted = backend default / inherit.
+   * pi: "provider/model-id" or bare model id; codex: model slug.
+   * Omitted = backend default / inherit.
    */
   readonly model?: string;
   /** Shared effort scale; each backend maps it to its native equivalent. */
@@ -65,13 +65,13 @@ export interface SpawnTask {
 
 export interface SubagentMeta {
   readonly backend: BackendName;
-  /** Display label, e.g. "anthropic/claude-opus-4-5" or "gpt-5-codex". */
+  /** Display label, e.g. "openai-codex/gpt-5.6-sol" or "gpt-5-codex". */
   readonly modelLabel?: string;
   /** Context window capacity for utilization display, when known. */
   readonly contextWindow?: number;
-  /** pi session file / Claude projects JSONL / Codex rollout path. */
+  /** Pi session file or Codex rollout path. */
   readonly sessionFilePath?: string;
-  /** Claude session id / Codex conversation id. */
+  /** Native Pi session id or Codex conversation id. */
   readonly nativeSessionId?: string;
 }
 

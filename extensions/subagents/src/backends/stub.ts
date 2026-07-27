@@ -1,6 +1,6 @@
 /**
- * Scripted stub sessions shared by all three backend implementations while
- * the real integrations are pending. A stub session:
+ * Scripted stub sessions used by backend-independent manager tests. A stub
+ * session:
  *
  * - streams a plausible turn (thinking deltas, one fake tool cycle, text
  *   deltas, usage ramp, a final assistant message, RunSettled) over a few
@@ -48,7 +48,7 @@ export function makeStubBackend(profile: StubProfile): SubagentBackend {
       modelSelection: true,
       reasoningEffort: true,
     },
-    // Real impls probe binary-on-PATH / SDK import / credentials here.
+    // Real implementations probe their runtime and credentials here.
     available: Effect.succeed(true),
     spawn: (task) => makeStubSession(profile, task),
   };

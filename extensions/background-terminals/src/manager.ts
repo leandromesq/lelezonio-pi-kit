@@ -171,9 +171,17 @@ export class TerminalManager extends Context.Service<
 function shellInvocation(command: string) {
   if (process.platform === "win32") {
     const shell = process.env.ComSpec ?? "cmd.exe";
-    return { shell, args: ["/d", "/s", "/c", command] };
+    return {
+      shell,
+      args: ["/d", "/s", "/c", `"${command}"`],
+      windowsVerbatimArguments: true,
+    };
   }
-  return { shell: "/bin/sh", args: ["-c", command] };
+  return {
+    shell: "/bin/sh",
+    args: ["-c", command],
+    windowsVerbatimArguments: false,
+  };
 }
 
 /** Signal the whole process group on POSIX so descendants (servers a shell
@@ -551,7 +559,9 @@ const makeManager = Effect.gen(function* () {
       );
 
       const doStart = Effect.gen(function* () {
-        const { shell, args } = shellInvocation(options.command);
+        const { shell, args, windowsVerbatimArguments } = shellInvocation(
+          options.command,
+        );
         const child = yield* Effect.try({
           try: () =>
             spawn(shell, args, {
@@ -562,6 +572,7 @@ const makeManager = Effect.gen(function* () {
               stdio: ["ignore", "pipe", "pipe"],
               // Own process group on POSIX → group kill takes the whole tree.
               detached: process.platform !== "win32",
+              windowsVerbatimArguments,
             }),
           catch: (error) => new SpawnError({ message: boundedError(error) }),
         });

@@ -1,6 +1,6 @@
 /**
- * Subagents — spawn background subagents on one of three backends
- * (pi, Claude Code, Codex) unified behind a single Effect service interface.
+ * Subagents — spawn background subagents on Pi or Codex, unified behind a
+ * single Effect service interface.
  *
  * Tools (for the parent LLM):
  * - subagent_spawn: fire-and-forget spawn (prompt, title, agent, working_dir,
@@ -15,9 +15,9 @@
  *
  * Architecture: Effect v4 generators throughout (backends -> manager ->
  * runtime); this file is the async boundary where tool handlers run effects
- * against one shared ManagedRuntime. All three backends are real: pi runs
- * in-process SDK sessions, claude drives the Claude Agent SDK, codex speaks
- * JSON-RPC to a scoped `codex app-server` process.
+ * against one shared ManagedRuntime. Both backends are real: Pi runs
+ * in-process SDK sessions and Codex speaks JSON-RPC to a scoped
+ * `codex app-server` process.
  */
 
 import * as fs from "node:fs";
@@ -41,6 +41,7 @@ import {
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { deriveBtwTitle, isModelVisible } from "./src/by-the-way.ts";
+import { loadSubagentsConfig, resolveSpawnOptions } from "./src/config.ts";
 import {
   BACKEND_NAMES,
   formatElapsed,
@@ -138,6 +139,12 @@ function resolveChildProjectTrust(options: {
 }
 
 export default function (pi: ExtensionAPI) {
+  const subagentConfig = loadSubagentsConfig(
+    path.join(getAgentDir(), "subagents.json"),
+  );
+  const profileNames = Object.keys(subagentConfig.profiles);
+  const profileSummary =
+    profileNames.length > 0 ? profileNames.join(", ") : "none";
   let runtime: SubagentRuntime | undefined;
   let managerPromise: Promise<SubagentManagerShape> | undefined;
   let sessionContext: ExtensionContext | undefined;
@@ -145,7 +152,10 @@ export default function (pi: ExtensionAPI) {
   let unsubStatus: (() => void) | undefined;
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
 
-  const getRuntime = () => (runtime ??= createSubagentRuntime());
+  const getRuntime = () =>
+    (runtime ??= createSubagentRuntime({
+      maxRunning: subagentConfig.maxConcurrent,
+    }));
 
   /** Resolve the manager service once per runtime and wire the extension hooks. */
   const getManager = () => {
@@ -267,9 +277,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_spawn",
     label: "Spawn Subagent",
-    description: SUBAGENT_SPAWN_TOOL_DESCRIPTION,
+    description: `${SUBAGENT_SPAWN_TOOL_DESCRIPTION} Configured profiles: ${profileSummary}. Maximum concurrent runs: ${subagentConfig.maxConcurrent}.`,
     promptSnippet: SUBAGENT_SPAWN_PROMPT_SNIPPET,
-    promptGuidelines: SUBAGENT_SPAWN_PROMPT_GUIDELINES,
+    promptGuidelines: [
+      ...SUBAGENT_SPAWN_PROMPT_GUIDELINES,
+      `Prefer a configured profile when it matches the task. Available profiles: ${profileSummary}.`,
+    ],
     parameters: Type.Object({
       prompt: Type.String({
         description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.prompt,
@@ -277,9 +290,16 @@ export default function (pi: ExtensionAPI) {
       name: Type.String({
         description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.name,
       }),
-      harness: StringEnum(BACKEND_NAMES, {
-        description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.harness,
-      }),
+      profile: Type.Optional(
+        Type.String({
+          description: `${SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.profile} Available: ${profileSummary}.`,
+        }),
+      ),
+      harness: Type.Optional(
+        StringEnum(BACKEND_NAMES, {
+          description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.harness,
+        }),
+      ),
       working_dir: Type.Optional(
         Type.String({
           description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.workingDir,
@@ -298,7 +318,13 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const manager = await getManager();
-      const harness = params.harness;
+      const resolved = resolveSpawnOptions(subagentConfig, {
+        profile: params.profile,
+        harness: params.harness,
+        model: params.model,
+        reasoningEffort: params.reasoning_effort,
+      });
+      const harness = resolved.harness;
 
       const cwd = path.resolve(ctx.cwd, params.working_dir ?? ".");
       if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
@@ -312,8 +338,8 @@ export default function (pi: ExtensionAPI) {
           prompt: params.prompt,
           title,
           cwd,
-          model: params.model,
-          reasoningEffort: params.reasoning_effort,
+          model: resolved.model,
+          reasoningEffort: resolved.reasoningEffort,
           parent: {
             parentCwd: ctx.cwd,
             projectTrusted: resolveChildProjectTrust({
@@ -348,6 +374,7 @@ export default function (pi: ExtensionAPI) {
           id: snap.id,
           title: snap.title,
           cwd,
+          profile: resolved.profile,
           harness,
           model: snap.meta.modelLabel,
         },

@@ -1,0 +1,31 @@
+{
+  "defaultHarness": "pi",
+  "maxConcurrent": 3,
+  "harnesses": {
+    "pi": {
+      "model": "opencode-go/kimi-k3",
+      "thinking": "max"
+    },
+    "codex": {
+      "model": "gpt-5.6-sol",
+      "thinking": "high"
+    }
+  },
+  "profiles": {
+    "planner": {
+      "harness": "codex",
+      "model": "gpt-5.6-sol",
+      "thinking": "high"
+    },
+    "coder": {
+      "harness": "pi",
+      "model": "opencode-go/deepseek-v4-pro",
+      "thinking": "max"
+    },
+    "reviewer": {
+      "harness": "pi",
+      "model": "opencode-go/kimi-k3",
+      "thinking": "max"
+    }
+  }
+}

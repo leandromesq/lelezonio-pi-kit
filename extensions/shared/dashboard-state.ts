@@ -11,8 +11,6 @@ export interface ModelInfoState {
   contextWindow: number;
   contextPercent: number | null;
   cost: number;
-  tokensPerSecond: number | null;
-  generating: boolean;
 }
 
 export interface PullRequestInfo {
@@ -38,8 +36,6 @@ export function emptyModelInfoState(): ModelInfoState {
     contextWindow: 0,
     contextPercent: null,
     cost: 0,
-    tokensPerSecond: null,
-    generating: false,
   };
 }
 
@@ -71,9 +67,7 @@ export function isModelInfoState(value: unknown): value is ModelInfoState {
     isNullableNumber(value.contextTokens) &&
     typeof value.contextWindow === "number" &&
     isNullableNumber(value.contextPercent) &&
-    typeof value.cost === "number" &&
-    isNullableNumber(value.tokensPerSecond) &&
-    typeof value.generating === "boolean"
+    typeof value.cost === "number"
   );
 }
 

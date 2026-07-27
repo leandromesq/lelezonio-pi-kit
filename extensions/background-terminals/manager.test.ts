@@ -23,9 +23,10 @@ import { createTerminalRuntime, runTool } from "./src/runtime.ts";
 
 const cwd = process.cwd();
 
-/** Quote a `node -e` script for sh -c. */
+/** Encode a `node -e` script so the same command survives cmd.exe and sh. */
 function nodeCmd(script: string) {
-  return `node -e '${script}'`;
+  const encoded = Buffer.from(script).toString("base64");
+  return `node -e "eval(Buffer.from('${encoded}','base64').toString())"`;
 }
 
 async function withManager(
@@ -101,7 +102,6 @@ test("happy path: stdout and stderr captured separately, settles done, hook fire
     );
     assert.equal(snap.status, "running");
     assert.ok(snap.pid);
-    assert.equal(snap.command.includes("out-line"), true);
 
     const { snap: done } = await settlement(manager, snap.id);
     assert.equal(done.status, "done");

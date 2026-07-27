@@ -44,6 +44,12 @@ import {
 
 export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
+
+export const SubagentManagerOptions = Context.Reference<{
+  readonly maxRunning: number;
+}>("subagents/SubagentManagerOptions", {
+  defaultValue: () => ({ maxRunning: MAX_RUNNING }),
+});
 const STOP_TIMEOUT_MS = 5_000;
 const ERROR_TEXT_MAX_LENGTH = 4_096;
 const TRANSCRIPT_TEXT_MAX_LENGTH = 64 * 1_024;
@@ -176,6 +182,7 @@ export class SubagentManager extends Context.Service<
 
 const makeManager = Effect.gen(function* () {
   const registry = yield* BackendRegistry;
+  const { maxRunning } = yield* SubagentManagerOptions;
   // Detached forker for sync contexts (read-model commands, pruning) that
   // preserves the manager's services instead of using the global runtime.
   const runDetached = Effect.runForkWith(yield* Effect.context());
@@ -430,9 +437,9 @@ const makeManager = Effect.gen(function* () {
               message: "Subagent manager is shutting down.",
             });
           }
-          if (runningCount() + reserved >= MAX_RUNNING) {
+          if (runningCount() + reserved >= maxRunning) {
             return new ConcurrencyLimitError({
-              message: `Max ${MAX_RUNNING} subagents can run concurrently. Wait for one to finish before spawning another.`,
+              message: `Max ${maxRunning} subagents can run concurrently. Wait for one to finish before spawning another.`,
             });
           }
           reserved++;
@@ -633,9 +640,9 @@ const makeManager = Effect.gen(function* () {
       // must respect the same cap as spawn. Steering an already-running one
       // does not consume additional capacity.
       if (entry.snapshot.status !== "running") {
-        if (runningCount() + reserved >= MAX_RUNNING) {
+        if (runningCount() + reserved >= maxRunning) {
           return new SendError({
-            message: `Max ${MAX_RUNNING} subagents can run concurrently; restarting "${id}" would exceed that.`,
+            message: `Max ${maxRunning} subagents can run concurrently; restarting "${id}" would exceed that.`,
           });
         }
         // Occupy the slot synchronously: the RunStarted that flips status
@@ -734,3 +741,9 @@ export const SubagentManagerLive: Layer.Layer<
   never,
   BackendRegistry
 > = Layer.effect(SubagentManager, makeManager);
+
+export function makeSubagentManagerLayer(maxRunning = MAX_RUNNING) {
+  return SubagentManagerLive.pipe(
+    Layer.provide(Layer.succeed(SubagentManagerOptions, { maxRunning })),
+  );
+}
