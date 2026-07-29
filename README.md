@@ -12,6 +12,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 - Fast Codex CLI account saving and switching with `/codex`
 - Multi-agent workflows with phased and parallel execution
 - Background terminals for servers, watchers, and long-running commands
+- Persistent remote Pi agents over SSH and Herdr, with context handoff and reconnectable monitoring
 - First-class `fd` and `rg` tools
 - Git status, changed-file browser, PR information, `/yeet`, and guarded `/git <target-branch>` workflows
 - Multiple-choice `ask_user` tool
@@ -30,6 +31,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 | `git-info`             | Branch/PR dashboard state, `/lg`, and `/pr`                                 |
 | `git-pr`               | `/yeet` and guarded `/git <target-branch>` workflows                        |
 | `model-info`           | Model, thinking, context, and cost state for the dashboard                  |
+| `remote-agents`        | Persistent remote Pi jobs over SSH and Herdr with `/remote` and `/remotes`  |
 | `subagents`            | Headless Pi and Codex children, profiles, result delivery, and `/subagents` |
 | `summaries`            | Asynchronous post-run recaps and `/summary-model`                           |
 | `ui-customization`     | Startup logo, footer, thinking colors, and fixed-bottom editor              |
@@ -96,7 +98,9 @@ Individual extensions also expose focused `check` and `test` scripts.
 
 ## Configuration and private state
 
-The `.gitignore` excludes Pi runtime/private state, including authentication, settings, sessions, trust data, generated workflow artifacts, downloaded binaries, and private summary configuration. Never commit those files.
+The `.gitignore` excludes Pi runtime/private state, including authentication, settings, sessions, trust data, remote-agent job metadata, generated workflow artifacts, downloaded binaries, and private summary configuration. Never commit those files.
+
+Remote agents require an SSH-accessible host running Herdr. Copy `remote-agents.example.json` to `remote-agents.json`, then customize the SSH executable, helper path, and explicit local-to-remote project mappings. See [SETUP.md](SETUP.md#remote-agents) for details.
 
 ## Credits
 

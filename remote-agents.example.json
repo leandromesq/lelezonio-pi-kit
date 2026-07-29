@@ -1,0 +1,9 @@
+{
+  "host": "macmini",
+  "sshExecutable": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+  "remoteHelper": "/Users/leandrom/.local/share/pi-remote/helper.py",
+  "projectsRoot": "/Users/leandrom/Projects",
+  "worktreesRoot": "/Users/leandrom/Worktrees",
+  "pollIntervalMs": 3000,
+  "maxConcurrent": 3
+}

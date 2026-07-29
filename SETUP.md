@@ -15,6 +15,7 @@ Optional:
 
 - [Codex CLI](https://github.com/openai/codex) for Codex subagents
 - [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login` for `/git`
+- An SSH-accessible host running [Herdr](https://github.com/epilande/herdr) for persistent remote agents
 - System `fd` and `rg` binaries; the file-search extension can provision supported builds when they are missing
 
 ## Clean installation
@@ -116,6 +117,50 @@ Authenticate Codex CLI normally, then save the current credentials with a portab
 Repeat after authenticating other Codex accounts. Run `/codex` to choose a saved account. The selected credentials apply to new Codex CLI processes and future Codex subagents; already-running processes are unchanged.
 
 Credential snapshots are stored under `~/.codex/accounts/`, or under `$CODEX_HOME/accounts/` when `CODEX_HOME` is set. They contain secrets and must not be committed or shared.
+
+## Remote agents
+
+The `remote-agents` extension delegates persistent Pi jobs to a host running Herdr. Remote jobs survive local Pi shutdown, reload, and temporary network loss.
+
+Prerequisites:
+
+1. Configure an SSH host alias such as `macmini`.
+2. Ensure `ssh -o BatchMode=yes macmini true` succeeds without prompting. On Windows, load an encrypted key into the Windows OpenSSH agent.
+3. Install and start Herdr on the remote host.
+4. Ensure Herdr can launch Pi on the remote host.
+5. Create the local configuration:
+
+   ```sh
+   cp remote-agents.example.json remote-agents.json
+   ```
+
+Edit `remote-agents.json` for the machine being configured:
+
+```json
+{
+  "host": "macmini",
+  "sshExecutable": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+  "remoteHelper": "/Users/remote-user/.local/share/pi-remote/helper.py",
+  "projectsRoot": "/Users/remote-user/Projects",
+  "worktreesRoot": "/Users/remote-user/Worktrees",
+  "pollIntervalMs": 3000,
+  "maxConcurrent": 3
+}
+```
+
+Use `"sshExecutable": "ssh"` on systems where SSH is available through `PATH`. Local Git repositories resolve by repository name beneath `projectsRoot`, preserving the current subdirectory. When a project is absent, `/remote` asks before cloning its credential-free origin. Only one active remote writer is allowed per project. Non-Git sessions use `worktreesRoot`. The extension does not synchronize dirty Git state.
+
+The Python helper is uploaded automatically to `remoteHelper` through SSH. It requires Python 3 and invokes `/usr/local/bin/herdr` on the remote host.
+
+Commands:
+
+- `/remote <instructions>` starts a persistent remote job with a filtered, redacted parent-session context capsule.
+- `/remotes` opens the remote job dashboard; press `d` to close and forget an entry.
+- `/remote-clean` closes and forgets all settled stale workspaces.
+
+The model can use `remote_spawn`, `remote_check`, `remote_list`, `remote_send`, `remote_wait`, and `remote_cancel` when remote execution has been explicitly requested or approved. Blocked-agent questions are delivered to the parent session automatically and can be answered with `remote_send`.
+
+Runtime job metadata is stored under `remote-agents/` and the machine-specific `remote-agents.json` is intentionally ignored by Git.
 
 ## `fd` and `rg`
 

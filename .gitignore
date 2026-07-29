@@ -12,6 +12,8 @@ settings.json
 trust.json
 models.json
 models-store.json
+remote-agents.json
+/remote-agents/
 extensions/summaries/config.private.json
 extensions/summaries/config.private.json.*.tmp
 
@@ -25,6 +27,8 @@ extensions/summaries/config.private.json.*.tmp
 *.log
 *.tmp
 *.swp
+*.pyc
+__pycache__/
 .DS_Store
 
 # Local editor settings
