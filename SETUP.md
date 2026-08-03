@@ -17,6 +17,7 @@ Optional:
 - [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login` for `/git`
 - An SSH-accessible host running [Herdr](https://github.com/epilande/herdr) for persistent remote agents
 - System `fd` and `rg` binaries; the file-search extension can provision supported builds when they are missing
+- Python 3.11+ if you want the optional Hound web-research tools
 
 ## Clean installation
 
@@ -93,6 +94,47 @@ Copy any memory directories you intentionally use. Keep the backup until the new
 ```
 
 Merge any model, provider, retry, or keybinding preferences from your previous settings. Keep `packages` empty unless you deliberately want additional Pi packages alongside this repository.
+
+## Hound web research
+
+Hound is an optional local MCP service that adds `web_search`, `web_fetch`, `web_crawl`, and `web_screenshot` to Pi. It has two parts: the Pi extension and the Python engine. Install both; the commands below keep the engine isolated from system Python and install the extension globally rather than adding it to this repository's `packages` array.
+
+### Install on Linux or macOS
+
+```sh
+python3 -m venv ~/.local/share/hound-venv
+~/.local/share/hound-venv/bin/python -m pip install --upgrade "hound-mcp[all]"
+~/.local/share/hound-venv/bin/python -m playwright install chromium
+
+mkdir -p ~/.local/bin
+ln -sfn ~/.local/share/hound-venv/bin/hound ~/.local/bin/hound
+```
+
+Make sure `~/.local/bin` is on `PATH` before starting Pi:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Install the Pi extension globally:
+
+```sh
+pi install npm:@houndmcp/hound-mcp-pi
+```
+
+Verify the engine and browser dependencies:
+
+```sh
+hound --version
+hound --doctor
+```
+
+Restart Pi after installing or updating the extension. Hound's keyless search needs no API key. Keep the extension and engine reasonably up to date together; the extension warns when their major versions diverge:
+
+```sh
+hound -u
+pi update npm:@houndmcp/hound-mcp-pi
+```
 
 ## Subagents
 
