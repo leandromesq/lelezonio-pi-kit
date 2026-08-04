@@ -97,7 +97,7 @@ Merge any model, provider, retry, or keybinding preferences from your previous s
 
 ## Hound web research
 
-Hound is an optional local MCP service that adds `web_search`, `web_fetch`, `web_crawl`, and `web_screenshot` to Pi. It has two parts: the Pi extension and the Python engine. Install both; the commands below keep the engine isolated from system Python and install the extension globally rather than adding it to this repository's `packages` array.
+Hound is an optional local MCP service that adds `web_search`, `web_fetch`, `web_crawl`, and `web_screenshot` to Pi. It has two parts: the Pi extension and the Python engine. Its maintained upstream is [dondai44423/master-fetch](https://github.com/dondai44423/master-fetch), which supersedes the old `dondai1234` repository. Install both; the commands below keep the engine isolated from system Python and install the extension globally rather than adding it to this repository's `packages` array.
 
 ### Install on Linux or macOS
 
@@ -116,11 +116,13 @@ Make sure `~/.local/bin` is on `PATH` before starting Pi:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Install the Pi extension globally:
+Install the Pi extension globally from the maintained repository. `v13.1.0` is the matching current release:
 
 ```sh
-pi install npm:@houndmcp/hound-mcp-pi
+pi install git:github.com/dondai44423/master-fetch@v13.1.0
 ```
+
+Do not install the legacy `npm:@houndmcp/hound-mcp-pi` package; its published release still points at the old repository.
 
 Verify the engine and browser dependencies:
 
@@ -129,11 +131,25 @@ hound --version
 hound --doctor
 ```
 
-Restart Pi after installing or updating the extension. Hound's keyless search needs no API key. Keep the extension and engine reasonably up to date together; the extension warns when their major versions diverge:
+Restart Pi after installing or updating the extension. Hound's keyless search needs no API key.
+
+### Migrate the legacy npm extension
+
+If Hound was installed through the old npm package, replace it with the maintained Git source:
+
+```sh
+pi uninstall npm:@houndmcp/hound-mcp-pi
+pi install git:github.com/dondai44423/master-fetch@v13.1.0
+```
+
+### Update
+
+Update the engine with its built-in updater. To update the Pi extension, replace its pinned tag with the matching release from [Hound's releases](https://github.com/dondai44423/master-fetch/releases):
 
 ```sh
 hound -u
-pi update npm:@houndmcp/hound-mcp-pi
+pi uninstall git:github.com/dondai44423/master-fetch@v13.1.0
+pi install git:github.com/dondai44423/master-fetch@v<version>
 ```
 
 ## Subagents
