@@ -28,6 +28,7 @@ import {
 
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 5;
+const HERDR_BLOCKED_EVENT = "herdr:blocked";
 
 const OptionSchema = Type.Object({
   label: Type.String({
@@ -329,10 +330,16 @@ export default function askUser(pi: ExtensionAPI) {
           };
         });
 
+      pi.events.emit(HERDR_BLOCKED_EVENT, {
+        active: true,
+        label: `Ask user: ${params.question}`,
+      });
       const uiExit = await Effect.runPromiseExit(
         Effect.tryPromise(showQuestion),
         signal ? { signal } : undefined,
-      );
+      ).finally(() => {
+        pi.events.emit(HERDR_BLOCKED_EVENT, { active: false });
+      });
 
       if (Exit.isFailure(uiExit)) {
         if (Cause.hasInterruptsOnly(uiExit.cause)) {
