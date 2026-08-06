@@ -56,6 +56,23 @@ interface RenderPatch {
   originalRender: (width: number) => string[];
 }
 
+function bindTuiMethod<T extends (...args: never[]) => unknown>(
+  target: object,
+  name: string,
+) {
+  let prototype = Object.getPrototypeOf(target);
+  while (prototype) {
+    const method = Object.getOwnPropertyDescriptor(prototype, name)?.value;
+    if (typeof method === "function") {
+      return method.bind(target) as T;
+    }
+    prototype = Object.getPrototypeOf(prototype);
+  }
+
+  const method = Reflect.get(target, name);
+  return typeof method === "function" ? (method.bind(target) as T) : undefined;
+}
+
 interface RenderPassCluster {
   width: number;
   terminalRows: number;
@@ -431,13 +448,9 @@ export class TerminalSplitCompositor {
     this.rowsDescriptor = descriptorForRows(options.terminal);
     this.originalWrite = options.terminal.write.bind(options.terminal);
     this.originalDoRender =
-      typeof options.tui.doRender === "function"
-        ? options.tui.doRender.bind(options.tui)
-        : null;
+      bindTuiMethod<() => void>(options.tui, "doRender") ?? null;
     this.originalRender =
-      typeof options.tui.render === "function"
-        ? options.tui.render.bind(options.tui)
-        : null;
+      bindTuiMethod<(width: number) => string[]>(options.tui, "render") ?? null;
   }
 
   install(): void {
@@ -492,10 +505,12 @@ export class TerminalSplitCompositor {
         }
       };
     }
-    if (typeof this.tui.compositeLineAt === "function") {
-      this.originalCompositeLineAt = this.tui.compositeLineAt.bind(
-        this.tui,
-      ) as CompositeLineAt;
+    const originalCompositeLineAt = bindTuiMethod<CompositeLineAt>(
+      this.tui,
+      "compositeLineAt",
+    );
+    if (originalCompositeLineAt) {
+      this.originalCompositeLineAt = originalCompositeLineAt;
       this.tui.compositeLineAt = (
         baseLine: string,
         overlayLine: string,

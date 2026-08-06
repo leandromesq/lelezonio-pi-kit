@@ -12,8 +12,99 @@ import {
   moveCursor,
   emergencyTerminalModeReset,
   buildFixedClusterPaint,
+  TerminalSplitCompositor,
+  type InternalTui,
+  type TerminalLike,
 } from "./src/fixed-editor/terminal-split.ts";
 import type { FixedEditorClusterRender } from "./src/fixed-editor/cluster.ts";
+
+class ProxyTerminal implements TerminalLike {
+  columns = 80;
+  private readonly height = 24;
+  writes: string[] = [];
+
+  get rows() {
+    return this.height;
+  }
+
+  write(data: string) {
+    this.writes.push(data);
+  }
+}
+
+class ProxyTui {
+  readonly terminal: ProxyTerminal;
+  doRenderCalls = 0;
+  renderCalls = 0;
+
+  constructor(terminal: ProxyTerminal) {
+    this.terminal = terminal;
+  }
+
+  render(width: number) {
+    this.renderCalls += 1;
+    return [`root:${width}`];
+  }
+
+  doRender() {
+    this.doRenderCalls += 1;
+    this.render(this.terminal.columns);
+  }
+
+  requestRender() {}
+
+  addInputListener() {
+    return () => {};
+  }
+}
+
+function createTuiReference(tui: ProxyTui) {
+  return new Proxy(
+    {},
+    {
+      get(_target, property) {
+        const value = Reflect.get(tui, property, tui);
+        if (typeof value !== "function") return value;
+
+        return (...args: never[]) => {
+          const method = Reflect.get(tui, property, tui);
+          if (typeof method !== "function") {
+            throw new TypeError(`${String(property)} is not callable`);
+          }
+          return Reflect.apply(method, tui, args);
+        };
+      },
+      set(_target, property, value) {
+        return Reflect.set(tui, property, value, tui);
+      },
+      getPrototypeOf: () => Reflect.getPrototypeOf(tui),
+    },
+  ) as unknown as InternalTui;
+}
+
+describe("stable TUI proxy compatibility", () => {
+  it("does not recurse when patched renderer methods are called", () => {
+    const terminal = new ProxyTerminal();
+    const tui = new ProxyTui(terminal);
+    const tuiReference = createTuiReference(tui);
+    const compositor = new TerminalSplitCompositor({
+      tui: tuiReference,
+      terminal,
+      mouseScroll: false,
+      renderCluster: () => ({ lines: [], cursor: null }),
+    });
+
+    try {
+      compositor.install();
+      tuiReference.doRender?.();
+    } finally {
+      compositor.dispose();
+    }
+
+    assert.strictEqual(tui.doRenderCalls, 1);
+    assert.strictEqual(tui.renderCalls, 1);
+  });
+});
 
 describe("ANSI escape sequence helpers", () => {
   describe("beginSynchronizedOutput", () => {
