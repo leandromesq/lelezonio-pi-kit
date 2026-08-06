@@ -13,6 +13,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { loadNamingConfig } from "../auto-naming/src/config.ts";
+import { generateTaskTitle } from "../auto-naming/src/title-generator.ts";
 import { loadRemoteAgentsConfig } from "./src/config.ts";
 import {
   buildRemotePrompt,
@@ -341,9 +343,16 @@ export default function (pi: ExtensionAPI) {
       if (!info.exists)
         throw new Error(`Remote worktrees folder does not exist: ${remoteCwd}`);
     }
-    const title = redactSensitiveText(
-      options.titleOverride?.trim() || deriveTitle(task),
-    ).slice(0, 72);
+    const rawTitle =
+      options.titleOverride?.trim() ||
+      (await generateTaskTitle({
+        modelRegistry: ctx.modelRegistry,
+        config: loadNamingConfig(),
+        prompt: task,
+        fallback: deriveTitle(task),
+        signal: options.signal,
+      }));
+    const title = redactSensitiveText(rawTitle).slice(0, 72) || "remote task";
     const prompt = buildRemotePrompt({
       instructions: task,
       title,

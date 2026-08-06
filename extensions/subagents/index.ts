@@ -40,6 +40,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { loadNamingConfig } from "../auto-naming/src/config.ts";
+import { generateTaskTitle } from "../auto-naming/src/title-generator.ts";
 import { deriveBtwTitle, isModelVisible } from "./src/by-the-way.ts";
 import { loadSubagentsConfig, resolveSpawnOptions } from "./src/config.ts";
 import {
@@ -331,7 +333,14 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`working_dir is not a directory: ${cwd}`);
       }
 
-      const title = params.name.trim().slice(0, 160) || "subagent";
+      const title = await generateTaskTitle({
+        modelRegistry: ctx.modelRegistry,
+        config: loadNamingConfig(),
+        prompt: params.prompt,
+        hint: params.name,
+        fallback: params.name.trim().slice(0, 160) || "subagent",
+        signal,
+      });
       const snap = await runTool(
         getRuntime(),
         manager.spawn(harness, {
@@ -709,6 +718,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     const manager = await getManager();
+    const title = await generateTaskTitle({
+      modelRegistry: ctx.modelRegistry,
+      config: loadNamingConfig(),
+      prompt,
+      fallback: deriveBtwTitle(prompt),
+    });
     let snap: SubagentSnapshot;
     try {
       snap = await runTool(
@@ -716,7 +731,7 @@ export default function (pi: ExtensionAPI) {
         manager.spawn("pi", {
           origin: "btw",
           prompt,
-          title: deriveBtwTitle(prompt),
+          title,
           cwd: ctx.cwd,
           parent: {
             parentCwd: ctx.cwd,

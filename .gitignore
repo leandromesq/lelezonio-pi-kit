@@ -16,6 +16,8 @@ remote-agents.json
 /remote-agents/
 extensions/summaries/config.private.json
 extensions/summaries/config.private.json.*.tmp
+extensions/auto-naming/config.private.json
+extensions/auto-naming/config.private.json.*.tmp
 
 # Environment variables and secrets
 .env

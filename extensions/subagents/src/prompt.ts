@@ -19,7 +19,7 @@ export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
 export const SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS = {
   prompt:
     "Task prompt for the subagent. Must be self-contained: include all needed context, file paths, and what to report back.",
-  name: "Short human-readable name for this subagent, shown in listings and the UI",
+  name: "Short human-readable name hint for this subagent; the auto-naming model may refine it for listings and the UI",
   profile:
     "Named role from subagents.json. It supplies the harness, model, and reasoning effort; explicit spawn fields override profile values.",
   harness:

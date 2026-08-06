@@ -21,21 +21,22 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 
 ## Extensions
 
-| Extension              | What it adds                                                                |
-| ---------------------- | --------------------------------------------------------------------------- |
-| `ask-user`             | Interactive multiple-choice questions with a free-form option               |
-| `background-terminals` | Background process tools and the `/ps` dashboard                            |
-| `copy-all`             | `/copy-all` conversation export                                             |
-| `codex-accounts`       | Save and switch Codex CLI accounts with `/codex`                            |
-| `file-search`          | Typed `fd` and `rg` model tools                                             |
-| `git-info`             | Branch/PR dashboard state, `/lg`, and `/pr`                                 |
-| `git-pr`               | `/yeet` and guarded `/git <target-branch>` workflows                        |
-| `model-info`           | Model, thinking, context, and cost state for the dashboard                  |
-| `remote-agents`        | Persistent remote Pi jobs over SSH and Herdr with `/remote` and `/remotes`  |
-| `subagents`            | Headless Pi and Codex children, profiles, result delivery, and `/subagents` |
-| `summaries`            | Asynchronous post-run recaps and `/summary-model`                           |
-| `ui-customization`     | Startup logo, footer, thinking colors, and fixed-bottom editor              |
-| `workflows`            | Scriptable phased/parallel multi-agent workflows and `/workflows`           |
+| Extension              | What it adds                                                                  |
+| ---------------------- | ----------------------------------------------------------------------------- |
+| `ask-user`             | Interactive multiple-choice questions with a free-form option                 |
+| `auto-naming`          | Automatic Pi session, subagent, and Herdr workspace titles via `/title-model` |
+| `background-terminals` | Background process tools and the `/ps` dashboard                              |
+| `copy-all`             | `/copy-all` conversation export                                               |
+| `codex-accounts`       | Save and switch Codex CLI accounts with `/codex`                              |
+| `file-search`          | Typed `fd` and `rg` model tools                                               |
+| `git-info`             | Branch/PR dashboard state, `/lg`, and `/pr`                                   |
+| `git-pr`               | `/yeet` and guarded `/git <target-branch>` workflows                          |
+| `model-info`           | Model, thinking, context, and cost state for the dashboard                    |
+| `remote-agents`        | Persistent remote Pi jobs over SSH and Herdr with `/remote` and `/remotes`    |
+| `subagents`            | Headless Pi and Codex children, profiles, result delivery, and `/subagents`   |
+| `summaries`            | Asynchronous post-run recaps and `/summary-model`                             |
+| `ui-customization`     | Startup logo, footer, thinking colors, and fixed-bottom editor                |
+| `workflows`            | Scriptable phased/parallel multi-agent workflows and `/workflows`             |
 
 ## Install
 
@@ -98,7 +99,7 @@ Individual extensions also expose focused `check` and `test` scripts.
 
 ## Configuration and private state
 
-The `.gitignore` excludes Pi runtime/private state, including authentication, settings, sessions, trust data, remote-agent job metadata, generated workflow artifacts, downloaded binaries, and private summary configuration. Never commit those files.
+The `.gitignore` excludes Pi runtime/private state, including authentication, settings, sessions, trust data, remote-agent job metadata, generated workflow artifacts, downloaded binaries, and private summary/title-model configuration. Auto-naming defaults to `opencode-go/deepseek-v4-flash`, redacts common credentials before sending the first task prompt to its selected model, and can be configured with `/title-model` or disabled with `/title-naming off`. Never commit those files.
 
 Remote agents require an SSH-accessible host running Herdr. Copy `remote-agents.example.json` to `remote-agents.json`, then customize the SSH executable, helper path, and explicit local-to-remote project mappings. See [SETUP.md](SETUP.md#remote-agents) for details.
 
