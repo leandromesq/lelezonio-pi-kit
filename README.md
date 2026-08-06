@@ -7,7 +7,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 ## Highlights
 
 - Fixed-bottom editor with a compact custom dashboard and color-coded thinking level
-- GitHub Dark Default theme
+- Theme collection with `/theme` picker and live preview (Noctalia by default)
 - Named Pi/Codex subagent profiles with configurable models and thinking effort
 - Fast Codex CLI account saving and switching with `/codex`
 - Multi-agent workflows with phased and parallel execution
@@ -35,8 +35,48 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 | `remote-agents`        | Persistent remote Pi jobs over SSH and Herdr with `/remote` and `/remotes`    |
 | `subagents`            | Headless Pi and Codex children, profiles, result delivery, and `/subagents`   |
 | `summaries`            | Asynchronous post-run recaps and `/summary-model`                             |
+| `theme-selector`       | `/theme` picker with live preview over all installed themes                   |
 | `ui-customization`     | Startup logo, footer, thinking colors, and fixed-bottom editor                |
 | `workflows`            | Scriptable phased/parallel multi-agent workflows and `/workflows`             |
+
+## Themes
+
+Theme JSON files live in [`themes/`](themes/). The kit ships eight curated
+themes, defaulting to **Noctalia** (warm dark with peach accents, matched to the
+Noctalia desktop shell palette):
+
+| Theme             | Vibe                                                    |
+| ----------------- | ------------------------------------------------------- |
+| `noctalia`        | Warm dark with peach accents â€” matches the DE (default) |
+| `catppuccinMocha` | Soft purple, high-coziness                              |
+| `tokyoNight`      | Deep blue with neon accents                             |
+| `nord`            | Cold, calm arctic blues                                 |
+| `gruvbox`         | Warm retro with high contrast                           |
+| `rosePine`        | Soft, muted, dreamy                                     |
+| `dracula`         | Dark purple with neon highlights                        |
+| `solarizedDark`   | Classic, scientifically tuned contrast                  |
+
+Switch themes interactively:
+
+```text
+/theme              # picker with a live preview pane
+/theme <name>       # apply directly, e.g. /theme tokyoNight
+/themes             # alias of /theme
+```
+
+The picker shows a miniature mock of the Pi transcript rendered with each
+theme's actual color tokens. Applying persists `theme` to `settings.json` and
+reloads Pi so the change takes effect immediately.
+
+Add your own theme by dropping a JSON file into `themes/` â€” see
+[themes.md](https://github.com/earendil-works/pi-mono/blob/main/docs/themes.md)
+for the token reference. The bundled generator
+([`scripts/gen-themes.mjs`](scripts/gen-themes.mjs)) rebuilds all eight themes
+from a single palette table:
+
+```sh
+npm run gen:themes
+```
 
 ## Install
 
@@ -96,6 +136,12 @@ npm run format:check
 ```
 
 Individual extensions also expose focused `check` and `test` scripts.
+
+To rebuild the bundled themes after editing the palette table:
+
+```sh
+npm run gen:themes
+```
 
 ## Configuration and private state
 

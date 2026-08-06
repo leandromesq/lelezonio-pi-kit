@@ -21,6 +21,7 @@
     "check": "tsc --noEmit",
     "format": "prettier --write \"extensions/**/*.{ts,cjs}\" \"scripts/**/*.mjs\" \"skills/**/*.md\" \"*.{json,md}\"",
     "format:check": "prettier --check \"extensions/**/*.{ts,cjs}\" \"scripts/**/*.mjs\" \"skills/**/*.md\" \"*.{json,md}\"",
+    "gen:themes": "node scripts/gen-themes.mjs",
     "test": "node scripts/test.mjs"
   }
 }
