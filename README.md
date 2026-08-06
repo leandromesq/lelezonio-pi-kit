@@ -37,6 +37,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 | `summaries`            | Asynchronous post-run recaps and `/summary-model`                             |
 | `ui-customization`     | Startup logo, footer, thinking colors, and fixed-bottom editor                |
 | `workflows`            | Scriptable phased/parallel multi-agent workflows and `/workflows`             |
+| `zed`                  | Open the current directory in Zed with `/zed`                                 |
 
 ## Themes
 

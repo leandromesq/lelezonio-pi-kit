@@ -34,7 +34,6 @@ import {
   TerminalSplitCompositor,
 } from "./src/fixed-editor/terminal-split.ts";
 
-type Rgb = [number, number, number];
 interface RenderableNode {
   children?: RenderableNode[];
   invalidate(): void;
@@ -50,16 +49,6 @@ interface ContainerMatch {
   index: number;
 }
 
-const RESET = "\x1b[0m";
-const BOLD = "\x1b[1m";
-const PALETTE: Rgb[] = [
-  [22, 83, 189],
-  [48, 129, 247],
-  [93, 171, 255],
-  [151, 205, 255],
-  [93, 171, 255],
-  [48, 129, 247],
-];
 const TITLE_LINES = [
   "▀████████████▀",
   " ╘███    ███  ",
@@ -83,43 +72,6 @@ function sanitizeTerminalLabel(text: string) {
     .replace(CSI_PATTERN, "")
     .replace(ESCAPE_PATTERN, "")
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
-}
-
-function mix(a: number, b: number, amount: number) {
-  return Math.round(a + (b - a) * amount);
-}
-
-function sampleGradient(position: number) {
-  const wrapped = ((position % 1) + 1) % 1;
-  const scaled = wrapped * PALETTE.length;
-  const index = Math.floor(scaled);
-  const nextIndex = (index + 1) % PALETTE.length;
-  const amount = scaled - index;
-  const start = PALETTE[index]!;
-  const end = PALETTE[nextIndex]!;
-
-  return [
-    mix(start[0], end[0], amount),
-    mix(start[1], end[1], amount),
-    mix(start[2], end[2], amount),
-  ] satisfies Rgb;
-}
-
-function foreground([red, green, blue]: Rgb, text: string) {
-  return `\x1b[38;2;${red};${green};${blue}m${text}${RESET}`;
-}
-
-function gradientText(text: string, phase: number) {
-  const characters = [...text];
-  const span = Math.max(characters.length - 1, 1);
-
-  return characters
-    .map((character, index) =>
-      character === " "
-        ? character
-        : foreground(sampleGradient(index / span + phase), character),
-    )
-    .join("");
 }
 
 function hasChildren(
@@ -448,20 +400,17 @@ export default function uiCustomization(pi: ExtensionAPI) {
   function install(ctx: ExtensionContext) {
     if (ctx.mode !== "tui") return;
 
-    ctx.ui.setHeader((tui) => {
+    ctx.ui.setHeader((tui, theme) => {
       activeTui = tui;
       requestRender = () => tui.requestRender();
       scheduleThemeRemoval(tui);
 
       return {
         render(width: number) {
-          const art = TITLE_LINES.map((line, row) =>
-            center(gradientText(line, row * 0.045), width),
+          const art = TITLE_LINES.map((line) =>
+            center(theme.fg("accent", line), width),
           );
-          const subtitle = center(
-            `${BOLD}${gradientText(title, 0.18)}${RESET}`,
-            width,
-          );
+          const subtitle = center(theme.fg("accent", theme.bold(title)), width);
           return ["", ...art, subtitle, ""];
         },
         invalidate() {},
