@@ -20,7 +20,7 @@
     "coder": {
       "harness": "pi",
       "model": "opencode-go/deepseek-v4-flash",
-      "thinking": "max"
+      "thinking": "high"
     },
     "reviewer": {
       "harness": "pi",

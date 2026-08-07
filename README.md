@@ -96,7 +96,7 @@ Profiles live in [`subagents.json`](subagents.json):
 | Profile    | Harness | Model                           | Thinking | Intended use                        |
 | ---------- | ------- | ------------------------------- | -------- | ----------------------------------- |
 | `planner`  | Codex   | `gpt-5.6-luna`                  | `max`    | Difficult planning and architecture |
-| `coder`    | Pi      | `opencode-go/deepseek-v4-flash` | `max`    | Implementation                      |
+| `coder`    | Pi      | `opencode-go/deepseek-v4-flash` | `high`   | Implementation                      |
 | `reviewer` | Pi      | `opencode-go/deepseek-v4-flash` | `max`    | Review and research                 |
 
 Explicit spawn fields override profile values. Profile values override per-harness defaults. The concurrency cap is also configured in this file.
