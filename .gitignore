@@ -4,6 +4,9 @@ node_modules/
 # Downloaded/generated executables
 bin/
 
+# Installed automatically by herdr
+extensions/herdr-agent-state.ts
+
 # Pi runtime and private state
 sessions/
 /workflows/
@@ -32,6 +35,17 @@ extensions/auto-naming/config.private.json.*.tmp
 *.pyc
 __pycache__/
 .DS_Store
+
+# Third-party skills — only the owned skills are tracked
+skills/*
+!skills/background-terminals/
+!skills/remote-agents/
+!skills/subagents/
+
+# Local caches and checkpoints
+checkpoints/
+/git/
+/npm/
 
 # Local editor settings
 .vscode/
