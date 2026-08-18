@@ -14,7 +14,6 @@ import {
   hyperlink,
   truncateToWidth,
   visibleWidth,
-  type Component,
   type EditorTheme,
   type TUI,
 } from "@earendil-works/pi-tui";
@@ -27,13 +26,6 @@ import {
   isGitInfoState,
   isModelInfoState,
 } from "../shared/dashboard-state.ts";
-import { renderFixedEditorCluster } from "./src/fixed-editor/cluster.ts";
-import {
-  emergencyTerminalModeReset,
-  type InternalTui,
-  TerminalSplitCompositor,
-} from "./src/fixed-editor/terminal-split.ts";
-
 interface RenderableNode {
   children?: RenderableNode[];
   invalidate(): void;
@@ -42,11 +34,6 @@ interface RenderableNode {
 
 interface DashboardTui extends RenderableNode {
   requestRender(force?: boolean): void;
-}
-
-interface ContainerMatch {
-  container: Component;
-  index: number;
 }
 
 const TITLE_LINES = [
@@ -174,29 +161,6 @@ function thinkingColor(level: string): ThemeColor {
   }
 }
 
-function componentChildren(component: Component) {
-  if (!("children" in component) || !Array.isArray(component.children)) {
-    return undefined;
-  }
-  return component.children.filter(
-    (child): child is Component =>
-      typeof child === "object" &&
-      child !== null &&
-      "render" in child &&
-      typeof child.render === "function",
-  );
-}
-
-function findContainerWithChild(
-  tui: TUI,
-  child: Component,
-): ContainerMatch | null {
-  const index = tui.children.findIndex((candidate) =>
-    componentChildren(candidate)?.includes(child),
-  );
-  return index === -1 ? null : { container: tui.children[index]!, index };
-}
-
 export default function uiCustomization(pi: ExtensionAPI) {
   let title = "pi";
   let modelInfo = emptyModelInfoState();
@@ -204,16 +168,6 @@ export default function uiCustomization(pi: ExtensionAPI) {
   let requestRender: (() => void) | undefined;
   let activeTui: DashboardTui | undefined;
   let themeRemovalTimers: Array<ReturnType<typeof setTimeout>> = [];
-  let fixedEditorTimer: ReturnType<typeof setTimeout> | undefined;
-  const fixedEditorEnabled = process.env.PI_UI_FIXED_EDITOR !== "0";
-  let currentEditor: CustomEditor | undefined;
-  let fixedEditorCompositor: TerminalSplitCompositor | undefined;
-  let fixedEditorContainer: Component | undefined;
-  let fixedStatusContainer: Component | undefined;
-  let fixedWidgetContainerAbove: Component | undefined;
-  let fixedWidgetContainerBelow: Component | undefined;
-  let activeFooterTheme: Theme | undefined;
-  let activeFooterData: ReadonlyFooterDataProvider | undefined;
 
   const stopModelListener = pi.events.on(MODEL_INFO_CHANNEL, (value) => {
     if (!isModelInfoState(value)) return;
@@ -291,108 +245,15 @@ export default function uiCustomization(pi: ExtensionAPI) {
     return lines;
   }
 
-  function teardownFixedEditor(resetTerminalModes = false) {
-    if (fixedEditorTimer) {
-      clearTimeout(fixedEditorTimer);
-      fixedEditorTimer = undefined;
-    }
-
-    const hadCompositor = fixedEditorCompositor !== undefined;
-    fixedEditorCompositor?.dispose({
-      resetExtendedKeyboardModes: resetTerminalModes,
-    });
-    if (!hadCompositor && resetTerminalModes) {
-      try {
-        process.stdout.write(emergencyTerminalModeReset());
-      } catch {
-        // Terminal cleanup is best-effort during shutdown.
-      }
-    }
-
-    fixedEditorCompositor = undefined;
-    fixedEditorContainer = undefined;
-    fixedStatusContainer = undefined;
-    fixedWidgetContainerAbove = undefined;
-    fixedWidgetContainerBelow = undefined;
-  }
-
-  function renderHidden(component: Component | undefined, width: number) {
-    if (!component || !fixedEditorCompositor) return [];
-    return fixedEditorCompositor.renderHidden(component, width);
-  }
-
-  function installFixedEditor(ctx: ExtensionContext, tui: TUI) {
-    teardownFixedEditor();
-    if (ctx.mode !== "tui" || !currentEditor) return;
-
-    const editorContainerMatch = findContainerWithChild(tui, currentEditor);
-    if (!editorContainerMatch) return;
-
-    fixedEditorContainer = editorContainerMatch.container;
-    fixedStatusContainer = tui.children[editorContainerMatch.index - 2];
-    fixedWidgetContainerAbove = tui.children[editorContainerMatch.index - 1];
-    fixedWidgetContainerBelow = tui.children[editorContainerMatch.index + 1];
-
-    const internalTui = tui as unknown as InternalTui;
-    let compositor: TerminalSplitCompositor;
-    compositor = new TerminalSplitCompositor({
-      tui: internalTui,
-      terminal: tui.terminal,
-      mouseScroll: true,
-      getShowHardwareCursor: () => tui.getShowHardwareCursor(),
-      renderCluster: (width, terminalRows) =>
-        renderFixedEditorCluster({
-          width,
-          terminalRows,
-          statusLines: [
-            ...renderHidden(fixedStatusContainer, width),
-            ...renderHidden(fixedWidgetContainerAbove, width),
-          ].filter((line) => visibleWidth(line) > 0),
-          editorLines: renderHidden(fixedEditorContainer, width),
-          topLines:
-            activeFooterTheme && activeFooterData
-              ? renderFooterLines(
-                  ctx,
-                  activeFooterTheme,
-                  activeFooterData,
-                  width,
-                )
-              : [],
-          secondaryLines: renderHidden(fixedWidgetContainerBelow, width),
-        }),
-    });
-
-    fixedEditorCompositor = compositor;
-    for (const component of [
-      fixedStatusContainer,
-      fixedWidgetContainerAbove,
-      fixedEditorContainer,
-      fixedWidgetContainerBelow,
-    ]) {
-      if (component) compositor.hideRenderable(component);
-    }
-    compositor.install();
-    tui.requestRender(true);
-  }
-
   function installEditor(ctx: ExtensionContext) {
     ctx.ui.setEditorComponent(
       (tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => {
-        class FixedEditor extends CustomEditor {
-          constructor() {
-            super(tui, theme, keybindings);
-            currentEditor = this;
-            fixedEditorTimer = setTimeout(
-              () => installFixedEditor(ctx, tui),
-              0,
-            );
-          }
-
+        class ThemedEditor extends CustomEditor {
           borderColor = (text: string) =>
             ctx.ui.theme.fg(thinkingColor(modelInfo.thinking), text);
         }
 
-        return new FixedEditor();
+        return new ThemedEditor(tui, theme, keybindings);
       },
     );
   }
@@ -419,8 +280,6 @@ export default function uiCustomization(pi: ExtensionAPI) {
 
     ctx.ui.setFooter((tui, theme, footerData: ReadonlyFooterDataProvider) => {
       requestRender = () => tui.requestRender();
-      activeFooterTheme = theme;
-      activeFooterData = footerData;
       const stopBranchListener = footerData.onBranchChange(() =>
         tui.requestRender(),
       );
@@ -428,9 +287,7 @@ export default function uiCustomization(pi: ExtensionAPI) {
       return {
         invalidate() {},
         render(width: number) {
-          return fixedEditorCompositor
-            ? []
-            : renderFooterLines(ctx, theme, footerData, width);
+          return renderFooterLines(ctx, theme, footerData, width);
         },
         dispose() {
           stopBranchListener();
@@ -438,8 +295,7 @@ export default function uiCustomization(pi: ExtensionAPI) {
       };
     });
 
-    if (fixedEditorEnabled) installEditor(ctx);
-    else ctx.ui.setEditorComponent(undefined);
+    installEditor(ctx);
     ctx.ui.setTitle(`pi · ${title}`);
     pi.events.emit(REFRESH_CHANNEL, undefined);
   }
@@ -455,18 +311,14 @@ export default function uiCustomization(pi: ExtensionAPI) {
     if (activeTui) scheduleThemeRemoval(activeTui);
   });
 
-  pi.on("session_shutdown", (event, ctx) => {
+  pi.on("session_shutdown", (_event, ctx) => {
     stopModelListener();
     stopGitListener();
     for (const timer of themeRemovalTimers) clearTimeout(timer);
     themeRemovalTimers = [];
     activeTui = undefined;
     requestRender = undefined;
-    activeFooterTheme = undefined;
-    activeFooterData = undefined;
     if (ctx.mode === "tui") {
-      teardownFixedEditor(event.reason === "quit");
-      currentEditor = undefined;
       ctx.ui.setHeader(undefined);
       ctx.ui.setEditorComponent(undefined);
       ctx.ui.setFooter(undefined);

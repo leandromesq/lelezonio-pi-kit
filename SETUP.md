@@ -226,20 +226,11 @@ The file-search extension registers `fd` and `rg` as model tools. At startup it 
 
 If automatic provisioning does not support your platform, install both binaries with your system package manager and restart Pi.
 
-## Fixed editor compatibility
+## Fullscreen TUI
 
-The custom editor is pinned to the terminal bottom by default. If a terminal does not render it correctly, start Pi with:
+The setup enables Pi's native fullscreen TUI through `"tuiMode": "fullscreen"` in `settings.json`. The transcript scrolls independently while queued messages, status, widgets, editor, and footer remain fixed at the bottom.
 
-```sh
-PI_UI_FIXED_EDITOR=0 pi
-```
-
-PowerShell:
-
-```powershell
-$env:PI_UI_FIXED_EDITOR = "0"
-pi
-```
+Change the setting to `"regular"` if you prefer the terminal's native scrollback.
 
 ## Updating
 
