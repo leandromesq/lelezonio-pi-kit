@@ -156,7 +156,7 @@ pi install git:github.com/dondai44423/master-fetch@v<version>
 
 Configure named roles, per-harness defaults, and the concurrency cap in [`subagents.json`](subagents.json). A spawn can select a `profile`; explicit `harness`, `model`, and `reasoning_effort` values override it. Profile values override the selected harness defaults.
 
-The included configuration reserves Codex for the `planner` profile and uses OpenCode models for `coder` and `reviewer` to conserve Codex subscription usage. Replace unavailable models with entries from:
+The included configuration runs `planner` and `reviewer` on Codex (`gpt-5.6-luna`) and `coder` on Pi (`opencode-go/deepseek-v4-flash`). Replace unavailable models with entries from:
 
 ```sh
 pi --list-models

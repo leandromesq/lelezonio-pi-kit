@@ -81,6 +81,10 @@ export default function (pi: ExtensionAPI) {
   let closed = false;
   let ui: ExtensionUIContext | undefined;
   let unsubscribe: (() => void) | undefined;
+  // Incremented on every session_start. Async continuations capture the value
+  // when they start and bail when it changes: after session replacement or
+  // reload their captured ctx/pi are stale and must never be touched.
+  let sessionGeneration = 0;
 
   const updateStatus = () => {
     if (!ui || !manager) return;
@@ -114,22 +118,26 @@ export default function (pi: ExtensionAPI) {
 
   const deliverCompletion = async (snapshot: RemoteAgentSnapshot) => {
     if (!manager || snapshot.completionDelivered) return;
+    const owningManager = manager;
+    const startedGeneration = sessionGeneration;
     const generation = snapshot.generation;
     try {
       // Herdr can report the Pi turn settled just before post-run integrations
       // finish updating the terminal/session file.
       await new Promise((resolve) => setTimeout(resolve, 1_500));
-      if (!manager) return;
-      await manager
+      // The session was replaced/reloaded while delivery was pending: the
+      // captured manager is disposed and pi is stale — drop delivery silently.
+      if (closed || sessionGeneration !== startedGeneration) return;
+      await owningManager
         .refresh(snapshot.id, { transcript: true })
         .catch(() => snapshot);
-      const latest = manager.get(snapshot.id) ?? snapshot;
+      const latest = owningManager.get(snapshot.id) ?? snapshot;
       if (
         latest.generation !== generation ||
         latest.completionDelivered ||
         isRemoteAgentActive(latest.status)
       ) {
-        manager.releaseCompletionDelivery(snapshot.id);
+        owningManager.releaseCompletionDelivery(snapshot.id);
         return;
       }
       pi.sendMessage(
@@ -145,29 +153,33 @@ export default function (pi: ExtensionAPI) {
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
-      manager.markCompletionDelivered(snapshot.id);
+      owningManager.markCompletionDelivered(snapshot.id);
     } catch (error) {
-      manager?.releaseCompletionDelivery(snapshot.id);
+      owningManager?.releaseCompletionDelivery(snapshot.id);
       console.error("remote-agents: completion delivery failed", error);
     }
   };
 
   const deliverBlocked = async (snapshot: RemoteAgentSnapshot) => {
     if (!manager || snapshot.blockedDelivered) return;
+    const owningManager = manager;
+    const startedGeneration = sessionGeneration;
     const generation = snapshot.generation;
     try {
       await new Promise((resolve) => setTimeout(resolve, 500));
-      if (!manager) return;
-      await manager
+      // The session was replaced/reloaded while delivery was pending: the
+      // captured manager is disposed and pi is stale — drop delivery silently.
+      if (closed || sessionGeneration !== startedGeneration) return;
+      await owningManager
         .refresh(snapshot.id, { transcript: true })
         .catch(() => snapshot);
-      const latest = manager.get(snapshot.id) ?? snapshot;
+      const latest = owningManager.get(snapshot.id) ?? snapshot;
       if (
         latest.generation !== generation ||
         latest.status !== "blocked" ||
         latest.blockedDelivered
       ) {
-        manager.releaseBlockedDelivery(snapshot.id);
+        owningManager.releaseBlockedDelivery(snapshot.id);
         return;
       }
       const question =
@@ -187,15 +199,17 @@ export default function (pi: ExtensionAPI) {
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
-      manager.markBlockedDelivered(snapshot.id);
+      owningManager.markBlockedDelivered(snapshot.id);
     } catch (error) {
-      manager?.releaseBlockedDelivery(snapshot.id);
+      owningManager?.releaseBlockedDelivery(snapshot.id);
       console.error("remote-agents: blocked delivery failed", error);
     }
   };
 
   const getManager = () => {
-    managerPromise ??= (async () => {
+    if (managerPromise) return managerPromise;
+    const startedGeneration = sessionGeneration;
+    const promise = (async () => {
       const transport = new SshTransport(config);
       const client = new HerdrClient(transport);
       const store = new RemoteJobStore(
@@ -208,7 +222,10 @@ export default function (pi: ExtensionAPI) {
       unsubscribe?.();
       unsubscribe = next.view.subscribe(updateStatus);
       await next.initialize();
-      if (closed) {
+      if (closed || sessionGeneration !== startedGeneration) {
+        // The session was shut down or replaced while initialization was in
+        // flight. Dispose the manager and report the expected
+        // closed-during-init outcome; the session_start caller suppresses it.
         next.dispose();
         throw new Error(
           "Remote agent extension session closed during initialization",
@@ -217,22 +234,31 @@ export default function (pi: ExtensionAPI) {
       updateStatus();
       return next;
     })().catch((error) => {
-      managerPromise = undefined;
+      // Clear only the promise this failure belongs to. A replacement session
+      // may have started its own manager while this one was in flight.
+      if (managerPromise === promise) managerPromise = undefined;
       throw error;
     });
+    managerPromise = promise;
     return managerPromise;
   };
 
   pi.on("session_start", (_event, ctx) => {
     closed = false;
+    const startedGeneration = ++sessionGeneration;
     if (ctx.hasUI) ui = ctx.ui;
     if (ctx.mode !== "tui") return;
-    void getManager().catch((error) =>
+    void getManager().catch((error) => {
+      // Initialization was still in flight when the session was shut down or
+      // replaced: this captured ctx is stale (the runner was invalidated) and
+      // the failure is expected teardown, so stay silent. Only surface
+      // genuine failures while this session is still current.
+      if (closed || sessionGeneration !== startedGeneration) return;
       ctx.ui.notify(
         `Remote agents unavailable: ${error instanceof Error ? error.message : String(error)}`,
         "error",
-      ),
-    );
+      );
+    });
   });
 
   pi.on("session_shutdown", () => {

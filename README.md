@@ -39,7 +39,6 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 | `workflows`            | Scriptable phased/parallel multi-agent workflows and `/workflows`             |
 | `zed`                  | Open the current directory in Zed with `/zed`                                 |
 
-
 ## Themes
 
 Theme JSON files live in [`themes/`](themes/). The kit ships eight curated
@@ -74,7 +73,6 @@ from a single palette table:
 npm run gen:themes
 ```
 
-
 ## Install
 
 > Back up an existing `~/.pi/agent` directory first. Authentication, sessions, trust data, and settings are intentionally not tracked by this repository.
@@ -97,15 +95,13 @@ Profiles live in [`subagents.json`](subagents.json):
 
 | Profile    | Harness | Model                           | Thinking | Intended use                        |
 | ---------- | ------- | ------------------------------- | -------- | ----------------------------------- |
-
-| `planner`  | Pi      | `opencode-go/deepseek-v4-pro`   | `max`    | Difficult planning and architecture |
-| `coder`    | Pi      | `opencode-go/deepseek-v4-flash` | `max`    | Implementation                      |
-| `reviewer` | Pi      | `opencode-go/deepseek-v4-pro`   | `max`    | Review and research                 |
-
+| `planner`  | Codex   | `gpt-5.6-luna`                  | `max`    | Difficult planning and architecture |
+| `coder`    | Pi      | `opencode-go/deepseek-v4-flash` | `high`   | Implementation                      |
+| `reviewer` | Codex   | `gpt-5.6-luna`                  | `high`   | Review and research                 |
 
 Explicit spawn fields override profile values. Profile values override per-harness defaults. The concurrency cap is also configured in this file.
 
-Orchestrator mode (see AGENTS.md): the main session runs `openai-codex/gpt-5.6-sol` at `high` thinking and delegates reads, discovery, and changes to these Pi subagents. The Codex harness is reserved for explicit user requests or tasks needing capabilities the Pi subagents lack (vision, MCP).
+The main agent executes small tasks directly and delegates only independent, complex, long, or parallelizable work to subagents. Codex runs `planner` and `reviewer` (gpt-5.6-luna), Pi runs `coder` (opencode-go/deepseek-v4-flash), and profile-less spawns default to the `pi` harness. See AGENTS.md for the full delegation policy.
 
 These model names reflect my accounts and preferences. Replace them with models available from `pi --list-models` and your Codex CLI installation.
 

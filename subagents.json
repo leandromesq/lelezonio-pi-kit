@@ -3,7 +3,7 @@
   "maxConcurrent": 3,
   "harnesses": {
     "pi": {
-      "model": "opencode-go/deepseek-v4-pro",
+      "model": "opencode-go/gpt-5.6-luna",
       "thinking": "max"
     },
     "codex": {
@@ -13,19 +13,19 @@
   },
   "profiles": {
     "planner": {
-      "harness": "pi",
-      "model": "opencode-go/deepseek-v4-pro",
+      "harness": "codex",
+      "model": "gpt-5.6-luna",
       "thinking": "max"
     },
     "coder": {
       "harness": "pi",
       "model": "opencode-go/deepseek-v4-flash",
-      "thinking": "max"
+      "thinking": "high"
     },
     "reviewer": {
-      "harness": "pi",
-      "model": "opencode-go/deepseek-v4-pro",
-      "thinking": "max"
+      "harness": "codex",
+      "model": "gpt-5.6-luna",
+      "thinking": "high"
     }
   }
 }

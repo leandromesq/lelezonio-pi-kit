@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
+  buildFallbackRecap,
   createRunBoundary,
   getRunEntries,
   serializeRunTranscript,
@@ -116,6 +117,31 @@ test("transcript omits thinking, images, and recap entries while redacting tool 
   assert.doesNotMatch(transcript, /old recap/);
   assert.match(transcript, /\[REDACTED\]/);
   assert.match(transcript, /tool arguments capped/);
+});
+
+test("fallback recap is written in Brazilian Portuguese", () => {
+  const recap = buildFallbackRecap([
+    entry("assistant", {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "call-1", name: "bash", arguments: {} },
+        { type: "text", text: "Done." },
+      ],
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      model: "gpt-5.6-luna",
+      usage,
+      stopReason: "toolUse",
+      timestamp: 0,
+    }),
+  ]);
+  assert.match(recap.recap, /^A execução do agente principal foi concluída\./);
+  assert.match(recap.recap, /1 chamada de ferramenta em bash\./);
+  assert.match(recap.recap, /Done\.$/);
+  assert.equal(
+    recap.next,
+    "Revise o trabalho concluído acima e continue se ainda houver algo pendente.",
+  );
 });
 
 test("transcript enforces per-result and total byte caps", () => {

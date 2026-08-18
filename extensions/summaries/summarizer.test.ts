@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { parseRecapResponse, reasoningOptions } from "./src/summarizer.ts";
+import { SUMMARY_SYSTEM_PROMPT } from "./src/prompt.ts";
+
+test("system prompt mandates Brazilian Portuguese for recap and next", () => {
+  assert.match(SUMMARY_SYSTEM_PROMPT, /Brazilian Portuguese \(pt-BR\)/);
+  assert.match(SUMMARY_SYSTEM_PROMPT, /recap and next/);
+});
 
 test("omits reasoning when configured off", () => {
   assert.deepEqual(reasoningOptions("off"), {});

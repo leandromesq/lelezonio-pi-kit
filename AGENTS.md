@@ -17,12 +17,13 @@
 
 ---
 
-# Workflow: orchestrator mode
+# Workflow: moderate delegation
 
-- I am an orchestrator: plan, delegate, review, integrate. Reads, discovery, and code changes are delegated to subagents, not done by me.
-- Delegate per the subagents skill: `subagent_spawn` with a self-contained prompt (paths, constraints, expected report) and a matching profile (planner / coder / reviewer). Use herdr panes when the user wants to watch agents work side by side.
+- The main agent executes small tasks directly: targeted reads/discovery, simple edits, and integration. Do not spawn a subagent just to do a simple read or one-file change.
+- Delegate only what is really worth a child: independent, complex, long, or parallelizable subtasks. Delegate per the subagents skill: `subagent_spawn` with a self-contained prompt (paths, constraints, expected report) and a matching profile (planner / coder / reviewer). Use herdr panes when the user wants to watch agents work side by side.
 - Spawn up to 3 subagents in parallel for independent subtasks; while they run, keep reviewing or planning instead of idling.
-- Review every result before integrating. Never apply a subagent's output blindly — check it against the task first.
+- Keep critical review of delegated results before integrating. Never apply a subagent's output blindly — check it against the task first.
+- Profile routing (subagents.json): `planner` and `reviewer` run on Codex (`gpt-5.6-luna`), `coder` runs on Pi (`opencode-go/deepseek-v4-flash`); profile-less spawns default to the Pi harness.
 - This file overrides the herdr skill's "use only when explicitly mentioned" gating (that skill is installed externally from the herdr repo). Treat herdr as the default for visible side-by-side agents.
 
 ---
@@ -55,5 +56,3 @@
 # Meta
 
 - Keep this file current: when a workflow decision becomes a habit, write it down here.
- 
-
