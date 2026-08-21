@@ -5,56 +5,26 @@ description: delegate work to subagents — use when the user asks to use subage
 
 # Subagents
 
-Each subagent is headless, has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. Give every child a self-contained prompt with paths, constraints, and the expected report.
+Each subagent has an isolated context and cannot see the parent conversation, ask the user, or orchestrate additional agents. Give every child a self-contained prompt with relevant paths, constraints, context, and the expected output.
 
-The main agent executes small tasks directly: targeted reads, simple edits, and integration. Delegate only what is really worth a child — independent, complex, long, or parallelizable subtasks — and critically review delegated results before integrating.
+Use subagents only for independent, complex, long-running, or meaningfully parallelizable work. Keep small reads, targeted edits, and integration in the parent agent. Critically review every result before integrating it.
 
-## Pi Harness
+## Configuration
 
-**Harness:** `pi`
-**Prompt nicknames:** “pi”, “pi agent”, “pi subagent”
-**Default:** Spawns without a named profile run on `pi` by default. The configured Pi default is `opencode-go/gpt-5.6-luna` with `max` thinking; explicit spawn fields and named profiles override it. The `coder` profile (implementation) runs on `opencode-go/deepseek-v4-flash` at `high`.
+Treat `~/.pi/agent/subagents.json` as the source of truth for available profiles, harness defaults, models, thinking levels, and concurrency limits.
 
-Do not use models from the Anthropic provider even if one appears in the model list.
+Prefer a configured profile when it matches the task. Override `harness`, `model`, or `reasoning_effort` only when the task requires it.
 
-Pi can use any model shown by `pi --list-models`. Prefer `provider/model-id`; a bare model id only works when unambiguous.
-
-**Thinking budgets:** `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. These map directly to pi thinking levels.
-
-## Codex Harness
-
-**Harness:** `codex`
-**Prompt nicknames:** “codex”, “Codex CLI”, “codex agent”, “codex subagent”
-**Use:** The `planner` and `reviewer` profiles run on Codex (`gpt-5.6-luna`). Use Codex whenever the task suits it — including work the pi harness lacks tools for, e.g. vision/image input (`deepseek-v4-flash` has no vision) or MCP servers (pi has no MCP) — or when the user explicitly requests it.
-
-| Model           | Recommended effort |
-| --------------- | ------------------ |
-| `gpt-5.6-sol`   | `high`             |
-| `gpt-5.6-terra` | `high`             |
-| `gpt-5.6-luna`  | `max`              |
-
-**Thinking budgets accepted by the extension:** `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Codex maps these to the nearest effort supported by the selected model; `off`/`minimal` become `minimal`, while `max` becomes the highest extension-supported Codex effort.
-
-Requires the Codex CLI to be installed and authenticated.
+`workflow.agent()` does not use named subagent profiles. Configure workflow children through its supported `model`, `provider`, and `effort` options.
 
 ## Spawn and Manage
 
-Call `subagent_spawn` with a complete `prompt`, short `name`, and preferably a matching `profile`. Optional `harness`, `working_dir`, `model`, and `reasoning_effort` fields override configured values. The current profiles in `subagents.json` are:
+Call `subagent_spawn` with a complete `prompt`, a short `name`, and preferably a matching `profile`.
 
-| Profile    | Harness | Model                           | Thinking | Use for                             |
-| ---------- | ------- | ------------------------------- | -------- | ----------------------------------- |
-| `planner`  | Codex   | `gpt-5.6-luna`                  | `max`    | difficult planning and architecture |
-| `coder`    | Pi      | `opencode-go/deepseek-v4-flash` | `high`   | implementation                      |
-| `reviewer` | Codex   | `gpt-5.6-luna`                  | `high`   | review and research                 |
-
-Codex runs the planning and review profiles; Pi runs implementation, and profile-less spawns default to the `pi` harness. At most three subagents run concurrently.
-
-`workflow`/ultracode children inherit the session model by default — pass an explicit model or named profile to `agent()` calls so each child matches the profile you intend instead of silently inheriting.
+Results return automatically. After spawning, continue useful parent work instead of immediately waiting.
 
 - `subagent_check({ id })`: peek without blocking.
 - `subagent_list()`: list all runs.
-- `subagent_wait({ ids })`: block only when results are required to proceed.
+- `subagent_wait({ ids })`: block only when progress depends on the result.
 - `subagent_cancel({ ids })`: stop runs while preserving partial transcripts.
 - `/subagents`: inspect or take over a run interactively.
-
-Results return automatically. After spawning, continue useful parent work instead of immediately waiting.
