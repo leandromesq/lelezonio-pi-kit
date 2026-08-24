@@ -19,3 +19,15 @@ export function deriveBtwTitle(prompt: string) {
 export function isModelVisible(snap: { readonly origin: SubagentOrigin }) {
   return snap.origin === "model";
 }
+
+/** Transcript label for a by-the-way entry status. */
+export function btwStatusLabel(status: string | undefined) {
+  switch (status) {
+    case "error":
+      return "failed";
+    case "running":
+      return "running";
+    default:
+      return "answered";
+  }
+}

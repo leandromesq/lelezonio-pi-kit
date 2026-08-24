@@ -42,7 +42,8 @@ import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadNamingConfig } from "../auto-naming/src/config.ts";
 import { generateTaskTitle } from "../auto-naming/src/title-generator.ts";
-import { deriveBtwTitle, isModelVisible } from "./src/by-the-way.ts";
+import { tryOpenBtwHerdrPane } from "./src/btw-herdr.ts";
+import { btwStatusLabel, deriveBtwTitle, isModelVisible } from "./src/by-the-way.ts";
 import { loadSubagentsConfig, resolveSpawnOptions } from "./src/config.ts";
 import {
   BACKEND_NAMES,
@@ -211,18 +212,35 @@ export default function (pi: ExtensionAPI) {
     for (const snap of resultDelivery.drain()) deliverResult(snap);
   };
 
-  const deliverBtwResult = (snap: SubagentSnapshot) => {
+  const deliverBtwEntry = (entry: {
+    id: string;
+    title: string;
+    status: SubagentSnapshot["status"];
+    errorText?: string;
+    prompt: string;
+    answer: string;
+  }) => {
     // appendEntry is a synchronous SessionManager operation and emits an
     // entry_appended event, so it is safe while the parent is streaming and
     // never enters the model's context or follow-up queue.
     pi.appendEntry<BtwResultData>("btw-result", {
+      id: entry.id,
+      title: entry.title,
+      status: entry.status,
+      errorText: entry.errorText,
+      prompt: entry.prompt,
+      answer: entry.answer,
+    });
+  };
+
+  const deliverBtwResult = (snap: SubagentSnapshot) => {
+    deliverBtwEntry({
       id: snap.id,
       title: snap.title,
       status: snap.status,
       errorText: snap.errorText,
       prompt: snap.prompt,
       answer: truncatedOutput(snap),
-      sessionFilePath: snap.meta.sessionFilePath,
     });
     ui?.notify(
       snap.status === "error"
@@ -667,7 +685,7 @@ export default function (pi: ExtensionAPI) {
         theme.fg("accent", theme.bold(`by the way · ${data?.title ?? "?"}`)) +
         theme.fg(
           "muted",
-          ` · ${failed ? "failed" : "answered"} · ${data?.id ?? "?"}`,
+          ` · ${btwStatusLabel(data?.status)} · ${data?.id ?? "?"}`,
         );
       const body = [
         data?.errorText ? `Error: ${data.errorText}` : "",
@@ -724,6 +742,30 @@ export default function (pi: ExtensionAPI) {
       prompt,
       fallback: deriveBtwTitle(prompt),
     });
+
+    // When this pi session runs inside Herdr, open the side agent as a
+    // visible pane next to the current one; fall back to the in-process
+    // headless subagent when Herdr is not available.
+    const herdrPane = await tryOpenBtwHerdrPane({
+      title,
+      prompt,
+      cwd: ctx.cwd,
+    });
+    if (herdrPane) {
+      deliverBtwEntry({
+        id: herdrPane.paneId,
+        title,
+        status: "running",
+        prompt,
+        answer: `Opened in Herdr pane ${herdrPane.paneId} — the agent is running there and can be followed or taken over from Herdr.`,
+      });
+      ctx.ui.notify(
+        `by the way “${title}” opened in Herdr pane ${herdrPane.paneId}`,
+        "info",
+      );
+      return;
+    }
+
     let snap: SubagentSnapshot;
     try {
       snap = await runTool(
