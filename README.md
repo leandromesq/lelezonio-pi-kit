@@ -14,6 +14,9 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 - Background terminals for servers, watchers, and long-running commands
 - Persistent remote Pi agents over SSH and Herdr, with context handoff and reconnectable monitoring
 - First-class `fd` and `rg` tools
+- Default-off Playwright browser tools for live web-app debugging
+- Composable one-turn prompt snippets via `Alt+S`
+- YouTube transcript extraction through a cross-platform skill
 - Git status, changed-file browser, PR information, `/yeet`, and guarded `/git <target-branch>` workflows
 - Multiple-choice `ask_user` tool
 - Automatic run summaries and conversation export
@@ -26,12 +29,14 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 | `ask-user`             | Interactive multiple-choice questions with a free-form option                 |
 | `auto-naming`          | Automatic Pi session, subagent, and Herdr workspace titles via `/title-model` |
 | `background-terminals` | Background process tools and the `/ps` dashboard                              |
+| `browser`              | Default-off Playwright tools, enabled per session with `/browser on`          |
 | `copy-all`             | `/copy-all` conversation export                                               |
 | `codex-accounts`       | Save and switch Codex CLI accounts with `/codex`                              |
 | `file-search`          | Typed `fd` and `rg` model tools                                               |
 | `git-info`             | Branch/PR dashboard state, `/lg`, and `/pr`                                   |
 | `git-pr`               | `/yeet` and guarded `/git <target-branch>` workflows                          |
 | `model-info`           | Model, thinking, context, and cost state for the dashboard                    |
+| `prompt-snippets`      | One-turn composable behavior rules selected with `Alt+S` or `/snippets`       |
 | `remote-agents`        | Persistent remote Pi jobs over SSH and Herdr with `/remote` and `/remotes`    |
 | `subagents`            | Headless Pi and Codex children, profiles, result delivery, and `/subagents`   |
 | `summaries`            | Asynchronous post-run recaps and `/summary-model`                             |
@@ -82,10 +87,12 @@ mv ~/.pi/agent ~/.pi/agent.backup
 git clone https://github.com/leandromesq/lelezonio-pi-kit.git ~/.pi/agent
 cd ~/.pi/agent
 npm ci --omit=dev
+npm --prefix extensions/browser ci --omit=dev
+node extensions/browser/node_modules/playwright-core/cli.js install chromium
 cp settings.example.json settings.json
 ```
 
-Restore any private state you want to keep from the backup, especially `auth.json`, `trust.json`, `sessions/`, and local memory directories. Merge rather than blindly replacing `settings.json`; keep `"packages": []` so stale npm-installed Pi packages are not loaded.
+Restore any private state you want to keep from the backup, especially `auth.json`, `trust.json`, `sessions/`, and local memory directories. Merge rather than blindly replacing `settings.json`; keep `"packages": []` unless you deliberately install an optional package such as Hound.
 
 Start Pi and use `/login` if authentication was not restored. See [SETUP.md](SETUP.md) for migration instructions, Windows commands, prerequisites, updates, and configuration.
 

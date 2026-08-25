@@ -41,6 +41,7 @@ skills/*
 !skills/background-terminals/
 !skills/remote-agents/
 !skills/subagents/
+!skills/youtube-transcript/
 
 # Local caches and checkpoints
 checkpoints/

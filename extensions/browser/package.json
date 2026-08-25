@@ -1,0 +1,19 @@
+{
+  "name": "pi-extension-browser",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Playwright-driven headless browser tools for pi: navigate, eval, observe console/network, fill, click, screenshot, close.",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p .",
+    "test": "node --test --test-force-exit --experimental-strip-types buffer.test.ts headers.test.ts eval.test.ts format.test.ts gate.test.ts runtime.integration.test.ts"
+  },
+  "dependencies": {
+    "playwright-core": "^1.57.0"
+  }
+}

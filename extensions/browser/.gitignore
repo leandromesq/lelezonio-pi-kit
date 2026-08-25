@@ -1,0 +1,4 @@
+# Chromium user-data dir (cookies, localStorage, session state)
+/.profile/
+# Installed dependencies are extension-local
+/node_modules/

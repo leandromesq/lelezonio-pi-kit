@@ -27,6 +27,8 @@ Use this when `~/.pi/agent` does not exist or contains no state you need:
 git clone https://github.com/leandromesq/lelezonio-pi-kit.git ~/.pi/agent
 cd ~/.pi/agent
 npm ci --omit=dev
+npm --prefix extensions/browser ci --omit=dev
+node extensions/browser/node_modules/playwright-core/cli.js install chromium
 cp settings.example.json settings.json
 ```
 
@@ -45,6 +47,8 @@ mv ~/.pi/agent ~/.pi/agent.backup
 git clone https://github.com/leandromesq/lelezonio-pi-kit.git ~/.pi/agent
 cd ~/.pi/agent
 npm ci --omit=dev
+npm --prefix extensions/browser ci --omit=dev
+node extensions/browser/node_modules/playwright-core/cli.js install chromium
 cp settings.example.json settings.json
 ```
 
@@ -69,6 +73,8 @@ Move-Item $agent $backup
 git clone https://github.com/leandromesq/lelezonio-pi-kit.git $agent
 Set-Location $agent
 npm ci --omit=dev
+npm --prefix extensions/browser ci --omit=dev
+node extensions/browser/node_modules/playwright-core/cli.js install chromium
 Copy-Item settings.example.json settings.json
 ```
 
@@ -97,13 +103,13 @@ Merge any model, provider, retry, or keybinding preferences from your previous s
 
 ## Hound web research
 
-Hound is an optional local MCP service that adds `web_search`, `web_fetch`, `web_crawl`, and `web_screenshot` to Pi. It has two parts: the Pi extension and the Python engine. Its maintained upstream is [dondai44423/master-fetch](https://github.com/dondai44423/master-fetch), which supersedes the old `dondai1234` repository. Install both; the commands below keep the engine isolated from system Python and install the extension globally rather than adding it to this repository's `packages` array.
+Hound is an optional local MCP service that adds `web_search`, `web_fetch`, `web_crawl`, and `web_screenshot` to Pi. It has two parts: the Pi extension and the Python engine. Its maintained upstream is [dondai44423/master-fetch](https://github.com/dondai44423/master-fetch), which supersedes the old `dondai1234` repository. Install both; the commands below keep the engine isolated from system Python and record the extension only in the user's private `settings.json`, not in this repository's tracked setup.
 
 ### Install on Linux or macOS
 
 ```sh
 python3 -m venv ~/.local/share/hound-venv
-~/.local/share/hound-venv/bin/python -m pip install --upgrade "hound-mcp[all]"
+~/.local/share/hound-venv/bin/python -m pip install --upgrade "hound-mcp[all]==13.1.2"
 ~/.local/share/hound-venv/bin/python -m playwright install chromium
 
 mkdir -p ~/.local/bin
@@ -116,10 +122,27 @@ Make sure `~/.local/bin` is on `PATH` before starting Pi:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Install the Pi extension globally from the maintained repository. `v13.1.0` is the matching current release:
+### Install on Windows without administrator access
+
+```powershell
+$venv = Join-Path $HOME ".local\share\hound-venv"
+python -m venv $venv
+& "$venv\Scripts\python.exe" -m pip install --upgrade "hound-mcp[all]==13.1.2"
+& "$venv\Scripts\python.exe" -m playwright install chromium
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$scripts = "$venv\Scripts"
+if (($userPath -split ";") -notcontains $scripts) {
+  [Environment]::SetEnvironmentVariable("Path", "$scripts;$userPath", "User")
+}
+```
+
+Restart the terminal after changing the user `PATH`.
+
+Install the Pi extension globally from the maintained repository. `v13.1.2` includes important SSRF fixes and is the matching current release:
 
 ```sh
-pi install git:github.com/dondai44423/master-fetch@v13.1.0
+pi install git:github.com/dondai44423/master-fetch@v13.1.2
 ```
 
 Do not install the legacy `npm:@houndmcp/hound-mcp-pi` package; its published release still points at the old repository.
@@ -139,7 +162,7 @@ If Hound was installed through the old npm package, replace it with the maintain
 
 ```sh
 pi uninstall npm:@houndmcp/hound-mcp-pi
-pi install git:github.com/dondai44423/master-fetch@v13.1.0
+pi install git:github.com/dondai44423/master-fetch@v13.1.2
 ```
 
 ### Update
@@ -148,7 +171,7 @@ Update the engine with its built-in updater. To update the Pi extension, replace
 
 ```sh
 hound -u
-pi uninstall git:github.com/dondai44423/master-fetch@v13.1.0
+pi uninstall git:github.com/dondai44423/master-fetch@v13.1.2
 pi install git:github.com/dondai44423/master-fetch@v<version>
 ```
 
@@ -238,6 +261,8 @@ Change the setting to `"regular"` if you prefer the terminal's native scrollback
 cd ~/.pi/agent
 git pull --ff-only
 npm ci --omit=dev
+npm --prefix extensions/browser ci --omit=dev
+node extensions/browser/node_modules/playwright-core/cli.js install chromium
 ```
 
 Review local changes to `subagents.json`, `AGENTS.md`, or skills before pulling. Runtime/private files remain untracked.
