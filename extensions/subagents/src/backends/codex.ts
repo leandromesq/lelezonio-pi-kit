@@ -48,6 +48,31 @@ interface ToolState {
 
 // --- Binary + protocol helpers -----------------------------------------------
 
+const CODEX_APP_SERVER_ARGS = ["app-server", "--stdio"] as const;
+
+export interface CodexSpawnCommand {
+  readonly command: string;
+  readonly args: string[];
+  readonly windowsVerbatimArguments?: boolean;
+}
+
+/** Windows cannot execute npm-generated .cmd/.bat shims directly via spawn(). */
+export function codexSpawnCommand(
+  binary: string,
+  platform: NodeJS.Platform = process.platform,
+  comspec = process.env.ComSpec,
+): CodexSpawnCommand {
+  if (platform === "win32" && /\.(?:cmd|bat)$/i.test(binary)) {
+    const commandLine = `""${binary}" ${CODEX_APP_SERVER_ARGS.join(" ")}"`;
+    return {
+      command: comspec?.trim() || "cmd.exe",
+      args: ["/d", "/s", "/c", commandLine],
+      windowsVerbatimArguments: true,
+    };
+  }
+  return { command: binary, args: [...CODEX_APP_SERVER_ARGS] };
+}
+
 let cachedCodexBinary: string | null | undefined;
 
 function executable(file: string) {
@@ -317,13 +342,15 @@ const makeCodexSession = (
       Queue.offerUnsafe(events, event);
     };
 
+    const launch = codexSpawnCommand(binary);
     const child = yield* Effect.try({
       try: () =>
-        spawn(binary, ["app-server", "--stdio"], {
+        spawn(launch.command, launch.args, {
           cwd: task.cwd,
           env: process.env,
           stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
+          windowsVerbatimArguments: launch.windowsVerbatimArguments,
           // Own process group on POSIX so teardown can signal the whole
           // tree: a wedged app-server must not orphan a still-running
           // shell command it spawned.

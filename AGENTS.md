@@ -1,4 +1,6 @@
-# System specs (this PC)
+# System specs (personal Linux laptop only)
+
+> These specifications and environment assumptions apply only on my personal Linux laptop. When running on Windows, ignore this entire section.
 
 - **OS**: CachyOS Linux (Arch-based, rolling)
 - **CPU**: 13th Gen Intel Core i7-13620H (12+4 cores, 16 threads) @ up to 4.90 GHz
@@ -8,12 +10,6 @@
 - **WM**: niri (Wayland compositor)
 - **Terminal**: kitty, using herdr multiplexer and pi agent
 - **Packages**: pacman
-
----
-
-# General Rules
-
-- When doing changes to pi-setup / lelezonio-pi-kit, remember to change both the local setup and the repo files
 
 ---
 
