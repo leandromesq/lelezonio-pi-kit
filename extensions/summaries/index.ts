@@ -8,6 +8,7 @@ import {
   buildFallbackRecap,
   createRunBoundary,
   getRunEntries,
+  isRunInterrupted,
   serializeRunTranscript,
 } from "./src/transcript.ts";
 import {
@@ -80,6 +81,13 @@ export default function (pi: ExtensionAPI) {
       run.baselineLeafId,
     );
     if (entries.length === 0) return;
+
+    // Never recap interrupted/aborted runs: pi still fires `agent_settled`
+    // after a user abort (or a teardown abort), marking the run's final
+    // assistant message with stopReason "aborted". The check runs synchronously
+    // on the settle-time entries and before any generation task is created, so
+    // no async recap can ever be delivered for an aborted run.
+    if (isRunInterrupted(entries)) return;
 
     const config = loadSummaryConfig();
     const controller = new AbortController();

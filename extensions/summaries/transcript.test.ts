@@ -5,6 +5,7 @@ import {
   buildFallbackRecap,
   createRunBoundary,
   getRunEntries,
+  isRunInterrupted,
   serializeRunTranscript,
   TRANSCRIPT_MAX_BYTES,
 } from "./src/transcript.ts";
@@ -141,6 +142,126 @@ test("fallback recap is written in Brazilian Portuguese", () => {
   assert.equal(
     recap.next,
     "Revise o trabalho concluído acima e continue se ainda houver algo pendente.",
+  );
+});
+
+type AssistantMessageShape = Extract<
+  SessionEntry,
+  { type: "message" }
+>["message"] & { role: "assistant" };
+
+function assistant(
+  id: string,
+  stopReason: "stop" | "aborted" | "error",
+  overrides: Partial<
+    Pick<AssistantMessageShape, "content" | "timestamp" | "errorMessage">
+  > = {},
+): SessionEntry {
+  return entry(id, {
+    role: "assistant",
+    content: [{ type: "text", text: "worked" }],
+    api: "openai-codex-responses",
+    provider: "openai-codex",
+    model: "gpt-5.6-luna",
+    usage,
+    stopReason,
+    timestamp: 0,
+    ...overrides,
+  });
+}
+
+function user(id: string): SessionEntry {
+  return entry(id, { role: "user", content: "go", timestamp: 0 });
+}
+
+test("interrupted runs end with an aborted final assistant message", () => {
+  // Abort mid-stream: partial content plus the aborted marker pi persists.
+  assert.equal(
+    isRunInterrupted([
+      user("u"),
+      assistant("a", "aborted", {
+        content: [{ type: "text", text: "partial answer" }],
+        timestamp: 1,
+      }),
+    ]),
+    true,
+  );
+  // Abort during teardown/shutdown: failure message with empty content.
+  assert.equal(
+    isRunInterrupted([user("u"), assistant("a", "aborted", { content: [] })]),
+    true,
+  );
+});
+
+test("interrupted detection ignores trailing bookkeeping entries", () => {
+  const run: SessionEntry[] = [
+    user("u"),
+    assistant("a", "aborted"),
+    {
+      type: "model_change",
+      id: "m",
+      parentId: "a",
+      timestamp: "",
+      provider: "openai-codex",
+      modelId: "gpt-5.6-luna",
+    },
+    {
+      type: "custom",
+      id: "c",
+      parentId: "m",
+      timestamp: "",
+      customType: "other-extension",
+      data: {},
+    },
+  ];
+  assert.equal(isRunInterrupted(run), true);
+});
+
+test("normal, errored, and recovered runs are not interruptions", () => {
+  // Normal completion.
+  assert.equal(isRunInterrupted([user("u"), assistant("a", "stop")]), false);
+  // Generic errors (stopReason "error") are NOT aborts: summaries must survive.
+  assert.equal(
+    isRunInterrupted([
+      user("u"),
+      assistant("a", "error", { errorMessage: "provider 500" }),
+    ]),
+    false,
+  );
+  // A tool abort mid-run followed by a completed turn: the run settled fine.
+  assert.equal(
+    isRunInterrupted([
+      user("u"),
+      assistant("a", "aborted", { errorMessage: "Operation aborted" }),
+      entry("tr", {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "bash",
+        content: [{ type: "text", text: "killed" }],
+        isError: true,
+        timestamp: 0,
+      }),
+      assistant("final", "stop"),
+    ]),
+    false,
+  );
+});
+
+test("interrupted detection is false without any assistant message", () => {
+  assert.equal(isRunInterrupted([]), false);
+  assert.equal(
+    isRunInterrupted([
+      user("u"),
+      entry("tr", {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "bash",
+        content: [{ type: "text", text: "out" }],
+        isError: false,
+        timestamp: 0,
+      }),
+    ]),
+    false,
   );
 });
 

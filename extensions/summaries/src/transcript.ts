@@ -40,6 +40,32 @@ export function getRunEntries(
   return baselineIndex === -1 ? [] : branch.slice(baselineIndex + 1);
 }
 
+/**
+ * Whether a settled run ended in an interrupted/aborted terminal state.
+ *
+ * When the user aborts a run (the abort keybinding, `ctx.abort()`, or an abort
+ * during teardown/shutdown), pi still emits `agent_settled`, and the run's final
+ * assistant message is persisted with `stopReason: "aborted"` (optionally with
+ * partial content and an error message). Generic run failures are persisted with
+ * `stopReason: "error"` instead and are NOT interruptions, so their summaries
+ * are preserved.
+ *
+ * We scan for the run's last assistant message rather than assuming it is the
+ * final entry: trailing bookkeeping entries (model/thinking changes, other
+ * extensions' custom entries) can follow it, and a run whose aborted turn was
+ * later retried or continued settles on a completed assistant message, which is
+ * a legitimate run to summarize.
+ */
+export function isRunInterrupted(entries: readonly SessionEntry[]) {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry.type !== "message" || entry.message.role !== "assistant")
+      continue;
+    return entry.message.stopReason === "aborted";
+  }
+  return false;
+}
+
 function truncateUtf8(text: string, maxBytes: number) {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
 
@@ -257,7 +283,8 @@ export function buildFallbackRecap(entries: readonly SessionEntry[]) {
     : "";
 
   return {
-    recap: `A execução do agente principal foi concluída.${activity}${result}`.trim(),
+    recap:
+      `A execução do agente principal foi concluída.${activity}${result}`.trim(),
     next: "Revise o trabalho concluído acima e continue se ainda houver algo pendente.",
   };
 }
