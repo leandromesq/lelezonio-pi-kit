@@ -125,10 +125,74 @@ test("cancel interrupts a running stub subagent", async () => {
     );
     const report = await runTool(runtime, manager.cancel([snap.id]));
     assert.deepEqual(report, [
-      { id: snap.id, title: "test", status: "error", cancelled: true },
+      {
+        id: snap.id,
+        title: "[sa-1 · codex] test",
+        status: "error",
+        cancelled: true,
+      },
     ]);
     assert.equal(manager.view.get(snap.id)?.errorText, "Run was aborted");
   });
+});
+
+test("the manager pre-allocates logical ids before the backend spawn", async () => {
+  const seen: Array<{ logicalId?: string; profile?: string }> = [];
+  const runtime = ManagedRuntime.make(
+    makeSubagentManagerLayer().pipe(
+      Layer.provide(
+        Layer.sync(BackendRegistry, () => {
+          const backends: SubagentBackend[] = [
+            makeStubBackend({
+              backend: "codex",
+              defaultModelLabel: "codex/gpt-5-codex",
+              contextWindow: 272_000,
+              toolName: "shell",
+              cadenceMs: 10,
+              onTask: (t) =>
+                seen.push({ logicalId: t.logicalId, profile: t.profile }),
+            }),
+          ];
+          return new Map<BackendName, SubagentBackend>(
+            backends.map((backend) => [backend.name, backend]),
+          );
+        }),
+      ),
+    ),
+  );
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const first = await runTool(
+      runtime,
+      manager.spawn("codex", {
+        prompt: "one",
+        title: "first",
+        cwd: process.cwd(),
+        profile: "reviewer",
+        parent,
+      }),
+    );
+    const second = await runTool(
+      runtime,
+      manager.spawn("codex", {
+        prompt: "two",
+        title: "second",
+        cwd: process.cwd(),
+        parent,
+      }),
+    );
+    // Ids allocated in spawn order, pre-backend, and titles carry profile.
+    assert.equal(first.id, "sa-1");
+    assert.equal(second.id, "sa-2");
+    assert.deepEqual(seen, [
+      { logicalId: "sa-1", profile: "reviewer" },
+      { logicalId: "sa-2", profile: undefined },
+    ]);
+    assert.equal(first.title, "[sa-1 · reviewer] first");
+    assert.equal(second.title, "[sa-2 · codex] second");
+  } finally {
+    await runtime.dispose();
+  }
 });
 
 test("spawn origin propagates to ids, snapshots, and settlement", async () => {

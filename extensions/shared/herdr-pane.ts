@@ -3,31 +3,32 @@
  * pane next to the current one, extracted from the subagents extension so all
  * extensions share one reviewed implementation of the Herdr CLI dance.
  *
+ * The Herdr CLI discovery/envelopes and the runner live in the deep shared
+ * module (extensions/shared/herdr-workspace.ts); this file keeps the pane
+ * split/run/close behavior and re-exports the runner for API compatibility
+ * (subagents' `/btw` and the takeover host import from here).
+ *
  * Everything here is plain Node (no pi imports), so it runs in unit tests.
  * The pane API is the deep seam: tests inject a stub runner/current-pane
  * resolver instead of talking to a live Herdr server.
  */
 
-import { spawn } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
+import {
+  herdrEnvironment,
+  runHerdr,
+  shellQuote,
+  type HerdrCliEnvelope,
+  type HerdrRunner,
+} from "./herdr-workspace.ts";
 
-/** This pi session was launched by Herdr into a pane with a live socket. */
-export function herdrEnvironment(): boolean {
-  return (
-    process.env.HERDR_ENV === "1" &&
-    !!process.env.HERDR_PANE_ID &&
-    !!process.env.HERDR_SOCKET_PATH
-  );
-}
-
-/** Stable JSON envelope herdr subcommands print (last trimmed line). */
-export interface HerdrCliEnvelope {
-  readonly error?: unknown;
-  readonly result?: HerdrCliEnvelope;
-  readonly pane?: { readonly pane_id?: string };
-}
+// Re-exported for existing consumers (subagents /btw, takeover host, tests).
+export {
+  herdrEnvironment,
+  runHerdr,
+  shellQuote,
+  type HerdrCliEnvelope,
+  type HerdrRunner,
+};
 
 const SPLIT_DIRECTION = "right";
 const SPLIT_RATIO = "0.45";
@@ -50,12 +51,6 @@ export interface SplitHerdrPaneOptions {
   readonly noFocus?: boolean;
 }
 
-/** Run a herdr CLI subcommand and parse its JSON envelope. */
-export type HerdrRunner = (
-  args: ReadonlyArray<string>,
-  timeoutMs: number,
-) => Promise<HerdrCliEnvelope>;
-
 export interface HerdrPaneApi {
   /** True when this process runs inside a Herdr pane with a live socket. */
   environment(): boolean;
@@ -76,151 +71,6 @@ export interface HerdrPaneDeps {
   readonly runRetryDeadlineMs?: number;
 }
 
-// --- CLI runner (default) -------------------------------------------------------
-
-const sleep = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-function isFile(candidate: string): boolean {
-  try {
-    return fs.statSync(candidate).isFile();
-  } catch {
-    return false;
-  }
-}
-
-function latestStandaloneReleases(): string[] {
-  const root = path.join(
-    os.homedir(),
-    ".herdr",
-    "packages",
-    "standalone",
-    "releases",
-  );
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  return entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort()
-    .reverse()
-    .slice(0, 8)
-    .map((name) => path.join(root, name));
-}
-
-function herdrExecutable(): string | undefined {
-  // HERDR_EXE and HERDR_BIN_PATH are injected by Herdr itself.
-  const explicit = [process.env.HERDR_EXE, process.env.HERDR_BIN_PATH]
-    .map((value) => value?.trim())
-    .find((value) => value && isFile(value));
-  if (explicit) return explicit;
-  const pathDirs = (process.env.PATH ?? "")
-    .split(path.delimiter)
-    .map((dir) => dir.trim())
-    .filter(Boolean);
-  for (const dir of pathDirs) {
-    for (const name of ["herdr.exe", "herdr.cmd", "herdr"]) {
-      const candidate = path.join(dir, name);
-      if (isFile(candidate)) return candidate;
-    }
-  }
-  for (const release of latestStandaloneReleases()) {
-    const candidate = path.join(release, "herdr.exe");
-    if (isFile(candidate)) return candidate;
-  }
-  return undefined;
-}
-
-function parseCliJson(output: string): HerdrCliEnvelope | undefined {
-  const lastLine = output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .at(-1);
-  if (!lastLine) return {};
-  try {
-    return JSON.parse(lastLine) as HerdrCliEnvelope;
-  } catch {
-    return undefined;
-  }
-}
-
-export function runHerdr(
-  args: ReadonlyArray<string>,
-  timeoutMs: number,
-): Promise<HerdrCliEnvelope> {
-  return new Promise((resolve, reject) => {
-    const executable = herdrExecutable();
-    if (!executable) {
-      reject(new Error("herdr executable not found"));
-      return;
-    }
-    const child = spawn(executable, [...args], { windowsHide: true });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    let settled = false;
-    const finish = (callback: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      callback();
-    };
-    const timer = setTimeout(() => {
-      if (settled) return;
-      child.kill();
-      finish(() =>
-        reject(
-          new Error(`herdr ${args[0] ?? ""} timed out after ${timeoutMs}ms`),
-        ),
-      );
-    }, timeoutMs);
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.on("error", (error) => finish(() => reject(error)));
-    child.on("close", (code) => {
-      finish(() => {
-        const output = Buffer.concat(stdout).toString("utf8").trim();
-        const errorText = Buffer.concat(stderr).toString("utf8").trim();
-        if (code !== 0) {
-          reject(new Error(errorText || output || `herdr exited ${code}`));
-          return;
-        }
-        // Login banners or shell startup noise may precede the JSON envelope.
-        const parsed = parseCliJson(output);
-        if (!parsed) {
-          reject(
-            new Error(
-              `herdr returned non-JSON output: ${output.slice(0, 300)}`,
-            ),
-          );
-          return;
-        }
-        if (parsed.error !== undefined) {
-          reject(
-            new Error(
-              typeof parsed.error === "object"
-                ? JSON.stringify(parsed.error)
-                : String(parsed.error),
-            ),
-          );
-          return;
-        }
-        resolve(parsed);
-      });
-    });
-  });
-}
-
-/** Shell-quote for the pane shell, which is pwsh (herdr default_shell). */
-export function shellQuote(value: string): string {
-  // Single quotes are literal in pwsh; embedded single quotes are doubled.
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
 // --- Pane API --------------------------------------------------------------------
 
 export function createHerdrPaneApi(deps?: HerdrPaneDeps): HerdrPaneApi {
@@ -228,6 +78,9 @@ export function createHerdrPaneApi(deps?: HerdrPaneDeps): HerdrPaneApi {
   const currentPaneId =
     deps?.currentPaneId ?? (() => process.env.HERDR_PANE_ID);
   const runRetryDeadlineMs = deps?.runRetryDeadlineMs ?? RUN_RETRY_DEADLINE_MS;
+
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms));
 
   return {
     environment: () => herdrEnvironment(),

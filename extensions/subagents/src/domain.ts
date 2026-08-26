@@ -39,6 +39,8 @@ export type SubagentStatus = "running" | "done" | "error";
 export interface ParentContext {
   readonly parentCwd: string;
   readonly projectTrusted: boolean;
+  /** Parent pi session id — collision-safe prefix for Herdr agent names. */
+  readonly parentSessionId?: string;
   /** Parent pi model, for the pi backend's "inherit" default. */
   readonly inheritedModel?: { readonly provider: string; readonly id: string };
   readonly inheritedThinkingLevel?: string;
@@ -49,6 +51,15 @@ export interface ParentContext {
 export interface SpawnTask {
   /** Omitted for normal tool-driven spawns. */
   readonly origin?: SubagentOrigin;
+  /**
+   * Logical subagent id ("sa-3" / "btw-1") allocated by the manager BEFORE
+   * the backend spawn so Herdr pane titles and technical agent names can be
+   * derived deterministically. Backends must not allocate their own.
+   */
+  readonly logicalId?: string;
+  /** Resolved subagent profile name, when the spawn used a configured
+   * profile. Displayed in pane titles; also carried for identity. */
+  readonly profile?: string;
   readonly prompt: string;
   readonly title: string;
   readonly cwd: string;
@@ -63,6 +74,19 @@ export interface SpawnTask {
   readonly parent: ParentContext;
 }
 
+/**
+ * The pane/agent-visible title: `[<logicalId> · <profile|backend>] <title>`.
+ * Used by the manager snapshot and the Herdr worker pane identically so the
+ * pane label always matches the dashboard row.
+ */
+export function subagentDisplayTitle(
+  backend: BackendName,
+  task: Pick<SpawnTask, "title" | "logicalId" | "profile">,
+): string {
+  const tag = task.profile ?? backend;
+  return `[${task.logicalId} · ${tag}] ${task.title}`;
+}
+
 export interface SubagentMeta {
   readonly backend: BackendName;
   /** Display label, e.g. "openai-codex/gpt-5.6-sol" or "gpt-5-codex". */
@@ -73,6 +97,12 @@ export interface SubagentMeta {
   readonly sessionFilePath?: string;
   /** Native Pi session id or Codex conversation id. */
   readonly nativeSessionId?: string;
+  /** Herdr worker pane hosting this subagent (when spawned inside Herdr). */
+  readonly herdrPaneId?: string;
+  /** Technical Herdr agent name (collision-safe parent prefix + logical id). */
+  readonly herdrAgentName?: string;
+  /** True once the user took the pane over (pane survives settle/close). */
+  readonly takenOver?: boolean;
 }
 
 // --- Transcript ------------------------------------------------------------

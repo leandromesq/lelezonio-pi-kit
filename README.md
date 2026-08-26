@@ -11,7 +11,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**�
 - Named Pi/Codex subagent profiles with configurable models and thinking effort
 - Fast Codex CLI account saving and switching with `/codex`
 - Multi-agent workflows with phased and parallel execution
-- Take over subagents, background terminals, and remote agents in a Herdr pane when running inside Herdr (one live viewer, never a second Pi; falls back to the in-session overlays outside Herdr)
+- Subagents spawn as real interactive Pi/Codex TUIs in a shared `Pi Workers` Herdr workspace when running inside Herdr (in-process fallback outside Herdr), with live pane take-over from `/subagents`
 - Background terminals for servers, watchers, and long-running commands
 - Persistent remote Pi agents over SSH and Herdr, with context handoff and reconnectable monitoring
 - First-class `fd` and `rg` tools
@@ -25,25 +25,25 @@ This repository is the setup itself. It is **not an npm package or Pi package**�
 
 ## Extensions
 
-| Extension              | What it adds                                                                  |
-| ---------------------- | ----------------------------------------------------------------------------- |
-| `ask-user`             | Interactive multiple-choice questions with a free-form option                 |
-| `auto-naming`          | Automatic Pi session, subagent, and Herdr workspace titles via `/title-model` |
-| `background-terminals` | Background process tools and the `/ps` dashboard                              |
-| `browser`              | Default-off Playwright tools, enabled per session with `/browser on`          |
-| `copy-all`             | `/copy-all` conversation export                                               |
-| `codex-accounts`       | Save and switch Codex CLI accounts with `/codex`                              |
-| `file-search`          | Typed `fd` and `rg` model tools                                               |
-| `git-info`             | Branch/PR dashboard state, `/lg`, and `/pr`                                   |
-| `git-pr`               | `/yeet` and guarded `/git <target-branch>` workflows                          |
-| `model-info`           | Model, thinking, context, and cost state for the dashboard                    |
-| `prompt-snippets`      | One-turn composable behavior rules selected with `Alt+S` or `/snippets`       |
-| `remote-agents`        | Persistent remote Pi jobs over SSH and Herdr with `/remote` and `/remotes`    |
-| `subagents`            | Headless Pi and Codex children, profiles, result delivery, and `/subagents`   |
-| `summaries`            | Asynchronous post-run recaps and `/summary-model`                             |
-| `ui-customization`     | Startup logo, footer, thinking colors, and fixed-bottom editor                |
-| `workflows`            | Scriptable phased/parallel multi-agent workflows and `/workflows`             |
-| `zed`                  | Open the current directory in Zed with `/zed`                                 |
+| Extension              | What it adds                                                                                                        |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `ask-user`             | Interactive multiple-choice questions with a free-form option                                                       |
+| `auto-naming`          | Automatic Pi session, subagent, and Herdr workspace titles via `/title-model`                                       |
+| `background-terminals` | Background process tools and the `/ps` dashboard                                                                    |
+| `browser`              | Default-off Playwright tools, enabled per session with `/browser on`                                                |
+| `copy-all`             | `/copy-all` conversation export                                                                                     |
+| `codex-accounts`       | Save and switch Codex CLI accounts with `/codex`                                                                    |
+| `file-search`          | Typed `fd` and `rg` model tools                                                                                     |
+| `git-info`             | Branch/PR dashboard state, `/lg`, and `/pr`                                                                         |
+| `git-pr`               | `/yeet` and guarded `/git <target-branch>` workflows                                                                |
+| `model-info`           | Model, thinking, context, and cost state for the dashboard                                                          |
+| `prompt-snippets`      | One-turn composable behavior rules selected with `Alt+S` or `/snippets`                                             |
+| `remote-agents`        | Persistent remote Pi jobs over SSH and Herdr with `/remote` and `/remotes`                                          |
+| `subagents`            | Pi and Codex children (Herdr-native TUIs in Herdr, in-process outside), profiles, result delivery, and `/subagents` |
+| `summaries`            | Asynchronous post-run recaps and `/summary-model`                                                                   |
+| `ui-customization`     | Startup logo, footer, thinking colors, and fixed-bottom editor                                                      |
+| `workflows`            | Scriptable phased/parallel multi-agent workflows and `/workflows`                                                   |
+| `zed`                  | Open the current directory in Zed with `/zed`                                                                       |
 
 ## Themes
 
@@ -129,22 +129,36 @@ Run `/codex` to select an account. The switch updates Codex CLI credentials for 
 
 The PR workflow requires an authenticated [GitHub CLI](https://cli.github.com/) installation.
 
-## Take over in a Herdr pane
+## Watch in Herdr panes
 
-When Pi runs inside Herdr (`HERDR_ENV=1`), selecting **take over** for a
-subagent (`/subagents`), a background terminal (`/ps`), or a remote agent
-(`/remotes`) opens a new Herdr pane that shows and controls the **same
-process** — it never starts a second Pi. The pane runs a thin viewer over a
-loopback JSONL bridge: live snapshot, `i`/Enter to compose and send for
-subagents/remotes (all printable characters type freely), Ctrl+C (with confirmation) to
-abort/kill/cancel, `r` to refresh a remote, `t` to toggle terminal
-stdout/stderr, `q` to detach (the target keeps running).
+When Pi runs inside Herdr (`HERDR_ENV=1`), subagents spawn as **real
+interactive TUI processes** in a shared ephemeral `Pi Workers · <project> ·
+<short-session>` workspace (Subagents tab): the parent launches Pi or Codex
+through a zero-dependency launcher (`node worker-launcher.mjs <spec.json>` —
+the pane command line never carries the worker's real argv, so PowerShell
+quoting cannot mangle it), drives Pi and active-pane follow-ups through
+Herdr's low-level `pane send-text` + `pane send-keys enter` surface (Codex's
+initial/resumed prompt is a native positional argv from inside the JSON
+spec), and tails the native session file (Pi session JSONL persisted under
+`<agentDir>/sessions/workers/<parent>/<sa-id>`, Codex rollout JSONL matched
+by a run marker + cwd) to power the existing subagent dashboard. Marking a
+subagent in `/subagents` takes it over in its live pane (running: focus,
+never interrupt; settled: reopen and resume the exact native session with the
+full launch policy — Pi model/thinking/exclusions/trust, Codex
+cwd/model/reasoning effort/sandbox/approval) and exits the dashboard.
+Outside Herdr — or when the pane cannot be opened — subagents run in-process
+(Pi SDK / `codex app-server`) and `/subagents` uses the in-session overlay
+exactly as before.
 
-Outside Herdr, or whenever the pane cannot be opened (including when the
-viewer fails to authenticate), the in-session overlays are used exactly as
-before. `/btw` keeps launching a real `pi -p` in a pane. The design, protocol
-bounds, and lifecycle are documented in
-[docs/takeover-herdr.md](docs/takeover-herdr.md).
+Background terminals (`/ps`) open a **watcher pane** in the same workspace
+(Terminals tab) that tails the terminal's full-output spill files with a plain
+shell command (two merged `Get-Content -Wait` jobs / `tail -F`) — display-only, never a
+second Pi. Selecting a terminal in `/ps` focuses its pane; when the terminal
+settles, the watcher stops and the pane closes unless you took it over.
+
+`/remotes` keeps its in-session overlay (native remote takeover is deferred),
+and `/btw` keeps launching a real `pi -p` in a pane. The design and lifecycle
+are documented in [docs/takeover-herdr.md](docs/takeover-herdr.md).
 
 ## Development
 

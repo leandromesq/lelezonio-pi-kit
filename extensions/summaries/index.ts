@@ -22,6 +22,16 @@ const RECAP_ENTRY_TYPE = "summary-recap";
 const STATUS_KEY = "summaries";
 const SHUTDOWN_WAIT_MS = 1_000;
 
+/**
+ * Subagent children launched through the Herdr worker launcher carry
+ * `PI_SUBAGENT=1` in their env. In them the summaries extension disables
+ * itself entirely: a post-run recap inside a child is extra model activity
+ * the parent does not orchestrate, and it races the child pane closing
+ * right after completion. Other child extensions stay available; tools were
+ * already excluded at launch.
+ */
+export const summariesDisabled = () => process.env.PI_SUBAGENT === "1";
+
 async function waitForCancellation(
   tasks: readonly Promise<void>[],
   timeoutMs: number,
@@ -62,7 +72,7 @@ export default function (pi: ExtensionAPI) {
   );
 
   pi.on("session_start", (_event, ctx) => {
-    sessionActive = ctx.mode === "tui";
+    sessionActive = ctx.mode === "tui" && !summariesDisabled();
     statusContext = ctx;
     runBoundary.reset();
   });

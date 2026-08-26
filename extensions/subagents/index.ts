@@ -43,7 +43,11 @@ import { Type } from "typebox";
 import { loadNamingConfig } from "../auto-naming/src/config.ts";
 import { generateTaskTitle } from "../auto-naming/src/title-generator.ts";
 import { tryOpenBtwHerdrPane } from "./src/btw-herdr.ts";
-import { btwStatusLabel, deriveBtwTitle, isModelVisible } from "./src/by-the-way.ts";
+import {
+  btwStatusLabel,
+  deriveBtwTitle,
+  isModelVisible,
+} from "./src/by-the-way.ts";
 import { loadSubagentsConfig, resolveSpawnOptions } from "./src/config.ts";
 import {
   BACKEND_NAMES,
@@ -79,7 +83,15 @@ import {
   type SubagentRuntime,
 } from "./src/runtime.ts";
 import { openSubagentPicker, openSubagentTakeover } from "./src/ui/takeover.ts";
-import { disposeTakeoverHost } from "../shared/takeover-host.ts";
+import {
+  workerWorkspaceForSession,
+  disposeWorkerWorkspace,
+} from "../shared/herdr-workspace.ts";
+import {
+  setHerdrWorkerSessionDirRoot,
+  setHerdrWorkerSpecDirRoot,
+  setHerdrWorkerWorkspace,
+} from "./src/backends/herdr-worker.ts";
 
 const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
@@ -274,6 +286,31 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     sessionContext = ctx;
     if (ctx.hasUI) ui = ctx.ui;
+    // One ephemeral "Pi Workers" workspace per parent pi session, shared via
+    // the process-wide singleton with the background-terminals extension; the
+    // Herdr worker backend allocates its Subagents tab lazily on first spawn.
+    setHerdrWorkerWorkspace(
+      workerWorkspaceForSession(
+        path.basename(ctx.cwd),
+        ctx.sessionManager.getSessionId() ?? "session",
+        ctx.cwd,
+      ),
+    );
+    // Named Pi sessions persist under the normal agent sessions tree —
+    // <agentDir>/sessions/workers/<parent session>/<sa-id> — and are NEVER
+    // deleted on scope close/prune, so children stay discoverable/resumable
+    // (take-over reopens with `pi --session`). Launcher specs stay transient
+    // under tmp and are cleaned after launch / at scope close.
+    const parentSessionId = ctx.sessionManager.getSessionId();
+    setHerdrWorkerSessionDirRoot(
+      path.join(
+        getAgentDir(),
+        "sessions",
+        "workers",
+        parentSessionId ?? "session",
+      ),
+    );
+    setHerdrWorkerSpecDirRoot(path.join(getAgentDir(), "tmp", "worker-specs"));
   });
 
   pi.on("agent_settled", flushResults);
@@ -291,8 +328,12 @@ export default function (pi: ExtensionAPI) {
     // Disposing the runtime runs the manager finalizer, which tears down all
     // subagent scopes (and, later, their real child processes).
     await closing?.dispose();
-    // Close takeover panes/sockets opened in this session; targets keep running.
-    await disposeTakeoverHost();
+    // Close the Herdr worker workspace (bounded) and forget the session's
+    // worker wiring; targets keep running until the workspace closes.
+    setHerdrWorkerWorkspace(undefined);
+    setHerdrWorkerSessionDirRoot(undefined);
+    setHerdrWorkerSpecDirRoot(undefined);
+    await disposeWorkerWorkspace();
   });
 
   // --- Tools -------------------------------------------------------------
@@ -377,6 +418,7 @@ export default function (pi: ExtensionAPI) {
               childCwd: cwd,
               parentTrusted: ctx.isProjectTrusted(),
             }),
+            parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
             inheritedModel: ctx.model
               ? { provider: ctx.model.provider, id: ctx.model.id }
               : undefined,
@@ -781,6 +823,7 @@ export default function (pi: ExtensionAPI) {
           parent: {
             parentCwd: ctx.cwd,
             projectTrusted: ctx.isProjectTrusted(),
+            parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
             inheritedModel: ctx.model
               ? { provider: ctx.model.provider, id: ctx.model.id }
               : undefined,

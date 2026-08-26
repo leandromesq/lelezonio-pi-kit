@@ -35,6 +35,7 @@ import type {
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
 import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
+import { trySpawnHerdrWorker } from "./herdr-worker.ts";
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 
@@ -539,6 +540,7 @@ const makePiSession = (
           }
           return Effect.sync(() => startRun(text));
         }),
+      takeOver: Effect.succeed(false),
       interrupt: Effect.promise(async () => {
         if (state.closed) return;
         try {
@@ -569,5 +571,15 @@ export const piBackend: SubagentBackend = {
   capabilities: { steering: true, modelSelection: true, reasoningEffort: true },
   // In-process SDK: always available.
   available: Effect.succeed(true),
-  spawn: makePiSession,
+  spawn: (task) =>
+    Effect.gen(function* () {
+      // Inside Herdr, spawn the subagent as a native interactive pi TUI in
+      // the shared workspace's Subagents tab; any pre-launch failure falls
+      // back to the in-process SDK session below (unchanged behavior).
+      const worker = yield* trySpawnHerdrWorker("pi", task).pipe(
+        Effect.orElseSucceed(() => undefined),
+      );
+      if (worker) return worker;
+      return yield* makePiSession(task);
+    }),
 };

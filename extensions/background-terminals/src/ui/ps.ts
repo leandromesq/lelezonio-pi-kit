@@ -15,11 +15,7 @@ import type {
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import {
-  takeoverHost,
-  takeoverKey,
-  type TakeoverTarget,
-} from "../../../shared/takeover-host.ts";
+import type { TerminalObserverCoordinator } from "../observer.ts";
 import { formatElapsed, formatExit, type TerminalSnapshot } from "../domain.ts";
 import type { TerminalReadModel } from "../manager.ts";
 import { createOutputLineCache, sanitizeText } from "./output-view.ts";
@@ -65,52 +61,27 @@ function statusWord(snap: TerminalSnapshot, theme: Theme) {
 
 // --- Entry point ---------------------------------------------------------------
 
-/** Normalized snapshot for the takeover bridge (stdout main, stderr toggle). */
-export function terminalTarget(snap: TerminalSnapshot): TakeoverTarget {
-  return {
-    kind: "terminal",
-    id: snap.id,
-    title: snap.title,
-    status: snap.status,
-    since: snap.createdAt,
-    text: snap.stdout.text,
-    secondaryText: snap.stderr.text,
-  };
-}
-
 /**
- * Try to open this terminal in a Herdr takeover pane (read-only + kill).
- * Returns true when the pane took over; callers keep the in-session overlay
- * otherwise.
+ * Try to take the terminal over in its Herdr observer pane: marks the
+ * observer taken over (it then survives the terminal's settle) and focuses
+ * the Pi Workers workspace. Returns true when a live observer pane exists;
+ * callers keep the in-session overlay otherwise.
  */
-export async function tryOpenTerminalTakeoverPane(
+export async function tryOpenTerminalObserver(
   ctx: ExtensionCommandContext,
-  view: TerminalReadModel,
+  coordinator: TerminalObserverCoordinator | undefined,
   id: string,
 ): Promise<boolean> {
-  const snap = view.get(id);
-  if (!snap) return false;
-  const host = takeoverHost();
-  const key = takeoverKey("terminal", id);
-  const paneId = await host.open({
-    target: () => {
-      const current = view.get(id);
-      return current ? terminalTarget(current) : undefined;
-    },
-    actions: {
-      kill: () => view.requestKill(id),
-    },
-    cwd: snap.cwd,
-    subscribe: () => view.subscribeTo(id, () => host.refresh(key)),
-  });
-  if (!paneId) return false;
-  ctx.ui.notify(`Terminal ${id} taken over in Herdr pane ${paneId}`, "info");
+  if (!coordinator) return false;
+  if (!(await coordinator.takeOver(id))) return false;
+  ctx.ui.notify(`Terminal ${id} opened in the Pi Workers workspace`, "info");
   return true;
 }
 
 export async function openTerminalPicker(
   ctx: ExtensionCommandContext,
   view: TerminalReadModel,
+  coordinator: TerminalObserverCoordinator | undefined,
 ) {
   const selection: DashboardSelection = { index: 0 };
 
@@ -132,7 +103,7 @@ export async function openTerminalPicker(
     if (!picked) return;
     if (!view.get(picked)) continue;
 
-    if (await tryOpenTerminalTakeoverPane(ctx, view, picked)) return;
+    if (await tryOpenTerminalObserver(ctx, coordinator, picked)) return;
 
     await ctx.ui.custom<null>(
       (tui, theme, keybindings, done) =>
@@ -143,8 +114,8 @@ export async function openTerminalPicker(
       },
     );
     // After leaving the detail view, fall back to the dashboard. A successful
-    // pane take-over returns above: the pane replaces the UI, so reopening the
-    // dashboard here would loop.
+    // observer take-over returns above: the workspace replaces the UI, so
+    // reopening the dashboard here would loop.
   }
 }
 

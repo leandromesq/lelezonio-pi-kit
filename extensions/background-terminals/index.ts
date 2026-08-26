@@ -12,6 +12,12 @@
  * While ≥1 process runs, a one-line widget above the editor shows
  * "N background terminal(s) running • /ps to view". `/ps` opens a two-stage
  * full-screen overlay (list → read-only detail with stdout/stderr toggle).
+ * Inside Herdr, /ps instead hands a selected terminal to its live watcher
+ * pane in the shared "Pi Workers" workspace (a plain spill-file tail); the
+ * overlay remains the fallback outside Herdr or when no pane can open.
+ * bg_start opens the watcher automatically; on settle the watcher stops and
+ * the pane closes unless the user took it over. See
+ * extensions/shared/herdr-workspace.ts for the deep module.
  *
  * Architecture: Effect v4 core (manager service behind one ManagedRuntime);
  * this file is the async boundary where tool handlers run effects via
@@ -54,7 +60,14 @@ import {
 } from "./src/runtime.ts";
 import { sanitizeText } from "./src/ui/output-view.ts";
 import { openTerminalPicker } from "./src/ui/ps.ts";
-import { disposeTakeoverHost } from "../shared/takeover-host.ts";
+import {
+  createTerminalObserverCoordinator,
+  type TerminalObserverCoordinator,
+} from "./src/observer.ts";
+import {
+  disposeWorkerWorkspace,
+  workerWorkspaceForSession,
+} from "../shared/herdr-workspace.ts";
 
 const WIDGET_KEY = "background-terminals";
 
@@ -64,6 +77,8 @@ export default function (pi: ExtensionAPI) {
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
+  /** Session-scoped observer coordinator; owns no processes, only panes. */
+  let coordinator: TerminalObserverCoordinator | undefined;
   const resultDelivery = createDeferredResultDelivery<TerminalSnapshot>();
 
   const getRuntime = () => (runtime ??= createTerminalRuntime());
@@ -154,6 +169,9 @@ export default function (pi: ExtensionAPI) {
   };
 
   const onSettled = (snap: TerminalSnapshot, consumed: boolean) => {
+    // The terminal is done: stop its observer watcher and close the pane
+    // unless the user took it over. Never touches the (already settled) process.
+    void coordinator?.settle(snap);
     if (consumed) {
       // An in-flight bg_kill is returning this settlement itself.
       resultDelivery.consume([snap.id]);
@@ -172,6 +190,17 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     sessionContext = ctx;
     if (ctx.hasUI) ui = ctx.ui;
+    // One ephemeral "Pi Workers" workspace per parent pi session, shared via
+    // the process-wide singleton; observers allocate into it lazily on the
+    // first bg_start.
+    coordinator ??= createTerminalObserverCoordinator({
+      workspace: () =>
+        workerWorkspaceForSession(
+          path.basename(ctx.cwd),
+          ctx.sessionManager.getSessionId() ?? "session",
+          ctx.cwd,
+        ),
+    });
   });
 
   // Drain deferred results when the agent settles: together with the
@@ -196,12 +225,17 @@ export default function (pi: ExtensionAPI) {
     }
     widgetRunning = 0;
     ui = undefined;
+    const closingCoordinator = coordinator;
+    coordinator = undefined;
     const closing = runtime;
     runtime = undefined;
     managerPromise = undefined;
     await closing?.dispose();
-    // Close takeover panes/sockets opened in this session; targets keep running.
-    await disposeTakeoverHost();
+    // Close the observer bookkeeping, then the shared workspace through the
+    // controller (bounded); target processes are gone with the manager above,
+    // so this only ever closes tail panes/shells.
+    await closingCoordinator?.dispose();
+    await disposeWorkerWorkspace();
   });
 
   // --- Tools -------------------------------------------------------------
@@ -244,6 +278,10 @@ export default function (pi: ExtensionAPI) {
         getRuntime(),
         manager.start({ command, title, cwd }),
       );
+
+      // Inside Herdr, open a watcher pane over the terminal's spill files
+      // (silent no-op outside Herdr or when spilling is unavailable).
+      await coordinator?.attach(snap);
 
       return {
         content: [{ type: "text", text: buildStartResult(snap) }],
@@ -444,7 +482,7 @@ export default function (pi: ExtensionAPI) {
         );
         return;
       }
-      await openTerminalPicker(ctx, manager.view);
+      await openTerminalPicker(ctx, manager.view, coordinator);
     },
   });
 }

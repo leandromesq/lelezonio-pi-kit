@@ -12,7 +12,6 @@ import {
 } from "../domain.ts";
 import type { RemoteAgentReadModel } from "../manager.ts";
 import { buildTranscriptLines, sanitizeText } from "./transcript.ts";
-import { openRemoteTakeoverPaneOr } from "./pane.ts";
 
 function configuredKeys(
   keybindings: KeybindingsManager,
@@ -74,16 +73,18 @@ export async function openRemoteTakeover(
 ): Promise<boolean> {
   const snap = view.get(id);
   if (!snap) return false;
-  return openRemoteTakeoverPaneOr(ctx, view, id, () =>
-    ctx.ui.custom<null>(
-      (tui, theme, keybindings, done) =>
-        new RemoteTakeover(tui, theme, keybindings, id, view, done),
-      {
-        overlay: true,
-        overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
-      },
-    ),
+  // Native remote takeover is deferred: /remotes always uses the in-session
+  // overlay (the previous behavior). Remote jobs live on the remote host;
+  // there is no local pane surface to take over yet.
+  await ctx.ui.custom<null>(
+    (tui, theme, keybindings, done) =>
+      new RemoteTakeover(tui, theme, keybindings, id, view, done),
+    {
+      overlay: true,
+      overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
+    },
   );
+  return false;
 }
 
 class RemoteDashboard implements Component {

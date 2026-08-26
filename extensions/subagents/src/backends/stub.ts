@@ -35,6 +35,8 @@ export interface StubProfile {
   readonly toolName: string;
   /** Delay between scripted events; varies per backend so streams differ. */
   readonly cadenceMs: number;
+  /** Receives the pre-allocation task (logical id + profile identity). */
+  readonly onTask?: (task: SpawnTask) => void;
 }
 
 const STUB_DIR = path.join(os.tmpdir(), "subagents-stub");
@@ -50,7 +52,10 @@ export function makeStubBackend(profile: StubProfile): SubagentBackend {
     },
     // Real implementations probe their runtime and credentials here.
     available: Effect.succeed(true),
-    spawn: (task) => makeStubSession(profile, task),
+    spawn: (task) => {
+      profile.onTask?.(task);
+      return makeStubSession(profile, task);
+    },
   };
 }
 
@@ -266,6 +271,7 @@ const makeStubSession = (
       meta: Effect.sync(() => state.meta),
       events: Stream.fromQueue(events),
       send: submit,
+      takeOver: Effect.succeed(false),
       interrupt: Effect.gen(function* () {
         // Drop queued prompts so interrupting cannot immediately start
         // another turn, then stop the active turn. A prompt may be mid-flight

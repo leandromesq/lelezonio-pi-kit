@@ -58,6 +58,24 @@ test("normal runs still get a recap (fallback when the model is unavailable)", a
   assertNoGeneration();
 });
 
+test("a PI_SUBAGENT=1 child disables recaps entirely (no model activity, no entries)", async () => {
+  const previous = process.env.PI_SUBAGENT;
+  process.env.PI_SUBAGENT = "1";
+  try {
+    const { run, generationAttempts, recaps } =
+      await wireSettledHandler2("normal");
+    await run();
+
+    // Not even the fallback path may run: the extension is fully off in
+    // subagent children (extra model activity + pane-close races).
+    assert.equal(generationAttempts, 0, "no model call in a subagent child");
+    assert.equal(recaps.length, 0, "no recap entry in a subagent child");
+  } finally {
+    if (previous === undefined) delete process.env.PI_SUBAGENT;
+    else process.env.PI_SUBAGENT = previous;
+  }
+});
+
 test("errored runs are not interruptions and still get a recap", async () => {
   const { run, assertNoGeneration } = await wireSettledHandler("error");
   await run();
@@ -177,4 +195,88 @@ function wireSettledHandler(termination: "aborted" | "normal" | "error") {
   };
 
   return { run, assertNoGeneration };
+}
+
+/** Like wireSettledHandler, but exposes the raw counters for the disable test. */
+function wireSettledHandler2(termination: "normal") {
+  const handlers = new Map<
+    string,
+    (event: unknown, ctx: ExtensionContext) => unknown
+  >();
+  const recaps: Array<{ customType: string; data: unknown }> = [];
+  const api = {
+    on: (
+      event: string,
+      handler: (event: unknown, ctx: ExtensionContext) => unknown,
+    ) => handlers.set(event, handler),
+    registerEntryRenderer: () => undefined,
+    registerCommand: () => undefined,
+    appendEntry: (customType: string, data: unknown) =>
+      recaps.push({ customType, data }),
+  } as unknown as ExtensionAPI;
+
+  summariesExtension(api);
+
+  let generationAttempts = 0;
+  const registry = {
+    find() {
+      generationAttempts++;
+      return { id: "fake-model" };
+    },
+    getApiKeyAndHeaders: async () => ({
+      ok: false as const,
+      error: "no api key in tests",
+    }),
+  } as unknown as ModelRegistry;
+
+  const ui = {
+    theme: { fg: () => () => "" },
+    setStatus: () => undefined,
+    notify: () => undefined,
+  };
+  const makeCtx = (branch: readonly SessionEntry[]): ExtensionContext =>
+    ({
+      mode: "tui",
+      ui,
+      modelRegistry: registry,
+      sessionManager: {
+        getLeafId: () => "base",
+        getBranch: () => branch,
+      },
+    }) as unknown as ExtensionContext;
+
+  const branch: SessionEntry[] = [
+    {
+      type: "message",
+      id: "base",
+      parentId: null,
+      timestamp: new Date(0).toISOString(),
+      message: { role: "user", content: "base", timestamp: 0 },
+    },
+    {
+      type: "message",
+      id: "run-message",
+      parentId: "base",
+      timestamp: new Date(0).toISOString(),
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "partial work" }],
+        api: "openai-codex-responses",
+        provider: "openai-codex",
+        model: "gpt-5.6-luna",
+        usage,
+        stopReason: "stop",
+        timestamp: 1,
+      },
+    },
+  ];
+
+  const run = async () => {
+    await handlers.get("session_start")!({}, makeCtx([]));
+    await handlers.get("before_agent_start")!({}, makeCtx([]));
+    await handlers.get("agent_settled")!({}, makeCtx(branch));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  };
+
+  return { run, generationAttempts, recaps };
 }

@@ -24,6 +24,7 @@ import type {
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
+import { trySpawnHerdrWorker } from "./herdr-worker.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const MODEL_LIST_TIMEOUT_MS = 5_000;
@@ -971,6 +972,7 @@ const makeCodexSession = (
           }
           return Effect.sync(() => startRun(text));
         }),
+      takeOver: Effect.succeed(false),
       interrupt: Effect.promise(async () => {
         if (state.closed || !state.activeRun) return;
         const serial = state.runSerial;
@@ -1083,5 +1085,15 @@ export const codexBackend: SubagentBackend = {
     reasoningEffort: true,
   },
   available: Effect.sync(() => resolveCodexBinary() !== undefined),
-  spawn: makeCodexSession,
+  spawn: (task) =>
+    Effect.gen(function* () {
+      // Inside Herdr, spawn the subagent as a native interactive Codex TUI
+      // in the shared workspace's Subagents tab; any pre-launch failure falls
+      // back to the scoped `codex app-server` process below (unchanged).
+      const worker = yield* trySpawnHerdrWorker("codex", task).pipe(
+        Effect.orElseSucceed(() => undefined),
+      );
+      if (worker) return worker;
+      return yield* makeCodexSession(task);
+    }),
 };

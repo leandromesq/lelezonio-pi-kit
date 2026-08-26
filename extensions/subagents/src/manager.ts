@@ -40,6 +40,7 @@ import {
   ConcurrencyLimitError,
   SendError,
   SpawnError,
+  subagentDisplayTitle,
 } from "./domain.ts";
 
 export const MAX_RUNNING = 4;
@@ -125,6 +126,13 @@ export interface SubagentReadModel {
   requestSend(id: string, text: string): void;
   /** Fire-and-forget: abort a running subagent (dashboard `x`, takeover). */
   requestAbort(id: string): void;
+  /**
+   * Take the subagent over in its live Herdr pane (running: focus + keep;
+   * settled: reopen and resume the exact native session). Resolves true when
+   * a pane is showing the session; in-process fallback sessions resolve
+   * false so callers keep the in-session overlay. Never interrupts.
+   */
+  requestTakeOver(id: string): Promise<boolean>;
   /**
    * Register the settle hook. `consumed` is true when an active
    * subagent_wait/cancel is collecting the result (so it must not also be
@@ -429,7 +437,12 @@ const makeManager = Effect.gen(function* () {
   const spawn = (backendName: BackendName, task: SpawnTask) =>
     Effect.gen(function* () {
       // Reserve synchronously (before the first yield inside doSpawn) so
-      // parallel tool calls cannot race past the global cap.
+      // parallel tool calls cannot race past the global cap, and allocate
+      // the logical id in the same synchronous tick: Herdr pane titles and
+      // technical agent names must be derivable from the id BEFORE the
+      // backend spawns the native TUI. A failed spawn burns the id (the
+      // counter still advances), matching v1's per-attempt ordering.
+      let logicalId = "";
       yield* Effect.suspend(
         (): Effect.Effect<void, SpawnError | ConcurrencyLimitError> => {
           if (disposed) {
@@ -443,9 +456,14 @@ const makeManager = Effect.gen(function* () {
             });
           }
           reserved++;
+          const origin = task.origin ?? "model";
+          logicalId =
+            origin === "btw" ? `btw-${++btwCounter}` : `sa-${++modelCounter}`;
           return Effect.void;
         },
       );
+      // The backend receives the pre-allocated id; never re-derive it.
+      const scopedTask: SpawnTask = { ...task, logicalId };
 
       const doSpawn = Effect.gen(function* () {
         const backend: SubagentBackend | undefined = registry.get(backendName);
@@ -462,9 +480,10 @@ const makeManager = Effect.gen(function* () {
         }
 
         const scope = yield* Scope.make();
-        const session = yield* Scope.provide(backend.spawn(task), scope).pipe(
-          Effect.onError(() => Scope.close(scope, Exit.void)),
-        );
+        const session = yield* Scope.provide(
+          backend.spawn(scopedTask),
+          scope,
+        ).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
         if (disposed) {
           yield* Scope.close(scope, Exit.void);
           return yield* new SpawnError({
@@ -473,15 +492,14 @@ const makeManager = Effect.gen(function* () {
         }
 
         const origin = task.origin ?? "model";
-        const id =
-          origin === "btw" ? `btw-${++btwCounter}` : `sa-${++modelCounter}`;
+        const id = logicalId;
         const meta = yield* session.meta;
         const entry: Entry = {
           snapshot: {
             id,
             origin,
             backend: backendName,
-            title: task.title,
+            title: subagentDisplayTitle(backendName, scopedTask),
             prompt: task.prompt,
             cwd: task.cwd,
             status: "running",
@@ -714,6 +732,24 @@ const makeManager = Effect.gen(function* () {
       // UI-initiated aborts are not "consumed": the failed result still
       // flows back to the parent as a follow-up message, matching v1.
       runDetached(abortEntry(entry).pipe(Effect.ignore));
+    },
+    requestTakeOver: (id) => {
+      const entry = entries.get(id);
+      if (!entry) return Promise.resolve(false);
+      return new Promise<boolean>((resolve) => {
+        const fiber = runDetached(
+          entry.session.takeOver.pipe(
+            Effect.exit,
+            Effect.map((exit) =>
+              resolve(Exit.isSuccess(exit) && exit.value === true),
+            ),
+            Effect.ignore,
+          ),
+        );
+        // Never leak a stuck takeover fiber; the read model is fire-and-forget.
+        cleanups.add(fiber);
+        fiber.addObserver(() => cleanups.delete(fiber));
+      });
     },
     setOnSettled: (hook) => {
       onSettled = hook;

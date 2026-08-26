@@ -32,7 +32,6 @@ import { RemoteJobStore } from "./src/persistence.ts";
 import { detectLocalGitProject, remoteProjectLocation } from "./src/project.ts";
 import { SshTransport } from "./src/transport.ts";
 import { openRemotePicker, openRemoteTakeover } from "./src/ui/dashboard.ts";
-import { disposeTakeoverHost } from "../shared/takeover-host.ts";
 
 const RESULT_TRANSCRIPT_CHARS = 24 * 1024;
 
@@ -271,10 +270,6 @@ export default function (pi: ExtensionAPI) {
     manager?.dispose();
     manager = undefined;
     managerPromise = undefined;
-    // Deliberately do not close Herdr workspaces: remote jobs survive local Pi.
-    // Local takeover panes are ours though — close them (awaited like the
-    // other extensions); the jobs keep running.
-    await disposeTakeoverHost();
   });
 
   pi.registerMessageRenderer(

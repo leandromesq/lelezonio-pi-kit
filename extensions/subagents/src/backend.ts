@@ -43,6 +43,15 @@ export interface SubagentSession {
    */
   send(text: string): Effect.Effect<void, SendError>;
   /**
+   * Take the subagent over in a visible pane (Herdr worker sessions).
+   * Marks the session taken over and focuses the live pane; when the run
+   * already settled and the pane was closed, opens a fresh pane resuming the
+   * exact native session. Never interrupts the run. Resolves true when the
+   * pane is (or is now) visible, false when the session has no pane surface
+   * (in-process fallback — callers keep the in-session overlay).
+   */
+  readonly takeOver: Effect.Effect<boolean>;
+  /**
    * Interrupt the active run. Resolves once the backend acknowledges; the
    * corresponding RunSettled(Interrupted) arrives on `events`. Callers bound
    * this with a timeout and fall back to closing the session scope.
