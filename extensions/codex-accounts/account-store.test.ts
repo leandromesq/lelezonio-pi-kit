@@ -6,44 +6,53 @@ import test from "node:test";
 import { parseCodexCommand } from "./index.ts";
 import {
   CodexAccountStore,
-  resolveCodexHome,
+  resolveAgentDir,
   validateAccountName,
 } from "./src/account-store.ts";
 
-function credentials(accountId: string, accessToken: string) {
+const PROVIDER = "openai-codex";
+
+function credential(accountId: string, accessToken: string, extra = {}) {
   return {
-    auth_mode: "chatgpt",
-    tokens: {
-      account_id: accountId,
-      access_token: accessToken,
-      refresh_token: `refresh-${accountId}`,
-    },
+    type: "oauth",
+    accountId,
+    access: accessToken,
+    refresh: `refresh-${accountId}`,
+    expires: 1_800_000_000_000,
+    ...extra,
   };
 }
 
-async function withCodexHome(
-  run: (input: { home: string; store: CodexAccountStore }) => Promise<void>,
+function authStore(openaiCodex?: unknown) {
+  return {
+    "opencode-go": { type: "api_key", key: "opencode-key" },
+    ...(openaiCodex !== undefined ? { [PROVIDER]: openaiCodex } : {}),
+  };
+}
+
+async function withAgentDir(
+  run: (input: { dir: string; store: CodexAccountStore }) => Promise<void>,
 ) {
-  const home = await mkdtemp(join(tmpdir(), "codex-accounts-"));
+  const dir = await mkdtemp(join(tmpdir(), "codex-accounts-"));
   try {
-    await run({ home, store: new CodexAccountStore(home) });
+    await run({ dir, store: new CodexAccountStore(dir) });
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
   }
 }
 
-async function writeCredentials(home: string, value: unknown) {
-  await writeFile(join(home, "auth.json"), JSON.stringify(value), "utf8");
+async function writeAuth(dir: string, value: unknown) {
+  await writeFile(join(dir, "auth.json"), JSON.stringify(value), "utf8");
 }
 
-test("resolves CODEX_HOME before the default user directory", () => {
+test("resolves PI_CODING_AGENT_DIR before the default ~/.pi/agent", () => {
   assert.equal(
-    resolveCodexHome({ CODEX_HOME: "/custom/codex" }, "/users/example"),
-    resolve("/custom/codex"),
+    resolveAgentDir({ PI_CODING_AGENT_DIR: "/custom/pi" }, "/users/example"),
+    resolve("/custom/pi"),
   );
   assert.equal(
-    resolveCodexHome({ CODEX_HOME: "" }, "/users/example"),
-    join("/users/example", ".codex"),
+    resolveAgentDir({ PI_CODING_AGENT_DIR: "" }, "/users/example"),
+    join("/users/example", ".pi", "agent"),
   );
 });
 
@@ -53,8 +62,14 @@ test("parses the supported command forms", () => {
     action: "save",
     name: "work",
   });
+  assert.deepEqual(parseCodexCommand("remove work"), {
+    action: "remove",
+    name: "work",
+  });
   assert.throws(() => parseCodexCommand("work"), /Usage/);
   assert.throws(() => parseCodexCommand("save two names"), /Usage/);
+  assert.throws(() => parseCodexCommand("remove"), /Usage/);
+  assert.throws(() => parseCodexCommand("delete work"), /Usage/);
 });
 
 test("rejects account names that could escape the account directory", () => {
@@ -66,14 +81,14 @@ test("rejects account names that could escape the account directory", () => {
   assert.throws(() => validateAccountName("name with spaces"), /Account names/);
 });
 
-test("saves, lists, and switches Codex credentials", async () => {
-  await withCodexHome(async ({ home, store }) => {
-    const personal = credentials("personal-id", "personal-token");
-    const work = credentials("work-id", "work-token");
+test("saves, lists, and switches the Pi OpenAI Codex credential", async () => {
+  await withAgentDir(async ({ dir, store }) => {
+    const personal = credential("personal-id", "personal-token");
+    const work = credential("work-id", "work-token");
 
-    await writeCredentials(home, personal);
+    await writeAuth(dir, authStore(personal));
     await store.save("personal");
-    await writeCredentials(home, work);
+    await writeAuth(dir, authStore(work));
     await store.save("work");
 
     assert.deepEqual(await store.list(), [
@@ -82,10 +97,14 @@ test("saves, lists, and switches Codex credentials", async () => {
     ]);
 
     await store.switchTo("personal");
-    assert.deepEqual(
-      JSON.parse(await readFile(join(home, "auth.json"), "utf8")),
-      personal,
-    );
+    const entries = JSON.parse(await readFile(join(dir, "auth.json"), "utf8"));
+    // The switch replaces only the OpenAI Codex entry and keeps other
+    // providers (e.g. opencode-go) intact.
+    assert.deepEqual(entries[PROVIDER], personal);
+    assert.deepEqual(entries["opencode-go"], {
+      type: "api_key",
+      key: "opencode-key",
+    });
     assert.deepEqual(await store.list(), [
       { name: "personal", active: true },
       { name: "work", active: false },
@@ -93,38 +112,86 @@ test("saves, lists, and switches Codex credentials", async () => {
   });
 });
 
-test("recognizes the current account after Codex refreshes its tokens", async () => {
-  await withCodexHome(async ({ home, store }) => {
-    await writeCredentials(home, credentials("same-account", "old-token"));
+test("recognizes the current account after Pi refreshes its tokens", async () => {
+  await withAgentDir(async ({ dir, store }) => {
+    await writeAuth(dir, authStore(credential("same-account", "old-token")));
     await store.save("primary");
-    await writeCredentials(home, credentials("same-account", "new-token"));
+    await writeAuth(dir, authStore(credential("same-account", "new-token")));
 
     assert.deepEqual(await store.list(), [{ name: "primary", active: true }]);
   });
 });
 
-test("requires explicit overwrite and valid credential JSON", async () => {
-  await withCodexHome(async ({ home, store }) => {
-    await writeCredentials(home, credentials("first", "token"));
-    await store.save("primary");
-    await assert.rejects(() => store.save("primary"), /already exists/);
+test("save requires Pi credentials first and valid auth.json", async () => {
+  await withAgentDir(async ({ dir, store }) => {
+    // No openai-codex entry in the store.
+    await writeAuth(dir, { "opencode-go": { type: "api_key", key: "k" } });
+    await assert.rejects(
+      () => store.save("orphan"),
+      /\/login \(provider: OpenAI Codex\) first/,
+    );
 
-    await writeFile(join(home, "auth.json"), "not-json", "utf8");
+    await writeFile(join(dir, "auth.json"), "not-json", "utf8");
     await assert.rejects(
       () => store.save("broken"),
-      /credentials are not valid JSON/,
+      /not valid JSON/,
     );
   });
 });
 
-test("detects a duplicate identity saved under another name", async () => {
-  await withCodexHome(async ({ home, store }) => {
-    const primary = credentials("same-account", "token-a");
-    const other = credentials("other-account", "token-b");
+test("requires explicit overwrite", async () => {
+  await withAgentDir(async ({ dir, store }) => {
+    await writeAuth(dir, authStore(credential("first", "token")));
+    await store.save("primary");
+    await assert.rejects(() => store.save("primary"), /already exists/);
 
-    await writeCredentials(home, primary);
+    // Overwrite path replaces the stored snapshot.
+    await writeAuth(dir, authStore(credential("second", "other-token")));
+    await store.save("primary", { overwrite: true });
+    assert.deepEqual(await store.list(), [
+      { name: "primary", active: true },
+    ]);
+  });
+});
+
+test("switchTo creates the auth.json when it does not exist yet", async () => {
+  await withAgentDir(async ({ dir, store }) => {
+    await writeAuth(dir, authStore(credential("primary-id", "token")));
+    await store.save("primary");
+    await rm(join(dir, "auth.json"));
+    await store.switchTo("primary");
+    const entries = JSON.parse(await readFile(join(dir, "auth.json"), "utf8"));
+    assert.equal(entries[PROVIDER].accountId, "primary-id");
+  });
+});
+
+test("removes saved accounts without touching the current login", async () => {
+  await withAgentDir(async ({ dir, store }) => {
+    await writeAuth(dir, authStore(credential("personal-id", "personal")));
+    await store.save("personal");
+    await writeAuth(dir, authStore(credential("work-id", "work")));
     await store.save("work");
-    await writeCredentials(home, other);
+
+    await store.remove("personal");
+    assert.deepEqual(await store.list(), [{ name: "work", active: true }]);
+
+    // Removing a missing account reports it.
+    await assert.rejects(
+      () => store.remove("personal"),
+      /No saved Codex account/,
+    );
+    // Removing the active account snapshot leaves the current login intact.
+    await store.remove("work");
+    assert.deepEqual(await store.list(), []);
+    assert.equal((await store.currentCredential())?.accountId, "work-id");
+  });
+});
+
+test("detects a duplicate identity saved under another name", async () => {
+  await withAgentDir(async ({ dir, store }) => {
+    await writeAuth(dir, authStore(credential("same-account", "token-a")));
+    await store.save("work");
+    await writeAuth(dir, authStore(credential("other-account", "token-b")));
     await store.save("personal");
 
     // Current is "personal" (other-account). Called from its own name it is
@@ -134,12 +201,13 @@ test("detects a duplicate identity saved under another name", async () => {
     assert.equal(await store.findCurrentIdentityName(), "personal");
 
     // Re-save the SAME identity under a new name -> match.
-    await writeCredentials(home, primary);
+    await writeAuth(dir, authStore(credential("same-account", "token-a")));
     assert.equal(await store.findCurrentIdentityName("backup"), "work");
     // Excluding the matching name hides it.
     assert.equal(await store.findCurrentIdentityName("work"), undefined);
+
     // No accounts directory at all -> undefined.
-    const empty = new CodexAccountStore(join(home, "does-not-exist"));
+    const empty = new CodexAccountStore(join(dir, "does-not-exist"));
     assert.equal(await empty.findCurrentIdentityName(), undefined);
   });
 });

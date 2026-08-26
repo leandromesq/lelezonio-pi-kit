@@ -11,24 +11,30 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import lockfile from "proper-lockfile";
 
 const ACCOUNT_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,63})$/;
+const PROVIDER_ID = "openai-codex";
 const AUTH_FILE_NAME = "auth.json";
-const ACCOUNTS_DIRECTORY_NAME = "accounts";
+const ACCOUNTS_DIRECTORY_NAME = "codex-accounts";
 
-type Credentials = Record<string, unknown>;
+type CodexCredential = { type: string; accountId?: string } & Record<
+  string,
+  unknown
+>;
 
 export type CodexAccount = {
   name: string;
   active: boolean;
 };
 
-export function resolveCodexHome(
+/** Pi's agent dir: $PI_CODING_AGENT_DIR or ~/.pi/agent. */
+export function resolveAgentDir(
   environment = process.env,
   userHome = homedir(),
 ) {
-  const configuredHome = environment.CODEX_HOME?.trim();
-  return configuredHome ? resolve(configuredHome) : join(userHome, ".codex");
+  const envDir = environment.PI_CODING_AGENT_DIR?.trim();
+  return envDir ? resolve(envDir) : join(userHome, ".pi", "agent");
 }
 
 export function validateAccountName(name: string) {
@@ -40,62 +46,71 @@ export function validateAccountName(name: string) {
   return name;
 }
 
-function parseCredentials(contents: Buffer, path: string) {
+function parseEntries(contents: Buffer, path: string) {
   let value: unknown;
   try {
     value = JSON.parse(contents.toString("utf8"));
   } catch {
-    throw new Error(`Codex credentials are not valid JSON: ${path}`);
+    throw new Error(`Pi auth store is not valid JSON: ${path}`);
   }
 
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Codex credentials must contain a JSON object: ${path}`);
+    throw new Error(`Pi auth store must contain a JSON object: ${path}`);
   }
 
-  return value as Credentials;
+  return value as Record<string, unknown>;
 }
 
-async function readCredentials(path: string) {
+async function readEntries(path: string) {
   let stats;
   try {
     stats = await lstat(path);
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      throw new Error(`Codex credentials were not found at ${path}`);
+      throw new AuthStoreNotFoundError(path);
     }
     throw error;
   }
 
   if (!stats.isFile()) {
-    throw new Error(`Codex credentials are not a regular file: ${path}`);
+    throw new Error(`Pi auth store is not a regular file: ${path}`);
   }
 
   const contents = await readFile(path);
-  return { contents, credentials: parseCredentials(contents, path) };
+  return { contents, entries: parseEntries(contents, path) };
 }
 
-function credentialIdentity(credentials: Credentials) {
-  const tokens = credentials.tokens;
-  if (tokens && typeof tokens === "object" && !Array.isArray(tokens)) {
-    const accountId = (tokens as Record<string, unknown>).account_id;
-    if (typeof accountId === "string" && accountId) {
-      return `account:${accountId}`;
-    }
+class AuthStoreNotFoundError extends Error {
+  constructor(path: string) {
+    super(`Pi auth store was not found at ${path}`);
   }
+}
 
-  const apiKey = credentials.OPENAI_API_KEY;
-  if (typeof apiKey === "string" && apiKey) return `api-key:${apiKey}`;
-  return undefined;
+/** The stored credential for the OpenAI Codex provider, if any. */
+function providerCredential(entries: Record<string, unknown>) {
+  const entry = entries[PROVIDER_ID];
+  return entry && typeof entry === "object" && !Array.isArray(entry)
+    ? (entry as CodexCredential)
+    : undefined;
+}
+
+function credentialIdentity(credential: CodexCredential) {
+  const accountId = credential.accountId;
+  return typeof accountId === "string" && accountId
+    ? `account:${accountId}`
+    : undefined;
 }
 
 function credentialsMatch(
-  first: { contents: Buffer; credentials: Credentials },
-  second: { contents: Buffer; credentials: Credentials },
+  first: { credential: CodexCredential },
+  second: { credential: CodexCredential },
 ) {
-  const firstIdentity = credentialIdentity(first.credentials);
-  const secondIdentity = credentialIdentity(second.credentials);
+  const firstIdentity = credentialIdentity(first.credential);
+  const secondIdentity = credentialIdentity(second.credential);
   if (firstIdentity && secondIdentity) return firstIdentity === secondIdentity;
-  return first.contents.equals(second.contents);
+  return (
+    JSON.stringify(first.credential) === JSON.stringify(second.credential)
+  );
 }
 
 async function atomicWrite(path: string, contents: Buffer) {
@@ -114,23 +129,75 @@ async function atomicWrite(path: string, contents: Buffer) {
   }
 }
 
-export class CodexAccountStore {
-  readonly codexHome: string;
+/**
+ * Run `fn` under the same file lock Pi itself uses for auth.json writes
+ * (proper-lockfile on the auth file), so a credential switch cannot interleave
+ * with Pi's own login/logout/token-refresh writes.
+ */
+async function withAuthStoreLock<T>(
+  authPath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  await mkdir(dirname(authPath), { recursive: true, mode: 0o700 });
+  await writeFile(authPath, "{}", { flag: "wx", mode: 0o600 }).catch(
+    (error: unknown) => {
+      if (
+        !(
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "EEXIST"
+        )
+      ) {
+        throw error;
+      }
+    },
+  );
 
-  constructor(codexHome = resolveCodexHome()) {
-    this.codexHome = codexHome;
+  let release: (() => Promise<void>) | undefined;
+  try {
+    release = await lockfile.lock(authPath, { realpath: false });
+    return await fn();
+  } finally {
+    if (release) {
+      await release().catch(() => undefined);
+    }
+  }
+}
+
+export class CodexAccountStore {
+  readonly agentDir: string;
+
+  constructor(agentDir = resolveAgentDir()) {
+    this.agentDir = agentDir;
   }
 
   private get authPath() {
-    return join(this.codexHome, AUTH_FILE_NAME);
+    return join(this.agentDir, AUTH_FILE_NAME);
   }
 
   private get accountsDirectory() {
-    return join(this.codexHome, ACCOUNTS_DIRECTORY_NAME);
+    return join(this.agentDir, ACCOUNTS_DIRECTORY_NAME);
   }
 
   private accountPath(name: string) {
     return join(this.accountsDirectory, `${validateAccountName(name)}.json`);
+  }
+
+  /** Current Pi credential for the OpenAI Codex provider, or undefined when
+   * no auth store exists yet. Parse/storage errors propagate. */
+  async currentCredential() {
+    let result;
+    try {
+      result = await readEntries(this.authPath);
+    } catch (error) {
+      if (error instanceof AuthStoreNotFoundError) return undefined;
+      throw error;
+    }
+    return providerCredential(result.entries);
+  }
+
+  async hasCurrentCredentials() {
+    return (await this.currentCredential()) !== undefined;
   }
 
   async hasAccount(name: string) {
@@ -149,14 +216,46 @@ export class CodexAccountStore {
     }
   }
 
+  /** Delete a saved account snapshot. The current Pi login is untouched. */
+  async remove(name: string) {
+    const path = this.accountPath(name);
+    try {
+      const stats = await lstat(path);
+      if (!stats.isFile()) {
+        throw new Error(
+          `Codex account "${name}" is not a regular file: ${path}`,
+        );
+      }
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        throw new Error(`No saved Codex account "${name}".`);
+      }
+      throw error;
+    }
+    await rm(path);
+  }
+
   async save(name: string, options: { overwrite?: boolean } = {}) {
     const path = this.accountPath(name);
     if (!options.overwrite && (await this.hasAccount(name))) {
       throw new Error(`Codex account "${name}" already exists.`);
     }
 
-    const activeCredentials = await readCredentials(this.authPath);
-    await atomicWrite(path, activeCredentials.contents);
+    const credential = await this.currentCredential();
+    if (!credential) {
+      throw new Error(
+        `Pi has no ${PROVIDER_ID} credentials yet. Run /login (provider: OpenAI Codex) first.`,
+      );
+    }
+
+    await atomicWrite(
+      path,
+      Buffer.from(`${JSON.stringify(credential, null, 2)}\n`, "utf8"),
+    );
   }
 
   async list() {
@@ -180,35 +279,45 @@ export class CodexAccountStore {
       .filter((name) => ACCOUNT_NAME_PATTERN.test(name))
       .sort((left, right) => left.localeCompare(right));
 
-    const activeCredentials = await readCredentials(this.authPath).catch(
+    const activeCredential = await this.currentCredential().catch(
       () => undefined,
     );
 
     return Promise.all(
       names.map(async (name): Promise<CodexAccount> => {
-        if (!activeCredentials) return { name, active: false };
+        if (!activeCredential) return { name, active: false };
 
-        const savedCredentials = await readCredentials(
-          this.accountPath(name),
-        ).catch(() => undefined);
+        const savedCredential = await this.readSavedCredential(name).catch(
+          () => undefined,
+        );
         return {
           name,
           active:
-            savedCredentials !== undefined &&
-            credentialsMatch(activeCredentials, savedCredentials),
+            savedCredential !== undefined &&
+            credentialsMatch(
+              { credential: activeCredential },
+              { credential: savedCredential },
+            ),
         };
       }),
     );
   }
 
-  /** Name of an already-saved account whose credentials match the CURRENT
-   * auth.json, excluding `targetName` (typically the name being saved).
+  private async readSavedCredential(name: string) {
+    const path = this.accountPath(name);
+    // Each snapshot file holds exactly one Pi credential entry.
+    const { contents } = await readEntries(path);
+    return parseEntries(contents, path) as CodexCredential;
+  }
+
+  /** Name of an already-saved account whose credential matches the CURRENT
+   * pi credential, excluding `targetName` (typically the name being saved).
    * Returns undefined when the current identity is not saved anywhere. */
   async findCurrentIdentityName(targetName?: string) {
-    const activeCredentials = await readCredentials(this.authPath).catch(
+    const activeCredential = await this.currentCredential().catch(
       () => undefined,
     );
-    if (!activeCredentials) return undefined;
+    if (!activeCredential) return undefined;
 
     let entries;
     try {
@@ -231,12 +340,15 @@ export class CodexAccountStore {
 
     for (const name of names) {
       if (name === targetName) continue;
-      const savedCredentials = await readCredentials(
-        this.accountPath(name),
-      ).catch(() => undefined);
+      const savedCredential = await this.readSavedCredential(name).catch(
+        () => undefined,
+      );
       if (
-        savedCredentials !== undefined &&
-        credentialsMatch(activeCredentials, savedCredentials)
+        savedCredential !== undefined &&
+        credentialsMatch(
+          { credential: activeCredential },
+          { credential: savedCredential },
+        )
       ) {
         return name;
       }
@@ -244,8 +356,20 @@ export class CodexAccountStore {
     return undefined;
   }
 
+  /** Switch Pi's OpenAI Codex credential to the saved account. */
   async switchTo(name: string) {
-    const savedCredentials = await readCredentials(this.accountPath(name));
-    await atomicWrite(this.authPath, savedCredentials.contents);
+    const savedCredential = await this.readSavedCredential(name);
+
+    await withAuthStoreLock(this.authPath, async () => {
+      const { contents } = await readEntries(this.authPath).catch(() => ({
+        contents: Buffer.from("{}", "utf8"),
+      }));
+      const entries = parseEntries(contents, this.authPath);
+      entries[PROVIDER_ID] = savedCredential;
+      await atomicWrite(
+        this.authPath,
+        Buffer.from(`${JSON.stringify(entries, null, 2)}\n`, "utf8"),
+      );
+    });
   }
 }

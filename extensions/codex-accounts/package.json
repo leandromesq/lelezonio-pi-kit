@@ -9,6 +9,10 @@
   },
   "devDependencies": {
     "@effect/tsgo": "^0.24.2",
+    "@types/proper-lockfile": "^4.1.4",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "proper-lockfile": "^4.1.2"
   }
 }

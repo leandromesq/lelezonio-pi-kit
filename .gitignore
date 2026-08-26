@@ -51,3 +51,6 @@ checkpoints/
 # Local editor settings
 .vscode/
 .idea/
+
+# Runtime credential snapshots for the codex-accounts extension
+/codex-accounts/
