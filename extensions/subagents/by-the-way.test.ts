@@ -6,7 +6,7 @@ import {
   deriveBtwTitle,
   isModelVisible,
 } from "./src/by-the-way.ts";
-import { herdrEnvironment } from "./src/btw-herdr.ts";
+import { herdrEnvironment } from "../shared/herdr-workspace.ts";
 
 test("deriveBtwTitle uses the first non-empty line and bounds the title", () => {
   assert.equal(

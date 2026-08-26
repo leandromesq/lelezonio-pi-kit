@@ -72,8 +72,36 @@ test("piWorkerLaunch passes a private deterministic session and child exclusions
     "high",
     "--approve",
     "--exclude-tools",
-    "subagent_spawn,subagent_wait,subagent_cancel,subagent_check,subagent_list,workflow,ask_user",
+    "subagent_spawn,subagent_wait,subagent_cancel,subagent_check,subagent_list,subagent_send,workflow,ask_user",
   ]);
+});
+
+test("piWorkerLaunch appends profile tool-policy exclusions", () => {
+  const base = {
+    nodePath: "node",
+    piCliPath: "codex.js",
+    sessionDir: "C:\\subs\\sa-3",
+    sessionId: "019f1234-0000",
+  };
+  // readOnly profile: the writing trio is excluded on top of the child
+  // denylist.
+  const readOnly = piWorkerLaunch(
+    task({ parent: { ...task().parent, toolPolicy: { readOnly: true } } }),
+    base,
+  );
+  const excludes = readOnly.argv[readOnly.argv.indexOf("--exclude-tools") + 1];
+  assert.match(excludes, /subagent_send,workflow,ask_user,write,edit,bash/);
+  // Explicit allowlist: anything built-in not listed is excluded.
+  const narrow = piWorkerLaunch(
+    task({
+      parent: { ...task().parent, toolPolicy: { tools: ["read", "grep"] } },
+    }),
+    base,
+  );
+  const narrowExcludes =
+    narrow.argv[narrow.argv.indexOf("--exclude-tools") + 1];
+  assert.match(narrowExcludes, /write,edit,bash,find,ls/);
+  assert.ok(!narrowExcludes.includes("read"), narrowExcludes);
 });
 
 test("piWorkerLaunch omits model/thinking when unset and flips trust when untrusted", () => {
@@ -171,6 +199,30 @@ test("codexWorkerLaunch passes the initial prompt as final positional argv (regr
     "-a",
     "never",
   ]);
+});
+
+test("untrusted Codex worker and resume launches are read-only", () => {
+  const untrusted = task({
+    parent: { ...task().parent, projectTrusted: false },
+  });
+  const fresh = codexWorkerLaunch(untrusted, {
+    nodePath: "node",
+    codexCliPath: "codex.js",
+  });
+  const resumed = codexResumeLaunch(untrusted, {
+    nodePath: "node",
+    codexCliPath: "codex.js",
+    sessionId: "019f-untrusted",
+  });
+
+  for (const argv of [fresh.argv, resumed]) {
+    assert.deepEqual(argv.slice(argv.indexOf("-s"), argv.indexOf("-s") + 4), [
+      "-s",
+      "read-only",
+      "-a",
+      "never",
+    ]);
+  }
 });
 
 test("codexWorkerLaunch includes the reasoning effort slug when set", () => {

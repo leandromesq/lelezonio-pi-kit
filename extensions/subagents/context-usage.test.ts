@@ -46,3 +46,21 @@ test("Codex occupancy is unknown when last usage or window is absent", () => {
     contextWindow: undefined,
   });
 });
+
+import { isStalled, STALLED_AFTER_MS } from "./src/format.ts";
+
+test("isStalled flags only running subagents past the inactivity threshold", () => {
+  const now = 1_000_000;
+  assert.equal(
+    isStalled({ status: "running", lastEventAt: now - STALLED_AFTER_MS }, now),
+    true,
+  );
+  assert.equal(
+    isStalled({ status: "running", lastEventAt: now - 1_000 }, now),
+    false,
+  );
+  assert.equal(
+    isStalled({ status: "done", lastEventAt: now - STALLED_AFTER_MS }, now),
+    false,
+  );
+});

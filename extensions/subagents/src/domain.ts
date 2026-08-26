@@ -35,6 +35,37 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 export type SubagentStatus = "running" | "done" | "error";
 
+/** Tool-surface policy for a child, derived from its profile. */
+export interface ChildToolPolicy {
+  /** Explicit pi tool allowlist (builtin names). When present, everything
+   * else is excluded. */
+  readonly tools?: readonly string[];
+  /** Read-only child: no write/edit/bash, codex sandbox forced read-only. */
+  readonly readOnly?: boolean;
+}
+
+/** Nesting capability: which profiles a child may spawn, and at what depth. */
+export interface NestContext {
+  readonly allow: readonly string[];
+  /** Depth of the CURRENT session (top-level spawn = 0). */
+  readonly depth: number;
+  /** Maximum depth; children may spawn only while depth+1 <= maxDepth. */
+  readonly maxDepth: number;
+}
+
+export interface SpawnChildResult {
+  readonly id: string;
+  readonly text: string;
+  readonly error?: string;
+}
+
+export type SpawnChildFn = (options: {
+  readonly profile: string;
+  readonly task: string;
+  readonly name?: string;
+  readonly nest: NestContext;
+}) => Promise<SpawnChildResult>;
+
 /** Parent-session context resolved by the tool layer and passed opaquely. */
 export interface ParentContext {
   readonly parentCwd: string;
@@ -46,6 +77,12 @@ export interface ParentContext {
   readonly inheritedThinkingLevel?: string;
   /** Parent model registry; required by the pi backend to resolve models. */
   readonly modelRegistry?: ModelRegistry;
+  /** Profile-derived tool policy applied to the child. */
+  readonly toolPolicy?: ChildToolPolicy;
+  /** Nesting context when the child may spawn its own subagents. */
+  readonly nest?: NestContext;
+  /** Local spawn callback for nested children (headless only, see pi.ts). */
+  readonly spawnChild?: SpawnChildFn;
 }
 
 export interface SpawnTask {
@@ -201,6 +238,11 @@ export type SubagentEvent =
     }
   // bookkeeping
   | {
+      readonly _tag: "QuestionAsked";
+      readonly questionId: string;
+      readonly text: string;
+    }
+  | {
       readonly _tag: "QueueChanged";
       readonly queued: ReadonlyArray<QueuedMessage>;
     }
@@ -227,7 +269,11 @@ export interface SubagentSnapshot {
   readonly prompt: string;
   readonly cwd: string;
   readonly status: SubagentStatus;
+  /** Monotonic run generation within this resumable logical session. */
+  readonly run: number;
   readonly createdAt: number;
+  /** Wall-clock of the last activity event (stall detection). */
+  readonly lastEventAt: number;
   readonly settledAt?: number;
   readonly errorText?: string;
   readonly meta: SubagentMeta;
@@ -241,6 +287,8 @@ export interface SubagentSnapshot {
   readonly finalText: string;
   /** Count of finalized assistant messages (for subagent_check). */
   readonly turns: number;
+  /** Pending child→parent clarification, unanswered. Cleared on next run. */
+  readonly question?: { readonly id: string; readonly text: string };
 }
 
 /** Final text, or the live streaming buffer while a run is active (v1 `latestOutput`). */

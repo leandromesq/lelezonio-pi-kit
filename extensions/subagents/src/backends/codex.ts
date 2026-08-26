@@ -24,6 +24,7 @@ import type {
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
+import { codexPolicyForTask } from "./codex-policy.ts";
 import { trySpawnHerdrWorker } from "./herdr-worker.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -374,6 +375,7 @@ const makeCodexSession = (
       finalText: "",
       lastAssistantText: "",
       pendingPrompts: [] as string[],
+      drainScheduled: false,
       nextRequestId: 0,
       stderr: "",
       meta: {
@@ -430,12 +432,23 @@ const makeCodexSession = (
         kind: "follow-up" as const,
       }));
 
-    const startNextQueued = () => {
-      if (state.closed || state.activeRun) return;
-      const next = state.pendingPrompts.shift();
-      if (next === undefined) return;
-      emit({ _tag: "QueueChanged", queued: queuedView() });
-      startRun(next);
+    const scheduleNextQueued = () => {
+      if (
+        state.closed ||
+        state.activeRun ||
+        state.drainScheduled ||
+        state.pendingPrompts.length === 0
+      )
+        return;
+      state.drainScheduled = true;
+      queueMicrotask(() => {
+        state.drainScheduled = false;
+        if (state.closed || state.activeRun) return;
+        const next = state.pendingPrompts.shift();
+        if (next === undefined) return;
+        emit({ _tag: "QueueChanged", queued: queuedView() });
+        startRun(next);
+      });
     };
 
     const settleRun = (outcome: RunOutcome, serial = state.runSerial) => {
@@ -451,7 +464,18 @@ const makeCodexSession = (
       state.interruptRequested = false;
       tools.clear();
       emit({ _tag: "RunSettled", outcome });
-      queueMicrotask(startNextQueued);
+      if (outcome._tag === "Completed") scheduleNextQueued();
+      else {
+        if (state.pendingPrompts.length > 0) {
+          emit({
+            _tag: "BackendError",
+            message: `Dropped ${state.pendingPrompts.length} queued follow-up(s): the run ended without completing.`,
+          });
+        }
+        state.pendingPrompts = [];
+        state.drainScheduled = false;
+        emit({ _tag: "QueueChanged", queued: [] });
+      }
     };
 
     const sendInterrupt = (serial: number) => {
@@ -914,13 +938,14 @@ const makeCodexSession = (
           capabilities: { experimentalApi: true },
         });
         writeMessage({ method: "initialized" });
-        // Headless children cannot answer approval prompts. The caller
-        // already chose to launch an autonomous subagent, so give the thread
-        // full workspace access without interactive approval requests.
+        // Headless children cannot answer approval prompts. Derive sandbox
+        // access from Pi's project-trust decision; untrusted repositories are
+        // read-only instead of receiving unrestricted host access.
+        const policy = codexPolicyForTask(task);
         return request("thread/start", {
           cwd: task.cwd,
-          approvalPolicy: "never",
-          sandbox: "danger-full-access",
+          approvalPolicy: policy.approvalPolicy,
+          sandbox: policy.sandbox,
           ephemeral: false,
           ...(task.model ? { model: task.model } : {}),
         });
@@ -965,9 +990,14 @@ const makeCodexSession = (
           if (state.closed) {
             return new SendError({ message: "Subagent session is closed." });
           }
-          if (state.activeRun) {
+          if (
+            state.activeRun ||
+            state.drainScheduled ||
+            state.pendingPrompts.length > 0
+          ) {
             state.pendingPrompts.push(text);
             emit({ _tag: "QueueChanged", queued: queuedView() });
+            scheduleNextQueued();
             return Effect.void;
           }
           return Effect.sync(() => startRun(text));
@@ -977,24 +1007,43 @@ const makeCodexSession = (
         if (state.closed || !state.activeRun) return;
         const serial = state.runSerial;
         state.pendingPrompts = [];
+        state.drainScheduled = false;
         emit({ _tag: "QueueChanged", queued: [] });
         state.interruptRequested = true;
         sendInterrupt(serial);
         if (state.interruptTimer) clearTimeout(state.interruptTimer);
         state.interruptTimer = setTimeout(() => {
-          if (state.activeRun && serial === state.runSerial) {
+          void (async () => {
+            if (!state.activeRun || serial !== state.runSerial) return;
             if (state.activeTurnId) ignoredTurnIds.add(state.activeTurnId);
-            settleRun({
-              _tag: "Interrupted",
-              partialText:
-                state.finalText || state.lastAssistantText || undefined,
-            });
             // The server never acknowledged the interrupt, so the native
-            // turn may still be executing tools. A session that ignores
-            // interrupts cannot be trusted — kill it rather than let
-            // invisible work continue behind a "settled" run.
-            void terminateChild(child, () => state.exited);
-          }
+            // turn may still be executing tools. Keep the run active while
+            // terminating the process tree; only report Interrupted after
+            // shutdown is confirmed, preventing a restart during the kill
+            // window. `closing` keeps the process-exit handler from racing us
+            // with a generic Failed settlement.
+            state.closing = true;
+            const terminated = await terminateChild(child, () => state.exited);
+            if (state.activeRun && serial === state.runSerial) {
+              settleRun(
+                terminated
+                  ? {
+                      _tag: "Interrupted",
+                      partialText:
+                        state.finalText || state.lastAssistantText || undefined,
+                    }
+                  : {
+                      _tag: "Failed",
+                      errorText:
+                        "Could not confirm Codex process termination after SIGKILL",
+                      partialText:
+                        state.finalText || state.lastAssistantText || undefined,
+                    },
+              );
+            }
+            state.closed = true;
+            Queue.endUnsafe(events);
+          })();
         }, INTERRUPT_FALLBACK_MS);
       }),
     } satisfies SubagentSession;
@@ -1056,34 +1105,29 @@ function terminateChild(
   child: ChildProcessWithoutNullStreams,
   exited: () => boolean,
 ) {
-  if (exited()) return Promise.resolve();
-  return new Promise<void>((resolve) => {
+  if (exited()) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
     let done = false;
     let forceTimer: ReturnType<typeof setTimeout> | undefined;
     let lastTimer: ReturnType<typeof setTimeout> | undefined;
-    const finish = () => {
+    const finish = (confirmed: boolean) => {
       if (done) return;
       done = true;
       if (forceTimer) clearTimeout(forceTimer);
       if (lastTimer) clearTimeout(lastTimer);
-      resolve();
+      resolve(confirmed);
     };
-    child.once("exit", finish);
+    child.once("exit", () => finish(true));
     killTree(child, "SIGTERM");
     forceTimer = setTimeout(() => {
       if (!exited()) killTree(child, "SIGKILL");
     }, FORCE_KILL_AFTER_MS);
-    lastTimer = setTimeout(finish, FORCE_KILL_AFTER_MS + 500);
+    lastTimer = setTimeout(() => finish(exited()), FORCE_KILL_AFTER_MS + 500);
   });
 }
 
 export const codexBackend: SubagentBackend = {
   name: "codex",
-  capabilities: {
-    steering: false,
-    modelSelection: true,
-    reasoningEffort: true,
-  },
   available: Effect.sync(() => resolveCodexBinary() !== undefined),
   spawn: (task) =>
     Effect.gen(function* () {

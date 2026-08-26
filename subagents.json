@@ -15,17 +15,23 @@
     "planner": {
       "harness": "codex",
       "model": "gpt-5.6-luna",
-      "thinking": "max"
+      "thinking": "max",
+      "readOnly": true,
+      "contextMode": "summary"
     },
     "coder": {
       "harness": "pi",
       "model": "opencode-go/deepseek-v4-flash",
-      "thinking": "high"
+      "thinking": "high",
+      "allowChildren": ["reviewer"],
+      "maxDepth": 1
     },
     "reviewer": {
       "harness": "codex",
       "model": "gpt-5.6-luna",
-      "thinking": "high"
+      "thinking": "high",
+      "readOnly": true,
+      "tools": ["read", "grep", "find", "ls"]
     }
   }
 }

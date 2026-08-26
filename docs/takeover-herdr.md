@@ -20,8 +20,10 @@ focused/prompted/keystroked by pane id.
   process.
 - **Remote agents** (`/remotes`) keep their in-session overlay (native remote
   takeover is deferred).
-- `/btw` keeps its original headless `pi -p`-in-a-pane behavior via the shared
-  `herdr-pane.ts` helpers.
+- **By-the-way agents** (`/btw`) use the same managed Pi backend as normal
+  subagents. Inside Herdr they run as tracked native workers with `btw-N` ids,
+  concurrency accounting, settlement delivery, cancellation, takeover, and
+  session cleanup; outside Herdr they fall back to the in-process Pi backend.
 
 Outside Herdr — or whenever the workspace/pane cannot be opened — every path
 falls back to the exact in-session behavior used before (in-process Pi SDK /
@@ -48,7 +50,12 @@ stdio). Quoted argv through Herdr/PowerShell Start-Process mangles arguments
 (live-proven: `--name '[spike · pi] native'` fragmented into positional
 prompt fragments), which is exactly why the pane line is minimized. The spec
 carries `PI_SUBAGENT=1` in the child env, and the launcher deletes the spec
-right after reading it (the session finalizer cleans leftovers). Pi's initial
+right after reading it (the session finalizer cleans leftovers). Pi children
+also receive `PI_SUBAGENT_ASK_FILE` pointing at a sidecar next to their
+private session: the `ask_question` tool (headless children get it via
+`customTools`, Herdr children via the extension when `PI_SUBAGENT=1`) writes
+`{questionId,text}` there, the parent worker polls/dedupes it into a
+`QuestionAsked` event, and the parent answers with `subagent_send`. Pi's initial
 prompt is submitted with the low-level transport
 `pane send-text <pane> <text>` then `pane send-keys <pane> enter` after the
 TUI boots (retried only while the pane is busy). Codex receives its initial

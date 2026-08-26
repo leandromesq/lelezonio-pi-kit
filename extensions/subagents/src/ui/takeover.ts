@@ -19,7 +19,7 @@ import type {
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { formatElapsed, type SubagentSnapshot } from "../domain.ts";
-import { formatContextUtilization } from "../format.ts";
+import { formatContextUtilization, isStalled } from "../format.ts";
 import type { SubagentReadModel } from "../manager.ts";
 import { buildTranscriptLines } from "./transcript.ts";
 
@@ -42,6 +42,9 @@ function statusGlyph(snap: SubagentSnapshot, theme: Theme): string {
 }
 
 function statusWord(snap: SubagentSnapshot, theme: Theme): string {
+  if (snap.status === "running" && isStalled(snap)) {
+    return theme.fg("error", "stalled");
+  }
   switch (snap.status) {
     case "running":
       return theme.fg("warning", "running");
@@ -351,12 +354,13 @@ class SubagentDashboard implements Component {
       const index = start + i;
       const isSelected = index === this.selection.index;
 
-      // Left: marker, status square, title, dim id
+      // Left: marker, question badge, status square, title, dim id
       const marker = isSelected ? theme.fg("accent", "❯") : " ";
+      const question = snap.question ? theme.fg("warning", "❓") : " ";
       const title = isSelected
         ? theme.fg("accent", snap.title)
         : theme.fg("text", snap.title);
-      const left = ` ${marker} ${statusGlyph(snap, theme)} ${title} ${theme.fg("dim", snap.id)}`;
+      const left = ` ${marker}${question} ${statusGlyph(snap, theme)} ${title} ${theme.fg("dim", snap.id)}`;
 
       // Right: backend · model · context utilization · elapsed · status
       const utilization = formatContextUtilization(snap.usage);

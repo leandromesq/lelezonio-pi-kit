@@ -509,7 +509,13 @@ export function createWorkerWorkspaceController(
   /** Hermes server errors mention the dead resource; treat as rebuildable. */
   const isMissingResource = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    return /(not found|does not exist|no such|closed|gone)/i.test(message);
+    const resource = "(?:pane|tab|workspace|agent)";
+    const missing = "(?:not found|does not exist|no such|closed|gone)";
+    const wasMissing = `(?:was|is)\\s+(?:already\\s+)?(?:${missing})\\b`;
+    return new RegExp(
+      `(?:\\b${resource}\\s+(?:already\\s+)?${missing}\\b|\\b${missing}\\s+${resource}\\b|\\b${resource}\\s+${wasMissing})`,
+      "i",
+    ).test(message);
   };
 
   const resultOf = (output: HerdrCliEnvelope) => output.result ?? output;
@@ -874,17 +880,25 @@ export function createWorkerWorkspaceController(
           return typeof lifecycle === "string" ? lifecycle : undefined;
         },
         isWorkerRunning: async () => {
-          const output = await call(
-            ["pane", "process-info", "--pane", allocatedPaneId],
-            cliTimeoutMs,
-          ).catch(() => undefined);
-          const processes = output
-            ? resultOf(output).process_info?.foreground_processes
-            : undefined;
+          let output: HerdrCliEnvelope;
+          try {
+            output = await call(
+              ["pane", "process-info", "--pane", allocatedPaneId],
+              cliTimeoutMs,
+            );
+          } catch (error) {
+            // A confirmed missing/closed pane is a terminal liveness result;
+            // transport and timeout failures remain unknown and must not
+            // falsely settle a healthy worker.
+            return isMissingResource(error) ? false : undefined;
+          }
+          const processes = resultOf(output).process_info?.foreground_processes;
           if (!processes) return undefined;
           return processes.some((process) => {
             const name = process.name ?? "";
-            return !/^(?:pwsh|powershell|cmd)(?:\.exe)?$/i.test(name);
+            return !/^(?:pwsh|powershell|cmd|sh|bash|zsh|fish|dash|ksh)(?:\.exe)?$/i.test(
+              name,
+            );
           });
         },
         reportMetadata: async ({ title, displayAgent, summary }) => {

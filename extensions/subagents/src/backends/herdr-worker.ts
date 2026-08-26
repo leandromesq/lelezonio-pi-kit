@@ -61,6 +61,8 @@ import type {
 } from "../../../shared/herdr-workspace.ts";
 import { shellQuote } from "../../../shared/herdr-workspace.ts";
 import type { SubagentSession } from "../backend.ts";
+import { codexPolicyCliArgs } from "./codex-policy.ts";
+import { extraExcludedTools } from "../profile.ts";
 import type {
   ReasoningEffort,
   RunOutcome,
@@ -238,6 +240,7 @@ const CHILD_EXCLUDED_TOOL_NAMES = [
   "subagent_cancel",
   "subagent_check",
   "subagent_list",
+  "subagent_send",
   "workflow",
   "ask_user",
 ] as const;
@@ -395,8 +398,12 @@ function piLaunchArgs(
     task.parent.inheritedThinkingLevel) as ReasoningEffort | undefined;
   if (thinking) argv.push("--thinking", thinking);
   argv.push(trustFlag(task.parent.projectTrusted));
-  if (CHILD_EXCLUDED_TOOL_NAMES.length > 0)
-    argv.push("--exclude-tools", CHILD_EXCLUDED_TOOL_NAMES.join(","));
+  const childExcludes = [
+    ...CHILD_EXCLUDED_TOOL_NAMES,
+    ...extraExcludedTools(task.parent.toolPolicy),
+  ];
+  if (childExcludes.length > 0)
+    argv.push("--exclude-tools", [...new Set(childExcludes)].join(","));
   return argv;
 }
 
@@ -442,7 +449,7 @@ export function piResumeLaunch(
 /**
  * Codex worker launch: the interactive TUI via the explicit node entrypoint
  * (which spawns the native exe attached). Model/sandbox/approval mirror the
- * headless app-server subagents: full workspace access, no approval dialogs.
+ * headless app-server trust policy, with no interactive approval dialogs.
  * Raw argv for the launcher spec. */
 export function codexWorkerLaunch(
   task: SpawnTask,
@@ -457,10 +464,7 @@ export function codexWorkerLaunch(
     options.codexCliPath,
     "--cd",
     task.cwd,
-    "-s",
-    "danger-full-access",
-    "-a",
-    "never",
+    ...codexPolicyCliArgs(task),
     ...(task.model ? ["-m", task.model] : []),
   ];
   const effort = codexEffortSlug(task.reasoningEffort);
@@ -488,10 +492,7 @@ export function codexResumeLaunch(
     options.sessionId,
     "--cd",
     task.cwd,
-    "-s",
-    "danger-full-access",
-    "-a",
-    "never",
+    ...codexPolicyCliArgs(task),
     ...(task.model ? ["-m", task.model] : []),
   ];
   const effort = codexEffortSlug(task.reasoningEffort);
@@ -1420,6 +1421,9 @@ interface WorkerState {
   interruptedFallback?: ReturnType<typeof setTimeout>;
   livenessClock: number;
   pendingCodex: string[];
+  codexDrainScheduled: boolean;
+  askFilePath?: string;
+  askedQuestionIds: Set<string>;
   meta: SubagentMeta;
   marker?: string;
 }
@@ -1514,6 +1518,14 @@ export function makeHerdrWorkerSession(
 
     const initialCodexMarker =
       kind === "codex" ? codexRunMarker(task.logicalId ?? "sa") : undefined;
+    // Children ask the orchestrator by writing a sidecar next to their
+    // session; the parent polls it (deduped per question id) and surfaces the
+    // QuestionAsked event. The file survives pane close/resume, so a child
+    // that asked and paused can still be answered later via subagent_send.
+    const askFilePath =
+      kind === "pi" && sessionDir && nativeSessionId
+        ? path.join(sessionDir, `${nativeSessionId}.ask`)
+        : undefined;
     const launch =
       kind === "pi" && piCli && sessionDir && nativeSessionId
         ? piWorkerLaunch(task, {
@@ -1543,6 +1555,7 @@ export function makeHerdrWorkerSession(
         nodePath,
         argv,
         task.cwd,
+        askFilePath ? { PI_SUBAGENT_ASK_FILE: askFilePath } : {},
       );
       writtenSpecs.add(specPath);
       return { specPath, paneLaunch };
@@ -1563,6 +1576,9 @@ export function makeHerdrWorkerSession(
       interruptRequested: false,
       livenessClock: 0,
       pendingCodex: [],
+      codexDrainScheduled: false,
+      askFilePath,
+      askedQuestionIds: new Set<string>(),
       meta: { backend: kind },
       marker: initialCodexMarker,
     };
@@ -1693,9 +1709,41 @@ export function makeHerdrWorkerSession(
       });
     };
 
-    const drainCodexPending = () => {
-      if (kind !== "codex" || state.pendingCodex.length === 0) return;
-      void startRun(state.pendingCodex.shift()!);
+    const codexQueuedView = () =>
+      state.pendingCodex.map((text) => ({
+        text,
+        kind: "follow-up" as const,
+      }));
+
+    const clearCodexPending = () => {
+      if (kind !== "codex") return;
+      if (state.pendingCodex.length > 0) {
+        emit({
+          _tag: "BackendError",
+          message: `Dropped ${state.pendingCodex.length} queued follow-up(s): the run ended without completing.`,
+        });
+      }
+      state.pendingCodex.length = 0;
+      state.codexDrainScheduled = false;
+      emit({ _tag: "QueueChanged", queued: [] });
+    };
+
+    const scheduleCodexDrain = () => {
+      if (
+        kind !== "codex" ||
+        state.closed ||
+        state.codexDrainScheduled ||
+        state.pendingCodex.length === 0
+      )
+        return;
+      state.codexDrainScheduled = true;
+      queueMicrotask(() => {
+        state.codexDrainScheduled = false;
+        if (state.closed || state.runActive) return;
+        const next = state.pendingCodex.shift();
+        emit({ _tag: "QueueChanged", queued: codexQueuedView() });
+        if (next !== undefined) startRun(next, true);
+      });
     };
 
     // --- run lifecycle ---------------------------------------------------------
@@ -1704,14 +1752,30 @@ export function makeHerdrWorkerSession(
       if (!state.runActive) return;
       emitOutcome(emit, state, outcome);
       void report("idle");
-      queueMicrotask(drainCodexPending);
+      if (outcome._tag === "Completed") scheduleCodexDrain();
+      else clearCodexPending();
       queueMicrotask(() => void settleClosePolicy());
     };
 
     // A run that produced no terminal signal but whose TUI exited is a real
     // failure — the honest fallback (never settled by Herdr idle alone).
     const probeLiveness = () => {
-      if (!state.runActive || !state.pane) return;
+      if (!state.runActive) return;
+      if (!state.pane) {
+        settleRun(
+          state.interruptRequested
+            ? {
+                _tag: "Interrupted",
+                partialText: state.lastAssistantText || undefined,
+              }
+            : {
+                _tag: "Failed",
+                errorText: "Subagent worker pane disappeared",
+                partialText: state.lastAssistantText || undefined,
+              },
+        );
+        return;
+      }
       const pane = state.pane;
       const liveness = pane.isWorkerRunning
         ? pane.isWorkerRunning()
@@ -1719,12 +1783,19 @@ export function makeHerdrWorkerSession(
       void liveness
         .then((running) => {
           if (state.runActive && running === false) {
-            settleRun({
-              _tag: "Failed",
-              errorText:
-                "Subagent worker exited before producing a terminal message",
-              partialText: state.lastAssistantText || undefined,
-            });
+            settleRun(
+              state.interruptRequested
+                ? {
+                    _tag: "Interrupted",
+                    partialText: state.lastAssistantText || undefined,
+                  }
+                : {
+                    _tag: "Failed",
+                    errorText:
+                      "Subagent worker exited before producing a terminal message",
+                    partialText: state.lastAssistantText || undefined,
+                  },
+            );
           }
         })
         .catch(() => {});
@@ -1737,6 +1808,32 @@ export function makeHerdrWorkerSession(
       if (clock() - state.livenessClock >= every) {
         state.livenessClock = clock();
         probeLiveness();
+      }
+    };
+
+    /** Read a child's `ask_question` sidecar (deduped per question id) and
+     * surface it as a QuestionAsked event. The file is deleted after reading;
+     * a partial write is simply retried on the next poll. */
+    const pollAskFile = () => {
+      const file = state.askFilePath;
+      if (!file) return;
+      try {
+        if (!fs.existsSync(file)) return;
+        const data = JSON.parse(fs.readFileSync(file, "utf8"));
+        const questionId =
+          typeof data?.questionId === "string" ? data.questionId : "";
+        const text = typeof data?.text === "string" ? data.text : "";
+        if (questionId && text && !state.askedQuestionIds.has(questionId)) {
+          state.askedQuestionIds.add(questionId);
+          emit({
+            _tag: "QuestionAsked",
+            questionId,
+            text: text.slice(0, 4000),
+          });
+        }
+        fs.rmSync(file, { force: true });
+      } catch {
+        // best-effort: a partial write is retried next poll
       }
     };
 
@@ -1790,16 +1887,47 @@ export function makeHerdrWorkerSession(
 
     const beginRun = (text: string) => submitRunPrompt(startRunState(text));
 
-    const startRun = (text: string) => {
+    const startRun = (text: string, dispatchingQueued = false) => {
       if (state.closed) return;
       if (state.runActive) {
         // Steer the active run through the TUI (pi queues its own
         // follow-ups); codex follow-ups queue locally and drain at settle.
         if (kind === "pi") {
-          void state.pane?.submitText(text).catch(() => {});
+          const pane = state.pane;
+          if (!pane) {
+            settleRun({
+              _tag: "Failed",
+              errorText: "Subagent worker pane disappeared before steering",
+              partialText: state.lastAssistantText || undefined,
+            });
+            return;
+          }
+          void pane.submitText(text).catch((error) => {
+            if (!state.closed && state.runActive) {
+              settleRun({
+                _tag: "Failed",
+                errorText: `Could not steer the subagent: ${boundedError(error)}`,
+                partialText: state.lastAssistantText || undefined,
+              });
+            }
+          });
         } else {
           state.pendingCodex.push(text);
+          emit({ _tag: "QueueChanged", queued: codexQueuedView() });
         }
+        return;
+      }
+      // Settlement schedules the oldest queued Codex follow-up in a
+      // microtask so the manager can observe the terminal snapshot. A send in
+      // that handoff window must join the FIFO instead of jumping the queue.
+      if (
+        !dispatchingQueued &&
+        kind === "codex" &&
+        (state.codexDrainScheduled || state.pendingCodex.length > 0)
+      ) {
+        state.pendingCodex.push(text);
+        emit({ _tag: "QueueChanged", queued: codexQueuedView() });
+        scheduleCodexDrain();
         return;
       }
       if (!state.pane) {
@@ -1810,7 +1938,7 @@ export function makeHerdrWorkerSession(
         // the run never emitted RunSettled (the manager waited forever).
         const promptText = startRunState(text);
         void withPaneOperation(async () => {
-          if (state.closed) return;
+          if (state.closed || !state.runActive) return;
           // A takeover may have reopened the pane while this send waited for
           // the operation lock. In that case type into the now-ready TUI.
           if (state.pane) {
@@ -1820,7 +1948,11 @@ export function makeHerdrWorkerSession(
           const reopened = await reopenPane(
             kind === "codex" ? promptText : undefined,
           );
-          if (state.closed) return;
+          if (state.closed || !state.runActive) {
+            if (reopened && state.pane === reopened) state.pane = undefined;
+            await reopened?.close().catch(() => {});
+            return;
+          }
           if (!reopened) {
             settleRun({
               _tag: "Failed",
@@ -1940,6 +2072,16 @@ export function makeHerdrWorkerSession(
     const initialPromptText = startRunState(task.prompt, initialCodexMarker);
 
     if (kind === "pi") {
+      // Poll the child's ask sidecar independently of the session tail (the
+      // child can ask mid-run or after the pane already settled).
+      if (askFilePath) {
+        void (async () => {
+          while (!state.closed) {
+            pollAskFile();
+            await sleepMs(pollIntervalMs);
+          }
+        })();
+      }
       // Wait for the private session file (created at first prompt) then tail
       // it from byte 0: the file may already contain the full run by the time
       // discovery finds it (fast tiny prompts), and replay is safe — the
@@ -2023,15 +2165,60 @@ export function makeHerdrWorkerSession(
       (async () => {
         if (state.closed || !state.runActive) return;
         state.interruptRequested = true;
-        await state.pane?.sendKeys("ctrl+c").catch(() => undefined);
+        clearCodexPending();
+        const pane = state.pane;
+        await pane?.sendKeys("ctrl+c").catch(() => undefined);
         clearInterruptFallback(state);
         state.interruptedFallback = setTimeout(() => {
-          if (!state.closed && state.runActive) {
+          void (async () => {
+            if (state.closed || !state.runActive) return;
+            // Never claim cancellation merely because the parser missed an
+            // abort event. Confirm the worker stopped; otherwise close the
+            // owned pane as the force-stop fallback before settling.
+            const running = pane
+              ? await (
+                  pane.isWorkerRunning
+                    ? pane.isWorkerRunning()
+                    : pane
+                        .getAgentState()
+                        .then((agentState) => agentState !== undefined)
+                ).catch(() => undefined)
+              : false;
+            if (state.closed || !state.runActive) return;
+            if (running !== false && pane) {
+              try {
+                await pane.close();
+              } catch (error) {
+                settleRun({
+                  _tag: "Failed",
+                  errorText: `Could not confirm subagent cancellation: ${boundedError(error)}`,
+                  partialText: state.lastAssistantText || undefined,
+                });
+                return;
+              }
+              const afterClose = await (
+                pane.isWorkerRunning
+                  ? pane.isWorkerRunning()
+                  : pane
+                      .getAgentState()
+                      .then((agentState) => agentState !== undefined)
+              ).catch(() => undefined);
+              if (afterClose !== false) {
+                settleRun({
+                  _tag: "Failed",
+                  errorText:
+                    "Could not confirm subagent cancellation; the worker may still be running",
+                  partialText: state.lastAssistantText || undefined,
+                });
+                return;
+              }
+              if (state.pane === pane) state.pane = undefined;
+            }
             settleRun({
               _tag: "Interrupted",
               partialText: state.lastAssistantText || undefined,
             });
-          }
+          })();
         }, deps.interruptFallbackMs);
       })();
 
@@ -2056,8 +2243,13 @@ export function makeHerdrWorkerSession(
           await pane.focus();
         } catch {
           if (!wasTakenOver) state.takenOver = false;
-          if (state.pane === pane) state.pane = undefined;
-          await pane.close().catch(() => {});
+          // Focusing is cosmetic for a live run. Never close or settle a
+          // healthy worker merely because Herdr could not focus its pane.
+          // A settled session reopened solely for takeover can be closed.
+          if (!state.runActive) {
+            if (state.pane === pane) state.pane = undefined;
+            await pane.close().catch(() => {});
+          }
           return false;
         }
         if (!wasTakenOver) {

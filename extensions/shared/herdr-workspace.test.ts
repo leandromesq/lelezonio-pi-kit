@@ -650,6 +650,79 @@ test("getAgentState reads the live state through the envelope", async () => {
   assert.equal(await pane.getAgentState(), "working");
 });
 
+test("isWorkerRunning distinguishes a missing pane from probe failure", async () => {
+  for (const [message, expected] of [
+    ["pane not found", false],
+    ["pane is gone", false],
+    ["transport timed out", undefined],
+    ["socket closed", undefined],
+    ["workspace connection closed", undefined],
+  ] as const) {
+    const herdr = fakeHerdr();
+    const runner: HerdrRunner = async (args, timeout) => {
+      if (args[0] === "pane" && args[1] === "process-info") {
+        throw new Error(message);
+      }
+      return herdr.runner(args, timeout);
+    };
+    const controller = createWorkerWorkspaceController({
+      project: "p",
+      sessionId: "s",
+      projectRoot: "C:\\w",
+      runner,
+      environment: () => true,
+      platform: "win32",
+      cliTimeoutMs: 2000,
+      closeTimeoutMs: 1000,
+    });
+    const pane = await controller.openWorker({
+      category: "subagents",
+      title: "sa",
+      cwd: "C:\\w",
+      launch: ["node", "cli.js"],
+    });
+    assert.ok(pane?.isWorkerRunning);
+    assert.equal(await pane.isWorkerRunning(), expected);
+  }
+});
+
+test("isWorkerRunning ignores idle POSIX and Windows shells", async () => {
+  const herdr = fakeHerdr();
+  const runner: HerdrRunner = async (args, timeout) => {
+    if (args[0] === "pane" && args[1] === "process-info") {
+      return {
+        result: {
+          process_info: {
+            foreground_processes: [
+              { name: "bash" },
+              { name: "zsh" },
+              { name: "pwsh.exe" },
+            ],
+          },
+        },
+      };
+    }
+    return herdr.runner(args, timeout);
+  };
+  const controller = createWorkerWorkspaceController({
+    project: "p",
+    sessionId: "s",
+    projectRoot: "C:\\w",
+    runner,
+    environment: () => true,
+    platform: "win32",
+    cliTimeoutMs: 2000,
+    closeTimeoutMs: 1000,
+  });
+  const pane = await controller.openWorker({
+    category: "subagents",
+    title: "sa",
+    cwd: "C:\\w",
+    launch: ["node", "cli.js"],
+  });
+  assert.equal(await pane?.isWorkerRunning?.(), false);
+});
+
 // --- rollback ---------------------------------------------------------------------
 
 test("a failed launch rolls back: the pane is closed and undefined returned", async () => {

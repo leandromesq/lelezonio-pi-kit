@@ -87,7 +87,9 @@ interface MutableSnapshot {
   prompt: string;
   cwd: string;
   status: SubagentStatus;
+  run: number;
   createdAt: number;
+  lastEventAt: number;
   settledAt?: number;
   errorText?: string;
   meta: SubagentMeta;
@@ -98,6 +100,7 @@ interface MutableSnapshot {
   queued: SubagentSnapshot["queued"];
   finalText: string;
   turns: number;
+  question?: { id: string; text: string };
 }
 
 interface Entry {
@@ -145,11 +148,33 @@ export interface SubagentReadModel {
 
 // --- Service --------------------------------------------------------------------
 
+/** Whether a settled entry may be pruned: not running, not mid-restart, and
+ * not being collected by an active wait/cancel. */
+export function isPrunableSettled(
+  status: SubagentStatus,
+  options: { readonly restarting?: boolean; readonly waitInterest: boolean },
+): boolean {
+  return status !== "running" && !options.restarting && !options.waitInterest;
+}
+
 export interface CancelResult {
   readonly id: string;
   readonly title: string;
   readonly status: SubagentStatus;
   readonly cancelled: boolean;
+  /** Settled snapshot clone of the run that was actually cancelled. */
+  readonly snapshot?: SubagentSnapshot;
+}
+
+export interface AdoptInput {
+  readonly id: string;
+  readonly title: string;
+  readonly backend: BackendName;
+  readonly finalText?: string;
+  readonly errorText?: string;
+  readonly nativeSessionId?: string;
+  readonly sessionFilePath?: string;
+  readonly settledAt: number;
 }
 
 export interface SubagentManagerShape {
@@ -169,11 +194,15 @@ export interface SubagentManagerShape {
   waitFor(
     ids: ReadonlyArray<string>,
     onPending?: (pending: string[]) => void,
-  ): Effect.Effect<void>;
+  ): Effect.Effect<ReadonlyArray<SubagentSnapshot>>;
   /** Cancel running subagents; resolves when they have settled. */
   cancel(
     ids: ReadonlyArray<string>,
   ): Effect.Effect<ReadonlyArray<CancelResult>>;
+  /** Restore a settled subagent discovered after a parent restart. Inspect
+   * only: no live session (send/resume unavailable), but the entry is
+   * visible in the dashboard, tools, and takeover transcript. */
+  adopt(input: AdoptInput): Effect.Effect<SubagentSnapshot, SpawnError>;
   send(id: string, text: string): Effect.Effect<void, SendError>;
   get(id: string): Effect.Effect<SubagentSnapshot | undefined>;
   readonly list: Effect.Effect<ReadonlyArray<SubagentSnapshot>>;
@@ -264,9 +293,11 @@ const makeManager = Effect.gen(function* () {
   const pruneSettled = () => {
     if (entries.size <= MAX_TRACKED) return;
     const candidates = [...entries.values()]
-      .filter(
-        (e) =>
-          e.snapshot.status !== "running" && !waitInterest.has(e.snapshot.id),
+      .filter((entry) =>
+        isPrunableSettled(entry.snapshot.status, {
+          restarting: entry.restarting,
+          waitInterest: waitInterest.has(entry.snapshot.id),
+        }),
       )
       .sort(
         (a, b) =>
@@ -286,7 +317,9 @@ const makeManager = Effect.gen(function* () {
     const s = entry.snapshot;
     entry.restarting = false;
     if (s.status !== "running") return;
+    if (s.run === 0) s.run = 1;
     s.settledAt = Date.now();
+    s.lastEventAt = s.settledAt;
     switch (outcome._tag) {
       case "Completed":
         s.status = "done";
@@ -328,12 +361,15 @@ const makeManager = Effect.gen(function* () {
 
   const foldEvent = (entry: Entry, event: SubagentEvent) => {
     const s = entry.snapshot;
+    s.lastEventAt = Date.now();
     switch (event._tag) {
       case "RunStarted":
         entry.restarting = false;
+        if (s.run === 0 || s.status !== "running") s.run++;
         s.status = "running";
         s.settledAt = undefined;
         s.errorText = undefined;
+        s.question = undefined;
         break;
       case "RunSettled":
         settle(entry, event.outcome);
@@ -418,6 +454,12 @@ const makeManager = Effect.gen(function* () {
       case "QueueChanged":
         s.queued = event.queued;
         break;
+      case "QuestionAsked":
+        s.question = {
+          id: event.questionId,
+          text: boundedTranscriptText(event.text),
+        };
+        break;
       case "UsageChanged":
         s.usage = {
           tokens: event.tokens ?? s.usage.tokens,
@@ -428,7 +470,11 @@ const makeManager = Effect.gen(function* () {
         s.meta = { ...s.meta, ...event.meta };
         break;
       case "BackendError":
-        s.errorText = bounded(event.message);
+        // Append diagnostics (e.g. dropped follow-ups) without clobbering a
+        // run-level failure text.
+        s.errorText = s.errorText
+          ? `${s.errorText}\n${bounded(event.message)}`
+          : bounded(event.message);
         break;
     }
     notify(s.id);
@@ -503,7 +549,9 @@ const makeManager = Effect.gen(function* () {
             prompt: task.prompt,
             cwd: task.cwd,
             status: "running",
+            run: 0,
             createdAt: Date.now(),
+            lastEventAt: Date.now(),
             meta,
             usage: { contextWindow: meta.contextWindow },
             transcript: [],
@@ -551,6 +599,9 @@ const makeManager = Effect.gen(function* () {
       );
     });
 
+  const isPending = (entry: Entry | undefined) =>
+    entry?.snapshot.status === "running" || entry?.restarting === true;
+
   const waitFor = (
     ids: ReadonlyArray<string>,
     onPending?: (pending: string[]) => void,
@@ -560,10 +611,13 @@ const makeManager = Effect.gen(function* () {
       addInterest(unique);
       const loop = Effect.gen(function* () {
         while (true) {
-          const pending = unique.filter(
-            (id) => entries.get(id)?.snapshot.status === "running",
-          );
-          if (pending.length === 0) return;
+          const pending = unique.filter((id) => isPending(entries.get(id)));
+          if (pending.length === 0) {
+            return unique
+              .map((id) => entries.get(id)?.snapshot)
+              .filter((snap): snap is MutableSnapshot => snap !== undefined)
+              .map((snap) => structuredClone(snap) as SubagentSnapshot);
+          }
           onPending?.(pending);
           yield* nextChange;
         }
@@ -578,10 +632,16 @@ const makeManager = Effect.gen(function* () {
       );
     });
 
-  /** Interrupt one running entry, force-closing its scope after 5s. */
+  /** Interrupt one running/restarting entry, force-closing its scope after 5s. */
   const abortEntry = (entry: Entry) =>
     Effect.gen(function* () {
-      if (entry.snapshot.status !== "running") return;
+      // A settled-session send reserves its restart synchronously, before the
+      // backend's RunStarted event arrives. Wait for that transition so an
+      // immediate cancel cannot miss the newly accepted run.
+      while (entry.restarting && entry.snapshot.status !== "running") {
+        yield* nextChange;
+      }
+      if (entry.snapshot.status !== "running") return false;
       const graceful = yield* entry.session.interrupt.pipe(
         Effect.timeout(STOP_TIMEOUT_MS),
         Effect.result,
@@ -603,6 +663,7 @@ const makeManager = Effect.gen(function* () {
           Effect.ignore,
         );
       }
+      return true;
     });
 
   const cancel = (ids: ReadonlyArray<string>) =>
@@ -610,20 +671,35 @@ const makeManager = Effect.gen(function* () {
       const unique = [...new Set(ids)];
       const running = unique
         .map((id) => entries.get(id))
-        .filter(
-          (entry): entry is Entry => entry?.snapshot.status === "running",
-        );
+        .filter((entry): entry is Entry => isPending(entry));
       const runningIds = running.map((entry) => entry.snapshot.id);
       // Mark consumed before interrupting so cancellation does not also
       // enqueue duplicate automatic result messages into the parent.
       addInterest(runningIds);
       const work = Effect.gen(function* () {
-        yield* Effect.forEach(running, abortEntry, {
+        const attempts = yield* Effect.forEach(running, abortEntry, {
           concurrency: "unbounded",
         });
-        while (running.some((entry) => entry.snapshot.status === "running")) {
+        while (running.some((entry) => isPending(entry))) {
           yield* nextChange;
         }
+        const cancelledIds = new Set(
+          running
+            .filter((_entry, index) => attempts[index] === true)
+            .map((entry) => entry.snapshot.id),
+        );
+        // Capture the settled snapshot clones immediately after the pending
+        // loop, before any concurrent restart can fold a new RunStarted.
+        const settledSnapshots = new Map(
+          [...cancelledIds]
+            .map((id) => entries.get(id)?.snapshot)
+            .filter((snap): snap is MutableSnapshot => snap !== undefined)
+            .map(
+              (snap) =>
+                [snap.id, structuredClone(snap) as SubagentSnapshot] as const,
+            ),
+        );
+        return { cancelledIds, settledSnapshots };
       });
       return work.pipe(
         Effect.ensuring(
@@ -632,16 +708,18 @@ const makeManager = Effect.gen(function* () {
             pruneSettled();
           }),
         ),
-        Effect.map((): ReadonlyArray<CancelResult> =>
-          unique.map((id) => {
-            const snapshot = entries.get(id)?.snapshot;
-            return {
-              id,
-              title: snapshot?.title ?? "?",
-              status: snapshot?.status ?? "error",
-              cancelled: runningIds.includes(id),
-            };
-          }),
+        Effect.map(
+          ({ cancelledIds, settledSnapshots }): ReadonlyArray<CancelResult> =>
+            unique.map((id) => {
+              const snapshot = settledSnapshots.get(id);
+              return {
+                id,
+                title: snapshot?.title ?? "?",
+                status: snapshot?.status ?? "error",
+                cancelled: cancelledIds.has(id),
+                snapshot: cancelledIds.has(id) ? snapshot : undefined,
+              };
+            }),
         ),
       );
     });
@@ -672,11 +750,83 @@ const makeManager = Effect.gen(function* () {
           Effect.onError(() =>
             Effect.sync(() => {
               entry.restarting = false;
+              notify(entry.snapshot.id);
             }),
           ),
         );
       }
       return entry.session.send(text);
+    });
+
+  const adopt = (input: AdoptInput) =>
+    Effect.gen(function* () {
+      if (disposed) {
+        return yield* new SpawnError({
+          message: "Subagent manager is shutting down.",
+        });
+      }
+      if (entries.has(input.id)) return entries.get(input.id)!.snapshot;
+      const scope = yield* Scope.make();
+      const status: SubagentStatus = input.errorText ? "error" : "done";
+      const meta: SubagentMeta = {
+        backend: input.backend,
+        sessionFilePath: input.sessionFilePath,
+        nativeSessionId: input.nativeSessionId,
+      };
+      const entry: Entry = {
+        snapshot: {
+          id: input.id,
+          origin: "model",
+          backend: input.backend,
+          title: input.title,
+          prompt: "",
+          cwd: "",
+          status,
+          run: 1,
+          createdAt: input.settledAt,
+          lastEventAt: input.settledAt,
+          settledAt: input.settledAt,
+          errorText: input.errorText,
+          meta,
+          usage: {},
+          transcript: [],
+          liveTools: [],
+          queued: [],
+          finalText: input.finalText ?? "",
+          turns: 0,
+        },
+        session: {
+          meta: Effect.succeed(meta),
+          events: Stream.empty,
+          send: () =>
+            new SendError({
+              message:
+                "This subagent was restored after a restart and is inspect-only; it cannot be resumed in-process. Open it via /subagents and take it over to continue in a pane.",
+            }),
+          interrupt: Effect.void,
+          takeOver: Effect.succeed(false),
+        },
+        scope,
+        liveToolMap: new Map(),
+      };
+      entries.set(input.id, entry);
+      const pump = Stream.runForEach(entry.session.events, (event) =>
+        Effect.sync(() => foldEvent(entry, event)),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (entry.snapshot.status === "running") {
+              settle(entry, {
+                _tag: "Failed",
+                errorText: "Backend event stream ended unexpectedly",
+              });
+            }
+          }),
+        ),
+      );
+      entry.pump = yield* Scope.provide(Effect.forkScoped(pump), scope);
+      notify(input.id);
+      return entry.snapshot as SubagentSnapshot;
     });
 
   const disposeAll = Effect.gen(function* () {
@@ -765,6 +915,7 @@ const makeManager = Effect.gen(function* () {
     waitFor,
     cancel,
     send,
+    adopt,
     get: (id) => Effect.sync(() => entries.get(id)?.snapshot),
     list: Effect.sync(() => [...entries.values()].map((e) => e.snapshot)),
     disposeAll,

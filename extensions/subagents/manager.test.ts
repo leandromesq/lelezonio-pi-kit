@@ -13,6 +13,7 @@ import { piBackend } from "./src/backends/pi.ts";
 import { makeStubBackend } from "./src/backends/stub.ts";
 import type { BackendName, ParentContext, SpawnTask } from "./src/domain.ts";
 import {
+  isPrunableSettled,
   makeSubagentManagerLayer,
   SubagentManager,
   type SubagentManagerShape,
@@ -124,16 +125,45 @@ test("cancel interrupts a running stub subagent", async () => {
       manager.spawn("codex", task("Long running task")),
     );
     const report = await runTool(runtime, manager.cancel([snap.id]));
-    assert.deepEqual(report, [
-      {
-        id: snap.id,
-        title: "[sa-1 · codex] test",
-        status: "error",
-        cancelled: true,
-      },
-    ]);
+    assert.deepEqual(
+      report.map((entry) => ({
+        id: entry.id,
+        title: entry.title,
+        status: entry.status,
+        cancelled: entry.cancelled,
+      })),
+      [
+        {
+          id: snap.id,
+          title: "[sa-1 · codex] test",
+          status: "error",
+          cancelled: true,
+        },
+      ],
+    );
+    assert.equal(report[0]?.snapshot?.id, snap.id);
+    assert.equal(report[0]?.snapshot?.status, "error");
     assert.equal(manager.view.get(snap.id)?.errorText, "Run was aborted");
   });
+});
+
+test("prune never drops a pending restart or an actively collected run", () => {
+  const settled = { restarting: undefined, waitInterest: false };
+  assert.equal(isPrunableSettled("error", settled), true);
+  assert.equal(isPrunableSettled("done", settled), true);
+  // A settled-session send reserved the slot before RunStarted folded.
+  assert.equal(
+    isPrunableSettled("done", { restarting: true, waitInterest: false }),
+    false,
+  );
+  assert.equal(
+    isPrunableSettled("running", { restarting: false, waitInterest: false }),
+    false,
+  );
+  assert.equal(
+    isPrunableSettled("error", { restarting: false, waitInterest: true }),
+    false,
+  );
 });
 
 test("the manager pre-allocates logical ids before the backend spawn", async () => {
@@ -321,6 +351,61 @@ test("idle restarts respect the concurrency cap", async () => {
   });
 });
 
+test("cancel catches a restart before RunStarted reaches the manager", async () => {
+  await withManager(async (manager, runtime) => {
+    const snap = await runTool(runtime, manager.spawn("codex", task("First")));
+    await runTool(runtime, manager.waitFor([snap.id]));
+
+    await runTool(runtime, manager.send(snap.id, "Second"));
+    const report = await runTool(runtime, manager.cancel([snap.id]));
+
+    assert.equal(report[0]?.cancelled, true);
+    assert.equal(manager.view.get(snap.id)?.status, "error");
+    assert.match(manager.view.get(snap.id)?.errorText ?? "", /aborted/i);
+  });
+});
+
+test("a child question folds into the snapshot and clears on the next run", async () => {
+  const runtime = ManagedRuntime.make(
+    makeSubagentManagerLayer(4).pipe(
+      Layer.provide(
+        Layer.sync(BackendRegistry, () => {
+          const backends: SubagentBackend[] = [
+            piBackend,
+            makeStubBackend({
+              backend: "codex",
+              defaultModelLabel: "codex/gpt-5-codex",
+              contextWindow: 272_000,
+              toolName: "shell",
+              cadenceMs: 10,
+              askQuestion: "Which API should I use?",
+            }),
+          ];
+          return new Map<BackendName, SubagentBackend>(
+            backends.map((backend) => [backend.name, backend]),
+          );
+        }),
+      ),
+    ),
+  );
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const snap = await runTool(runtime, manager.spawn("codex", task("ask")));
+    await runTool(runtime, manager.waitFor([snap.id]));
+    const settled = manager.view.get(snap.id);
+    assert.equal(settled?.status, "done");
+    assert.equal(settled?.question?.text, "Which API should I use?");
+    assert.ok(settled?.question?.id);
+
+    // A follow-up run clears the pending question.
+    await runTool(runtime, manager.send(snap.id, "answer, then continue"));
+    await runTool(runtime, manager.waitFor([snap.id]));
+    assert.equal(manager.view.get(snap.id)?.question, undefined);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
 test("send steers an idle subagent into another turn", async () => {
   await withManager(async (manager, runtime) => {
     const snap = await runTool(
@@ -332,13 +417,47 @@ test("send steers an idle subagent into another turn", async () => {
     assert.equal(afterFirst?.status, "done");
 
     await runTool(runtime, manager.send(snap.id, "Second turn"));
-    // The fresh run flips the status back to running...
-    while (manager.view.get(snap.id)?.status !== "running") {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    // waitFor must observe the synchronous restarting reservation even before
+    // the backend's asynchronous RunStarted event reaches the manager.
     await runTool(runtime, manager.waitFor([snap.id]));
     const afterSecond = manager.view.get(snap.id);
     assert.equal(afterSecond?.status, "done");
     assert.match(afterSecond?.finalText ?? "", /Second turn/);
+  });
+});
+
+test("adopt restores a settled subagent as an inspect-only entry", async () => {
+  await withManager(async (manager, runtime) => {
+    const snap = await runTool(
+      runtime,
+      manager.adopt({
+        id: "sa-9",
+        title: "Restored sa-9",
+        backend: "pi",
+        finalText: "old output",
+        sessionFilePath: "/tmp/restored.jsonl",
+        settledAt: 1234,
+      }),
+    );
+    assert.equal(snap.id, "sa-9");
+    assert.equal(snap.status, "done");
+    assert.equal(snap.finalText, "old output");
+    assert.equal(snap.settledAt, 1234);
+    // Re-adopting the same id is idempotent.
+    await runTool(
+      runtime,
+      manager.adopt({
+        id: "sa-9",
+        title: "Restored sa-9",
+        backend: "pi",
+        settledAt: 1234,
+      }),
+    );
+    assert.equal(manager.view.size(), 1);
+    // Inspect-only: send explains why resume is unavailable.
+    await assert.rejects(
+      runTool(runtime, manager.send("sa-9", "continue")),
+      /inspect-only/,
+    );
   });
 });

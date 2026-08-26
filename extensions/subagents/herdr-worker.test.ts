@@ -41,6 +41,10 @@ interface StubWorkspace {
   failOpen: boolean;
   available: boolean;
   agentState: () => string | undefined;
+  workerRunning: () => boolean | undefined;
+  submitError?: Error;
+  focusError?: Error;
+  closeError?: Error;
 }
 
 function stubWorkspace(
@@ -56,6 +60,7 @@ function stubWorkspace(
     failOpen: false,
     available: true,
     agentState,
+    workerRunning: () => ws.agentState() !== undefined,
     controller: undefined as unknown as WorkerWorkspaceController,
   };
   let nextPane = 0;
@@ -77,17 +82,22 @@ function stubWorkspace(
         },
         rename: async () => {},
         submitText: async (text) => {
+          if (ws.submitError) throw ws.submitError;
           ws.prompts.push(text);
         },
         reportState: async (state, message) => {
           ws.states.push({ pane: paneId, state: `state:${state}` });
         },
         getAgentState: async () => ws.agentState(),
+        isWorkerRunning: async () =>
+          ws.closed.includes(paneId) ? false : ws.workerRunning(),
         reportMetadata: async () => {},
         focus: async () => {
+          if (ws.focusError) throw ws.focusError;
           ws.focused.push(paneId);
         },
         close: async () => {
+          if (ws.closeError) throw ws.closeError;
           ws.closed.push(paneId);
         },
       };
@@ -360,6 +370,12 @@ test("pi worker: pane runs only node <launcher> <spec>; spec carries raw argv + 
       assert.ok(spec.args.includes("--approve"));
       assert.equal(spec.cwd, "C:\\work\\proj");
       assert.equal(spec.env.PI_SUBAGENT, "1");
+      // Children ask the orchestrator via a sidecar next to their session;
+      // the spec must teach the child where to write it.
+      const askPath = spec.env.PI_SUBAGENT_ASK_FILE;
+      assert.ok(askPath, "PI_SUBAGENT_ASK_FILE is set for pi workers");
+      assert.equal(path.dirname(askPath), sessionDir);
+      assert.ok(askPath.endsWith(".ask"));
 
       const file = await piSessionFile(ws, sessionDir);
       fs.writeFileSync(
@@ -383,6 +399,52 @@ test("pi worker: pane runs only node <launcher> <spec>; spec carries raw argv + 
     ? fs.readdirSync(path.join(root, "specs"))
     : [];
   assert.deepEqual(leftovers, [], "launcher specs are cleaned");
+});
+
+test("pi worker: the child's ask sidecar surfaces a QuestionAsked event, deduped", async () => {
+  const ws = stubWorkspace();
+  const root = freshSessionRoot();
+  const sessionDir = path.join(root, "sessions", "sa-3");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  await withSession(
+    "pi",
+    testDeps(ws, root),
+    task("do it"),
+    async (session, events) => {
+      await waitFor(() => ws.opened.length === 1, "pane open");
+      const spec = readLaunchSpec(launchSpecToken(ws.opened[0].launch));
+      const askFile = spec.env.PI_SUBAGENT_ASK_FILE;
+      assert.ok(askFile);
+
+      fs.writeFileSync(
+        askFile,
+        `${JSON.stringify({ questionId: "q1", text: "red or blue?" })}\n`,
+        "utf8",
+      );
+      await waitFor(
+        () => events.some((event) => event._tag === "QuestionAsked"),
+        "question surfaced",
+      );
+      const question = events.find((event) => event._tag === "QuestionAsked");
+      assert.equal(
+        question?._tag === "QuestionAsked" ? question.text : "",
+        "red or blue?",
+      );
+
+      // The sidecar is consumed and a duplicate question id is ignored.
+      assert.equal(fs.existsSync(askFile), false);
+      fs.writeFileSync(
+        askFile,
+        `${JSON.stringify({ questionId: "q1", text: "again" })}\n`,
+        "utf8",
+      );
+      await sleep(80);
+      assert.equal(
+        events.filter((event) => event._tag === "QuestionAsked").length,
+        1,
+      );
+    },
+  );
 });
 
 test("worker startup exit before a session file settles as failed", async () => {
@@ -513,6 +575,25 @@ test("pi worker: take over while running keeps the pane open and never interrupt
   );
   // Scope close keeps the taken-over pane open.
   assert.equal(ws.closed.length, 0);
+});
+
+test("pi worker: focus failure during live takeover does not stop the run", async () => {
+  const ws = stubWorkspace();
+  const root = freshSessionRoot();
+  await withSession(
+    "pi",
+    testDeps(ws, root),
+    task("run"),
+    async (session, events) => {
+      await waitFor(() => ws.prompts.length === 1, "initial prompt");
+      ws.focusError = new Error("focus transport failed");
+
+      assert.equal(await Effect.runPromise(session.takeOver), false);
+      await sleep(25);
+      assert.equal(settled(events).settled, 0);
+      assert.equal(ws.closed.length, 0);
+    },
+  );
 });
 
 test("pi worker: take over a settled run reopens and resumes the exact session", async () => {
@@ -726,6 +807,30 @@ test("pi worker: steering while running goes through the TUI and interrupt sends
   );
 });
 
+test("pi worker: active steering transport failure settles the run", async () => {
+  const ws = stubWorkspace();
+  const root = freshSessionRoot();
+  await withSession(
+    "pi",
+    testDeps(ws, root),
+    task("run"),
+    async (session, events) => {
+      await waitFor(() => ws.prompts.length === 1, "initial prompt");
+      ws.submitError = new Error("pane gone");
+
+      await Effect.runPromise(session.send("steer"));
+      await waitFor(() => settled(events).settled === 1, "steer failure");
+
+      const terminal = events.find((event) => event._tag === "RunSettled");
+      assert.equal(terminal?.outcome._tag, "Failed");
+      assert.match(
+        terminal?.outcome._tag === "Failed" ? terminal.outcome.errorText : "",
+        /Could not steer.*pane gone/,
+      );
+    },
+  );
+});
+
 test("pi worker: interrupt falls back to a local settle when no terminal message arrives", async () => {
   const ws = stubWorkspace();
   const sessionDir = path.join(DIR, "sessions", "sa-3");
@@ -891,9 +996,14 @@ test("codex worker: follow-ups while working queue locally and drain after settl
       const marker1 = spec.args.at(-1)!.split(" ")[0];
       // The launch prompt is positional argv — nothing was typed yet.
       assert.equal(ws.prompts.length, 0, "launch prompt is not a pane prompt");
-      // Queue a follow-up while the first task is still running.
+      // Queue multiple follow-ups while the first task is still running.
       await Effect.runPromise(session.send("do two"));
-      assert.equal(ws.prompts.length, 0, "follow-up is queued, not submitted");
+      await Effect.runPromise(session.send("do three"));
+      assert.equal(
+        ws.prompts.length,
+        0,
+        "follow-ups are queued, not submitted",
+      );
       const file = codexRolloutPath(root);
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(
@@ -925,6 +1035,31 @@ test("codex worker: follow-ups while working queue locally and drain after settl
       );
       const marker2 = ws.prompts[0].split(" ")[0];
       assert.notEqual(marker2, marker1);
+      assert.match(ws.prompts[0], /do two$/);
+
+      // Settling the second run must drain the next FIFO entry, not requeue
+      // the just-dequeued prompt behind it during the handoff window.
+      fs.appendFileSync(
+        file,
+        [
+          cxEvent({ type: "task_started", turn_id: "t2" }),
+          cxEvent({ type: "user_message", message: `${marker2} do two` }),
+          cxEvent({
+            type: "agent_message",
+            message: "second",
+            phase: "final_answer",
+          }),
+          cxEvent({
+            type: "task_complete",
+            turn_id: "t2",
+            last_agent_message: "second",
+          }),
+        ].join("\n") + "\n",
+        "utf8",
+      );
+      await waitFor(() => settled(events).settled === 2, "second settle");
+      await waitFor(() => ws.prompts.length === 2, "third prompt submitted");
+      assert.match(ws.prompts[1], /do three$/);
     },
   );
 });

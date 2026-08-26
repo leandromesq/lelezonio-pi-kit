@@ -20,6 +20,7 @@ import type {
 import {
   createAgentSession,
   DefaultResourceLoader,
+  defineTool,
   getAgentDir,
   SessionManager,
   SettingsManager,
@@ -34,6 +35,8 @@ import type {
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
+import { Type } from "typebox";
+import { randomUUID } from "node:crypto";
 import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
 import { trySpawnHerdrWorker } from "./herdr-worker.ts";
 
@@ -46,6 +49,7 @@ const CHILD_EXCLUDED_TOOL_NAMES = [
   "subagent_cancel",
   "subagent_check",
   "subagent_list",
+  "subagent_send",
   "workflow",
   "ask_user",
 ] as const;
@@ -293,7 +297,113 @@ const makePiSession = (
           resourceLoader: loader,
           model,
           thinkingLevel,
+          // Profile tool policy: an explicit allowlist narrows the child's
+          // surface (read-only profiles default to read/grep/find/ls).
+          tools: task.parent.toolPolicy?.tools
+            ? [...task.parent.toolPolicy.tools]
+            : undefined,
           excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES],
+          customTools: [
+            ...(task.parent.spawnChild && task.parent.nest
+              ? [
+                  defineTool({
+                    name: "subagent_spawn",
+                    label: "Spawn Child Subagent",
+                    description:
+                      `Spawn a child subagent and wait for its result. Allowed profiles: ${task.parent.nest.allow.join(", ")}. ` +
+                      "The child runs under its own profile's tool policy; its final output returns here as the tool result.",
+                    promptSnippet:
+                      "You may delegate to child subagents for independent, self-contained subtasks.",
+                    promptGuidelines: [
+                      "Only spawn profiles from your allowlist.",
+                      "Give the child a complete, self-contained task.",
+                      "Continue with the returned result.",
+                    ],
+                    parameters: Type.Object({
+                      profile: Type.String({
+                        description: "Allowed profile name to spawn.",
+                      }),
+                      task: Type.String({
+                        minLength: 1,
+                        description:
+                          "Self-contained task for the child subagent.",
+                      }),
+                      name: Type.Optional(
+                        Type.String({
+                          description:
+                            "Optional friendly name (for later subagent_send addressing).",
+                        }),
+                      ),
+                    }),
+                    async execute(_toolCallId, params) {
+                      const result = await task.parent.spawnChild!({
+                        profile: params.profile,
+                        task: params.task,
+                        name: params.name,
+                        nest: task.parent.nest!,
+                      });
+                      if (result.error) {
+                        return {
+                          content: [
+                            {
+                              type: "text",
+                              text: `Child subagent ${result.id} failed: ${result.error}`,
+                            },
+                          ],
+                          details: { childId: result.id, failed: true },
+                        };
+                      }
+                      return {
+                        content: [
+                          {
+                            type: "text",
+                            text: `Child subagent ${result.id} finished:\n\n${result.text}`,
+                          },
+                        ],
+                        details: { childId: result.id, failed: false },
+                      };
+                    },
+                  }),
+                ]
+              : []),
+            defineTool({
+              name: "ask_question",
+              label: "Ask Orchestrator",
+              description:
+                "Ask the orchestrator a single freeform question and stop. Your session stays resumable; the answer arrives as a follow-up task message. Prefer asking over guessing when requirements are ambiguous.",
+              promptSnippet:
+                "When requirements are ambiguous, ask the orchestrator via ask_question and stop for the answer.",
+              promptGuidelines: [
+                "Ask exactly one question per call.",
+                "Prefer ask_question over guessing implementation details.",
+                "After asking, stop and wait for the answer.",
+              ],
+              parameters: Type.Object({
+                question: Type.String({
+                  minLength: 1,
+                  maxLength: 4000,
+                  description:
+                    "The question for the orchestrator. Include enough context to answer without re-reading the whole task.",
+                }),
+              }),
+              async execute(_toolCallId, params) {
+                askQuestion.emit({
+                  _tag: "QuestionAsked",
+                  questionId: randomUUID(),
+                  text: params.question,
+                });
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: "Question sent to the orchestrator. Stop working and wait — the answer arrives as your next user message.",
+                    },
+                  ],
+                  details: {},
+                };
+              },
+            }),
+          ],
         });
         // Start child extension session hooks/resources in headless mode.
         // A rejection here would otherwise leak the freshly created session:
@@ -318,10 +428,19 @@ const makePiSession = (
       settled: false,
     };
 
+    // The custom child tool below is registered before the event queue exists;
+    // it only ever fires during a prompt() run, by which time `emit` is bound.
+    const askQuestion = {
+      emit: (_event: SubagentEvent) => {
+        // replaced once `emit` is defined
+      },
+    };
+
     const events = yield* Queue.make<SubagentEvent, Cause.Done>();
     const emit = (event: SubagentEvent) => {
       Queue.offerUnsafe(events, event);
     };
+    askQuestion.emit = emit;
 
     const toolTimeout = createToolCallTimeoutGuard();
     toolTimeout.apply(session);
@@ -568,7 +687,6 @@ const makePiSession = (
 
 export const piBackend: SubagentBackend = {
   name: "pi",
-  capabilities: { steering: true, modelSelection: true, reasoningEffort: true },
   // In-process SDK: always available.
   available: Effect.succeed(true),
   spawn: (task) =>
@@ -576,10 +694,14 @@ export const piBackend: SubagentBackend = {
       // Inside Herdr, spawn the subagent as a native interactive pi TUI in
       // the shared workspace's Subagents tab; any pre-launch failure falls
       // back to the in-process SDK session below (unchanged behavior).
-      const worker = yield* trySpawnHerdrWorker("pi", task).pipe(
-        Effect.orElseSucceed(() => undefined),
-      );
-      if (worker) return worker;
+      // Nesting-capable children are always headless: their subagent_spawn
+      // tool is an in-process callback a Herdr TUI child cannot host.
+      if (!task.parent.nest) {
+        const worker = yield* trySpawnHerdrWorker("pi", task).pipe(
+          Effect.orElseSucceed(() => undefined),
+        );
+        if (worker) return worker;
+      }
       return yield* makePiSession(task);
     }),
 };

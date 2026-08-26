@@ -1,7 +1,9 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "plugins": [{ "name": "@effect/language-service" }]
+    "plugins": [{ "name": "@effect/language-service" }],
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
   },
-  "include": ["index.ts", "src/**/*.ts", "*.test.ts"]
+  "include": ["index.ts", "src/**/*.ts"]
 }

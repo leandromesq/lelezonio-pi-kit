@@ -146,8 +146,13 @@ test("tryOpenHerdrPane returns the pane id on success", async () => {
 });
 
 test("shellQuote single-quotes for pwsh and doubles embedded quotes", () => {
-  assert.equal(shellQuote("pi -p 'hello'"), "'pi -p ''hello'''");
-  assert.equal(shellQuote("plain"), "'plain'");
+  assert.equal(shellQuote("pi -p 'hello'", "win32"), "'pi -p ''hello'''");
+  assert.equal(shellQuote("plain", "win32"), "'plain'");
+});
+
+test("shellQuote escapes embedded quotes for POSIX sh", () => {
+  assert.equal(shellQuote("pi -p 'hello'", "linux"), "'pi -p '\\''hello'\\'''");
+  assert.equal(shellQuote("plain", "linux"), "'plain'");
 });
 
 test("herdrEnvironment gates on Herdr env vars", () => {

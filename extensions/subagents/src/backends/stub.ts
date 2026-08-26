@@ -33,6 +33,8 @@ export interface StubProfile {
   readonly defaultModelLabel: string;
   readonly contextWindow: number;
   readonly toolName: string;
+  /** When set, every run emits one QuestionAsked before settling. */
+  readonly askQuestion?: string;
   /** Delay between scripted events; varies per backend so streams differ. */
   readonly cadenceMs: number;
   /** Receives the pre-allocation task (logical id + profile identity). */
@@ -45,11 +47,6 @@ let sessionCounter = 0;
 export function makeStubBackend(profile: StubProfile): SubagentBackend {
   return {
     name: profile.backend,
-    capabilities: {
-      steering: true,
-      modelSelection: true,
-      reasoningEffort: true,
-    },
     // Real implementations probe their runtime and credentials here.
     available: Effect.succeed(true),
     spawn: (task) => {
@@ -198,6 +195,13 @@ const makeStubSession = (
           tokens: Math.min(profile.contextWindow, 2400 * (turn + 1) + 900),
           contextWindow: profile.contextWindow,
         });
+        if (profile.askQuestion && turn === 0) {
+          yield* emit({
+            _tag: "QuestionAsked",
+            questionId: `${sessionId}-q${turn + 1}`,
+            text: profile.askQuestion,
+          });
+        }
         yield* emit({
           _tag: "RunSettled",
           outcome: { _tag: "Completed", finalText },

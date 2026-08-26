@@ -49,10 +49,26 @@ export function formatContextUtilization(usage: ContextUtilization) {
   return `${percent === undefined ? "?" : percent}%/${formatCompactTokens(capacity)}`;
 }
 
+/** A running subagent with no activity for this long is considered stalled. */
+export const STALLED_AFTER_MS = 90_000;
+
+export function isStalled(
+  snap: { readonly status: string; readonly lastEventAt: number },
+  now: number = Date.now(),
+): boolean {
+  return (
+    snap.status === "running" && now - snap.lastEventAt >= STALLED_AFTER_MS
+  );
+}
+
 interface ActivityCounts {
   running: number;
   done: number;
   failed: number;
+  /** Running subagents with no recent activity. */
+  stalled: number;
+  /** Children with an unanswered ask_question. */
+  questions: number;
 }
 
 const SQUARE = "■";
@@ -62,11 +78,17 @@ export function formatActivityStatus(theme: Theme, counts: ActivityCounts) {
   if (counts.running > 0) {
     parts.push(theme.fg("warning", `${SQUARE} ${counts.running} running`));
   }
+  if (counts.stalled > 0) {
+    parts.push(theme.fg("error", `◔ ${counts.stalled} stalled`));
+  }
   if (counts.done > 0) {
     parts.push(theme.fg("success", `${SQUARE} ${counts.done} done`));
   }
   if (counts.failed > 0) {
     parts.push(theme.fg("error", `${SQUARE} ${counts.failed} failed`));
+  }
+  if (counts.questions > 0) {
+    parts.push(theme.fg("warning", `❓ ${counts.questions} ask`));
   }
   parts.push(theme.fg("accent", "/subagents") + theme.fg("dim", " to view"));
 

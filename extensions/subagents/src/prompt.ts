@@ -2,7 +2,7 @@
 
 /** Describes subagent_spawn, including harnesses and the fixed concurrency cap. */
 export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
-  "Spawn a background subagent: a fully autonomous, headless agent with its own context window and the selected harness's normal host permissions. You choose the harness it runs on: pi (in-process pi session, inherits this environment's tools and config) or codex (Codex CLI). Fire-and-forget: this returns immediately with an id. The subagent's final output is queued back to you as a message when it settles, or collect it explicitly with subagent_wait. Children cannot orchestrate more agents/workflows or ask the user, and cannot see this conversation, so the prompt must be self-contained. Only use trusted working directories. A configured concurrency cap applies across all harnesses.";
+  "Spawn a background subagent: a fully autonomous, headless agent with its own context window and trust-aware harness permissions (untrusted Codex projects are read-only). You choose the harness it runs on: pi (in-process pi session, inherits this environment's tools and config) or codex (Codex CLI). Fire-and-forget: this returns immediately with an id. The subagent's final output is queued back to you as a message when it settles, or collect it explicitly with subagent_wait. Children cannot orchestrate more agents/workflows or see this conversation, so the prompt must be self-contained; pi children CAN clarify ambiguous requirements via ask_question, which arrives as a question on their result. Choose an allowlisted profile to let a child delegate constrained subtasks. For multi-step pipelines with phase dependencies, use the workflow tool instead of hand-chaining subagents. Only use trusted working directories. A configured concurrency cap applies across all harnesses.";
 
 /** Adds background subagent delegation to the parent model's available-tools prompt. */
 export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
@@ -21,7 +21,7 @@ export const SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS = {
     "Task prompt for the subagent. Must be self-contained: include all needed context, file paths, and what to report back.",
   name: "Short human-readable name hint for this subagent; the auto-naming model may refine it for listings and the UI",
   profile:
-    "Named role from subagents.json. It supplies the harness, model, and reasoning effort; explicit spawn fields override profile values.",
+    "Named role from subagents.json. It supplies the harness, model, reasoning effort, tool policy (readOnly/tools), optional system prompt, context mode, and nesting allowlist.",
   harness:
     'Harness to run the subagent on: "pi" (in-process pi session; inherits this environment) or "codex" (Codex CLI). Omit to use the profile or configured default.',
   workingDir:
@@ -78,6 +78,32 @@ export const SUBAGENT_CHECK_PARAMETER_DESCRIPTIONS = {
 export const SUBAGENT_LIST_TOOL_DESCRIPTION =
   "List all subagents (running and finished) with their harness and status.";
 
+/** Describes steering or resuming a subagent by id or friendly name. */
+export const SUBAGENT_SEND_TOOL_DESCRIPTION =
+  "Send a message to a subagent by id or friendly name. If it is running, the message steers it (follow-up on the active run); if it has settled, the session is resumed with the message as the next task. Use this to answer a child's ask_question clarification or to push follow-up work without spawning a new agent.";
+
+/** Model-facing schema descriptions for subagent_send. */
+export const SUBAGENT_SEND_PARAMETER_DESCRIPTIONS = {
+  target: 'Subagent id (e.g. "sa-3") or the friendly name given at spawn time.',
+  message: "The message to deliver as the subagent's next user input.",
+};
+
+/** Builds the subagent_send result telling the model what was delivered. */
+export function buildSubagentSendResult(options: {
+  target: string;
+  id: string;
+  title: string;
+  message: string;
+  status: "running" | "done" | "error";
+}) {
+  const target =
+    options.target === options.id
+      ? options.id
+      : `${options.target} (${options.id})`;
+  const action = options.status === "running" ? "steered" : "resumed";
+  return `Delivered to subagent ${target} "${options.title}" — ${action}; the result will arrive as usual.`;
+}
+
 /** Builds the child completion/failure wrapper injected into the parent model's context. */
 export function buildSubagentResultMessage(options: {
   id: string;
@@ -85,10 +111,15 @@ export function buildSubagentResultMessage(options: {
   status: "running" | "done" | "error";
   errorText?: string;
   output: string;
+  question?: string;
+  usageText?: string;
 }) {
   const verb = options.status === "error" ? "failed" : "finished";
   let text = `Subagent ${options.id} "${options.title}" ${verb}.`;
   if (options.errorText) text += `\nError: ${options.errorText}`;
+  if (options.usageText) text += `\nUsage: ${options.usageText}`;
+  if (options.question)
+    text += `\nQuestion for you: ${options.question}\n(Answer it with subagent_send({ target: "${options.id}", message: ... }) to resume the child.)`;
   text += `\n\n${options.output}`;
   return text;
 }

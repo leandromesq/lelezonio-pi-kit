@@ -22,12 +22,14 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
   ExtensionUIContext,
+  ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_MAX_BYTES,
@@ -42,33 +44,56 @@ import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadNamingConfig } from "../auto-naming/src/config.ts";
 import { generateTaskTitle } from "../auto-naming/src/title-generator.ts";
-import { tryOpenBtwHerdrPane } from "./src/btw-herdr.ts";
 import {
   btwStatusLabel,
   deriveBtwTitle,
   isModelVisible,
 } from "./src/by-the-way.ts";
-import { loadSubagentsConfig, resolveSpawnOptions } from "./src/config.ts";
+import {
+  clearMergedCache,
+  loadConfigMerged,
+  loadSubagentsConfig,
+  resolveProfileBehavior,
+  resolveSpawnOptions,
+  type SubagentsConfig,
+} from "./src/config.ts";
 import {
   BACKEND_NAMES,
   formatElapsed,
   latestText,
   REASONING_EFFORTS,
+  type SpawnChildFn,
   type SubagentSnapshot,
 } from "./src/domain.ts";
 import {
   formatActivityStatus,
+  formatCompactTokens,
   formatContextUtilization,
+  isStalled,
 } from "./src/format.ts";
-import { SubagentManager, type SubagentManagerShape } from "./src/manager.ts";
+import {
+  SubagentManager,
+  type CancelResult,
+  type SubagentManagerShape,
+} from "./src/manager.ts";
+import { registerSubagentName, resolveSubagentTarget } from "./src/naming.ts";
+import {
+  buildChildPrompt,
+  loadProfileSystemPrompt,
+  nestingAllowed,
+  toolPolicyFor,
+} from "./src/profile.ts";
 import {
   buildSubagentResultMessage,
+  buildSubagentSendResult,
   buildSubagentSpawnResult,
   SUBAGENT_CANCEL_PARAMETER_DESCRIPTIONS,
   SUBAGENT_CANCEL_TOOL_DESCRIPTION,
   SUBAGENT_CHECK_PARAMETER_DESCRIPTIONS,
   SUBAGENT_CHECK_TOOL_DESCRIPTION,
   SUBAGENT_LIST_TOOL_DESCRIPTION,
+  SUBAGENT_SEND_PARAMETER_DESCRIPTIONS,
+  SUBAGENT_SEND_TOOL_DESCRIPTION,
   SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS,
   SUBAGENT_SPAWN_PROMPT_GUIDELINES,
   SUBAGENT_SPAWN_PROMPT_SNIPPET,
@@ -107,6 +132,15 @@ interface BtwResultData {
   readonly sessionFilePath?: string;
 }
 
+function firstLine(text: string): string {
+  return (
+    text
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line) ?? ""
+  );
+}
+
 function describeSubagent(snap: SubagentSnapshot) {
   const details = [
     `${snap.backend}: ${snap.meta.modelLabel ?? "?"}`,
@@ -114,7 +148,9 @@ function describeSubagent(snap: SubagentSnapshot) {
     formatElapsed(snap),
     snap.cwd,
   ].filter(Boolean);
-  return `${snap.id} [${snap.status}] "${snap.title}" (${details.join(", ")})`;
+  let text = `${snap.id} [${snap.status}] "${snap.title}" (${details.join(", ")})`;
+  if (snap.question) text += `\n❓ ${snap.question.text}`;
+  return text;
 }
 
 function truncatedOutput(
@@ -143,12 +179,21 @@ function resolveChildProjectTrust(options: {
   childCwd: string;
   parentTrusted: boolean;
 }) {
-  if (path.resolve(options.childCwd) === path.resolve(options.parentCwd)) {
+  const canonical = (value: string) => {
+    const resolved = path.resolve(value);
+    try {
+      return fs.realpathSync.native(resolved);
+    } catch {
+      return resolved;
+    }
+  };
+  const childCwd = canonical(options.childCwd);
+  if (childCwd === canonical(options.parentCwd)) {
     return options.parentTrusted;
   }
   try {
     const trustStore = new ProjectTrustStore(getAgentDir());
-    return trustStore.get(options.childCwd) === true;
+    return trustStore.get(childCwd) === true;
   } catch {
     return false;
   }
@@ -166,12 +211,21 @@ export default function (pi: ExtensionAPI) {
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
-  const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
+  const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>(
+    (snap) => `${snap.id}:${snap.run}`,
+  );
+  /** Session-scoped friendly names (optional `name` at spawn) → id. */
+  const subagentNames = new Map<string, string>();
+  let stallTimer: ReturnType<typeof setInterval> | undefined;
 
   const getRuntime = () =>
     (runtime ??= createSubagentRuntime({
       maxRunning: subagentConfig.maxConcurrent,
     }));
+
+  /** Project-aware config: global subagents.json merged with the project
+   * overlay at the given cwd (`.pi/subagents.json`), cached per cwd. */
+  const configFor = (cwd: string) => loadConfigMerged(subagentConfig, cwd);
 
   /** Resolve the manager service once per runtime and wire the extension hooks. */
   const getManager = () => {
@@ -187,6 +241,99 @@ export default function (pi: ExtensionAPI) {
     return managerPromise;
   };
 
+  /** Build the in-process nested-spawn callback threaded to children via
+   * `parent.spawnChild`. Enforces the caller's allowlist/depth budget here
+   * (defense in depth — the child tool also forwards the request through this
+   * single closure), applies the target profile's system prompt/tool policy,
+   * and waits for the grandchild before returning its output. */
+  const makeNestedSpawn = (base: {
+    parentCwd: string;
+    projectTrusted: boolean;
+    parentSessionId?: string;
+    inheritedModel?: { provider: string; id: string };
+    inheritedThinkingLevel?: string;
+    modelRegistry?: ModelRegistry;
+    config: SubagentsConfig;
+  }): SpawnChildFn => {
+    const fn: SpawnChildFn = async ({
+      profile,
+      task: childTask,
+      name,
+      nest,
+    }) => {
+      if (!nestingAllowed(nest, profile)) {
+        return {
+          id: "?",
+          text: "",
+          error: `Profile "${profile}" is not allowed here or exceeds the nesting depth.`,
+        };
+      }
+      const resolved = resolveSpawnOptions(base.config, { profile });
+      const behavior = resolveProfileBehavior(base.config.profiles[profile]);
+      const systemPrompt = loadProfileSystemPrompt(getAgentDir(), behavior);
+      const childNest =
+        behavior.allowChildren.length > 0
+          ? {
+              allow: behavior.allowChildren,
+              depth: nest.depth + 1,
+              maxDepth: behavior.maxDepth,
+            }
+          : undefined;
+      const title = await generateTaskTitle({
+        modelRegistry: base.modelRegistry,
+        config: loadNamingConfig(),
+        prompt: childTask,
+        hint: name,
+        fallback:
+          name?.trim().slice(0, 160) ||
+          firstLine(childTask) ||
+          "child subagent",
+      });
+      const manager = await getManager();
+      const snap = await runTool(
+        getRuntime(),
+        manager.spawn(resolved.harness, {
+          origin: "model",
+          prompt: buildChildPrompt({
+            prompt: childTask,
+            systemPrompt,
+            contextMode: behavior.contextMode,
+            parentCwd: base.parentCwd,
+            parentSessionId: base.parentSessionId,
+          }),
+          title,
+          cwd: base.parentCwd,
+          model: resolved.model,
+          reasoningEffort: resolved.reasoningEffort,
+          parent: {
+            ...base,
+            toolPolicy: toolPolicyFor(behavior),
+            nest: childNest,
+            spawnChild: childNest ? fn : undefined,
+          },
+        }),
+        { interruptMessage: "Nested subagent aborted." },
+      );
+      if (name?.trim()) registerSubagentName(subagentNames, name, snap.id);
+      const settled = await runTool(getRuntime(), manager.waitFor([snap.id]), {
+        interruptMessage: "Nested subagent wait aborted.",
+      });
+      // The grandchild's terminal result returns inline to the spawning
+      // child, so suppress the redundant automatic root follow-up.
+      resultDelivery.consumeResults(settled);
+      const finalSnap = settled[0];
+      return {
+        id: snap.id,
+        text: finalSnap?.finalText ?? "",
+        error:
+          finalSnap && finalSnap.status === "error"
+            ? finalSnap.errorText
+            : undefined,
+      };
+    };
+    return fn;
+  };
+
   const updateStatus = (manager: SubagentManagerShape) => {
     if (!ui) return;
     const subs = manager.view.list();
@@ -197,13 +344,146 @@ export default function (pi: ExtensionAPI) {
     const running = subs.filter((snap) => snap.status === "running").length;
     const failed = subs.filter((snap) => snap.status === "error").length;
     const done = subs.length - running - failed;
+    const questions = subs.filter((snap) => snap.question !== undefined).length;
+    const stalled = subs.filter((snap) => isStalled(snap)).length;
     ui.setStatus(
       "subagents",
-      formatActivityStatus(ui.theme, { running, done, failed }),
+      formatActivityStatus(ui.theme, {
+        running,
+        done,
+        failed,
+        questions,
+        stalled,
+      }),
     );
   };
 
+  /** Read only the tail of a session JSONL so restoring many (possibly
+   * multi-MB) workers at startup reads bounded I/O. */
+  const readFileTail = (filePath: string, maxBytes: number): string => {
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const start = Math.max(0, size - maxBytes);
+      const length = size - start;
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, start);
+      const tail = buffer.toString("utf8");
+      // Drop a partial first line (truncated mid-entry) — the rest is intact.
+      const newline = tail.indexOf("\n");
+      return newline >= 0 ? tail.slice(newline + 1) : tail;
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+
+  /** Parse the final assistant text/error from a persisted worker session
+   * JSONL (best-effort, tail-bounded). */
+  const summaryFromSessionFile = (filePath: string) => {
+    let finalText = "";
+    let errorText: string | undefined;
+    let settledAt = 0;
+    try {
+      for (const line of readFileTail(filePath, 256 * 1024).split("\n")) {
+        if (!line.trim()) continue;
+        let entry: unknown;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const record = entry as {
+          type?: string;
+          timestamp?: number;
+          message?: {
+            role?: string;
+            content?: Array<{ type?: string; text?: string }>;
+            stopReason?: string;
+            errorMessage?: string;
+            timestamp?: number;
+          };
+        };
+        if (record.type !== "message" || record.message?.role !== "assistant")
+          continue;
+        const text = (record.message.content ?? [])
+          .filter((block) => block.type === "text")
+          .map((block) => block.text ?? "")
+          .join("\n");
+        if (text) finalText = text;
+        if (record.message.stopReason === "error") {
+          errorText = record.message.errorMessage ?? "Restored run failed";
+        }
+        const ts = record.timestamp ?? record.message.timestamp ?? 0;
+        if (ts) settledAt = ts;
+      }
+    } catch {
+      // unreadable session → skip adoption
+    }
+    return { finalText, errorText, settledAt };
+  };
+
+  /** Re-surface persisted children of a previous pi session as inspect-only
+   * entries (dashboard, subagent_check). Resume after restart is not wired
+   * for restored entries — send() explains how to take over in a pane. */
+  const restoreWorkers = async (parentSessionId: string) => {
+    const root = path.join(
+      getAgentDir(),
+      "sessions",
+      "workers",
+      parentSessionId,
+    );
+    let dirs: string[] = [];
+    try {
+      dirs = fs
+        .readdirSync(root, { withFileTypes: true })
+        .filter((dirent) => dirent.isDirectory())
+        .map((dirent) => path.join(root, dirent.name));
+    } catch {
+      return; // no previous session persisted
+    }
+    const manager = await getManager();
+    for (const dir of dirs) {
+      const id = path.basename(dir);
+      if (manager.view.get(id)) continue;
+      const files = fs
+        .readdirSync(dir)
+        .filter((file) => file.endsWith(".jsonl"))
+        .sort();
+      const filePath = files.length
+        ? path.join(dir, files[files.length - 1])
+        : undefined;
+      if (!filePath) continue;
+      const { finalText, errorText, settledAt } =
+        summaryFromSessionFile(filePath);
+      try {
+        await runTool(
+          getRuntime(),
+          manager.adopt({
+            id,
+            title: `Restored ${id}`,
+            backend: "pi",
+            finalText,
+            errorText,
+            sessionFilePath: filePath,
+            settledAt: settledAt || Date.now(),
+          }),
+        );
+      } catch {
+        // adopt is best-effort; keep the previous session intact
+      }
+    }
+  };
+
   const deliverResult = (snap: SubagentSnapshot) => {
+    const usageText = (() => {
+      const { tokens, contextWindow } = snap.usage ?? {};
+      if (tokens === undefined && contextWindow === undefined) return undefined;
+      const parts: string[] = [];
+      if (tokens !== undefined) parts.push(`↑${formatCompactTokens(tokens)}`);
+      const ctx = formatContextUtilization({ tokens, contextWindow });
+      if (ctx) parts.push(ctx);
+      return parts.join(" · ");
+    })();
     pi.sendMessage(
       {
         customType: "subagent-result",
@@ -213,6 +493,8 @@ export default function (pi: ExtensionAPI) {
           status: snap.status,
           errorText: snap.errorText,
           output: truncatedOutput(snap),
+          question: snap.question?.text,
+          usageText,
         }),
         display: true,
         details: { id: snap.id, title: snap.title, status: snap.status },
@@ -271,16 +553,13 @@ export default function (pi: ExtensionAPI) {
       deliverBtwResult({ ...snap, meta: { ...snap.meta } });
       return;
     }
-    if (consumed) {
-      resultDelivery.consume([snap.id]);
-      return;
-    }
-    // Keep the result retractable while the parent is working. A later
-    // subagent_wait can consume it before agent_settled flushes follow-ups.
-    // Defer a copy: the live snapshot keeps mutating if the subagent is
-    // restarted before the deferred result flushes.
-    resultDelivery.defer({ ...snap, meta: { ...snap.meta } });
-    if (sessionContext?.isIdle()) flushResults();
+    // Always retain a copy until a collector successfully returns it. An
+    // active wait/cancel is only a provisional claim: if that tool is aborted
+    // after settlement, automatic delivery must still have the result.
+    // The live snapshot can mutate if the same session is restarted, so defer
+    // an immutable top-level/meta copy for each settled run.
+    resultDelivery.defer(structuredClone(snap));
+    if (!consumed && sessionContext?.isIdle()) flushResults();
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -311,6 +590,27 @@ export default function (pi: ExtensionAPI) {
       ),
     );
     setHerdrWorkerSpecDirRoot(path.join(getAgentDir(), "tmp", "worker-specs"));
+    // Project-local profiles may have changed on disk; drop the per-cwd
+    // merged-config cache so the rest of this session sees the overlay.
+    clearMergedCache();
+    // Refresh the footer stalled badge while anything is running (the
+    // event-driven updateStatus alone would stop after the last event). Only
+    // start the ticker with a UI, and skip ticks with no running subagents
+    // so a long idle session does zero per-tick work.
+    if (ctx.hasUI) {
+      stallTimer = setInterval(() => {
+        managerPromise
+          ?.then((manager) => {
+            if (!manager.view.list().some((s) => s.status === "running"))
+              return;
+            updateStatus(manager);
+          })
+          .catch(() => {});
+      }, 20_000);
+    }
+    // Re-surface children of a previous pi session (same parent id) that are
+    // persisted under the workers dir: inspect-only entries in the dashboard.
+    void restoreWorkers(parentSessionId ?? "session");
   });
 
   pi.on("agent_settled", flushResults);
@@ -318,6 +618,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     sessionContext = undefined;
     resultDelivery.clear();
+    subagentNames.clear();
+    if (stallTimer !== undefined) {
+      clearInterval(stallTimer);
+      stallTimer = undefined;
+    }
     unsubStatus?.();
     unsubStatus = undefined;
     ui?.setStatus("subagents", undefined);
@@ -382,7 +687,11 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const manager = await getManager();
-      const resolved = resolveSpawnOptions(subagentConfig, {
+      const config = configFor(ctx.cwd);
+      const behavior = resolveProfileBehavior(
+        params.profile ? config.profiles[params.profile] : undefined,
+      );
+      const resolved = resolveSpawnOptions(config, {
         profile: params.profile,
         harness: params.harness,
         model: params.model,
@@ -390,7 +699,10 @@ export default function (pi: ExtensionAPI) {
       });
       const harness = resolved.harness;
 
-      const cwd = path.resolve(ctx.cwd, params.working_dir ?? ".");
+      const cwd = path.resolve(
+        ctx.cwd,
+        params.working_dir ?? behavior.cwd ?? ".",
+      );
       if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
         throw new Error(`working_dir is not a directory: ${cwd}`);
       }
@@ -403,31 +715,58 @@ export default function (pi: ExtensionAPI) {
         fallback: params.name.trim().slice(0, 160) || "subagent",
         signal,
       });
+      const systemPrompt = loadProfileSystemPrompt(getAgentDir(), behavior);
+      const toolPolicy = toolPolicyFor(behavior);
+      const nest =
+        behavior.allowChildren.length > 0
+          ? {
+              allow: behavior.allowChildren,
+              depth: 0,
+              maxDepth: behavior.maxDepth,
+            }
+          : undefined;
+      const parentBase = {
+        parentCwd: ctx.cwd,
+        projectTrusted: resolveChildProjectTrust({
+          parentCwd: ctx.cwd,
+          childCwd: cwd,
+          parentTrusted: ctx.isProjectTrusted(),
+        }),
+        parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
+        inheritedModel: ctx.model
+          ? { provider: ctx.model.provider, id: ctx.model.id }
+          : undefined,
+        inheritedThinkingLevel: pi.getThinkingLevel(),
+        modelRegistry: ctx.modelRegistry,
+        config,
+      };
       const snap = await runTool(
         getRuntime(),
         manager.spawn(harness, {
-          prompt: params.prompt,
+          prompt: buildChildPrompt({
+            prompt: params.prompt,
+            systemPrompt,
+            contextMode: behavior.contextMode,
+            parentCwd: ctx.cwd,
+            parentSessionId: parentBase.parentSessionId,
+          }),
           title,
           cwd,
           model: resolved.model,
           reasoningEffort: resolved.reasoningEffort,
           parent: {
-            parentCwd: ctx.cwd,
-            projectTrusted: resolveChildProjectTrust({
-              parentCwd: ctx.cwd,
-              childCwd: cwd,
-              parentTrusted: ctx.isProjectTrusted(),
-            }),
-            parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
-            inheritedModel: ctx.model
-              ? { provider: ctx.model.provider, id: ctx.model.id }
-              : undefined,
-            inheritedThinkingLevel: pi.getThinkingLevel(),
-            modelRegistry: ctx.modelRegistry,
+            ...parentBase,
+            toolPolicy,
+            nest,
+            spawnChild: nest ? makeNestedSpawn(parentBase) : undefined,
           },
         }),
         { signal, interruptMessage: "Subagent spawn aborted." },
       );
+
+      const friendlyName = params.name.trim()
+        ? registerSubagentName(subagentNames, params.name, snap.id)
+        : undefined;
 
       return {
         content: [
@@ -445,6 +784,7 @@ export default function (pi: ExtensionAPI) {
         details: {
           id: snap.id,
           title: snap.title,
+          name: friendlyName,
           cwd,
           profile: resolved.profile,
           harness,
@@ -453,6 +793,95 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+
+  pi.registerTool({
+    name: "subagent_send",
+    label: "Send to Subagent",
+    description: SUBAGENT_SEND_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      target: Type.String({
+        description: SUBAGENT_SEND_PARAMETER_DESCRIPTIONS.target,
+      }),
+      message: Type.String({
+        minLength: 1,
+        description: SUBAGENT_SEND_PARAMETER_DESCRIPTIONS.message,
+      }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const manager = await getManager();
+      const id = resolveSubagentTarget(params.target, subagentNames);
+      const snap = manager.view.get(id);
+      if (!snap || !isModelVisible(snap)) {
+        const known = manager.view
+          .list()
+          .filter(isModelVisible)
+          .map((s) => s.id);
+        throw new Error(
+          `Unknown subagent target "${params.target}" (resolved to "${id}"). Known: ${known.join(", ") || "none"}.`,
+        );
+      }
+      await runTool(getRuntime(), manager.send(id, params.message), {
+        signal,
+        interruptMessage: "Subagent send aborted.",
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: buildSubagentSendResult({
+              target: params.target,
+              id,
+              title: snap.title,
+              message: params.message,
+              status: snap.status,
+            }),
+          },
+        ],
+        details: { id, title: snap.title, message: params.message },
+      };
+    },
+  });
+
+  // A child pi TUI (Herdr worker) loads this extension too. Inside a child
+  // (PI_SUBAGENT=1) expose only ask_question, which writes the sidecar the
+  // parent worker polls to surface QuestionAsked.
+  if (process.env.PI_SUBAGENT === "1" && process.env.PI_SUBAGENT_ASK_FILE) {
+    const askFile = process.env.PI_SUBAGENT_ASK_FILE;
+    pi.registerTool({
+      name: "ask_question",
+      label: "Ask Orchestrator",
+      description:
+        "Ask the orchestrator (the parent agent that spawned you) a single freeform question and stop. The answer arrives as your next user message. Prefer asking over guessing.",
+      promptSnippet:
+        "When requirements are ambiguous, ask the orchestrator via ask_question and stop for the answer.",
+      promptGuidelines: [
+        "Ask exactly one question per call.",
+        "Prefer ask_question over guessing implementation details.",
+        "After asking, stop and wait for the answer.",
+      ],
+      parameters: Type.Object({
+        question: Type.String({
+          minLength: 1,
+          maxLength: 4000,
+          description:
+            "The question for the orchestrator. Include enough context to answer without re-reading the whole task.",
+        }),
+      }),
+      async execute(_toolCallId, params) {
+        const data = { questionId: randomUUID(), text: params.question };
+        fs.writeFileSync(askFile, `${JSON.stringify(data)}\n`, "utf8");
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Question sent to the orchestrator. Stop working and wait — the answer arrives as your next user message.",
+            },
+          ],
+          details: {},
+        };
+      },
+    });
+  }
 
   pi.registerTool({
     name: "subagent_wait",
@@ -483,27 +912,40 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      await runTool(
-        getRuntime(),
-        manager.waitFor(ids, (pending) => {
-          onUpdate?.({
-            content: [
-              { type: "text", text: `Waiting for ${pending.join(", ")}...` },
-            ],
-            details: { pending },
-          });
-        }),
-        { signal, interruptMessage: "Wait aborted. Subagents keep running." },
+      let returnedSnapshots: ReadonlyArray<SubagentSnapshot>;
+      try {
+        returnedSnapshots = await runTool(
+          getRuntime(),
+          manager.waitFor(ids, (pending) => {
+            onUpdate?.({
+              content: [
+                { type: "text", text: `Waiting for ${pending.join(", ")}...` },
+              ],
+              details: { pending },
+            });
+          }),
+          { signal, interruptMessage: "Wait aborted. Subagents keep running." },
+        );
+      } catch (error) {
+        // Aborted collector: interest was released, so the settlement stays
+        // deferred. Flush now so an aborted wait cannot strand results until
+        // the next agent_settled/idle event.
+        if (sessionContext?.isIdle()) flushResults();
+        throw error;
+      }
+
+      // Settlement may have happened before this wait began. Remove only the
+      // exact run generations this tool is returning; older undelivered runs
+      // with the same logical id remain queued in FIFO order.
+      resultDelivery.consumeResults(returnedSnapshots);
+
+      const returnedById = new Map(
+        returnedSnapshots.map((snap) => [snap.id, snap] as const),
       );
-
-      // Settlement may have happened before this wait began. Remove any
-      // deferred automatic delivery now that the tool is returning the result.
-      resultDelivery.consume(ids);
-
       const sections: string[] = [];
       let remainingBytes = WAIT_OUTPUT_MAX_BYTES;
       for (const id of ids) {
-        const snap = manager.view.get(id);
+        const snap = returnedById.get(id);
         if (!snap) {
           sections.push(`## ${id}\n\n(no longer tracked)`);
           continue;
@@ -540,7 +982,7 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text }],
         details: {
           results: ids.map((id) => {
-            const snap = manager.view.get(id);
+            const snap = returnedById.get(id);
             return { id, title: snap?.title, status: snap?.status };
           }),
         },
@@ -577,10 +1019,28 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const report = await runTool(getRuntime(), manager.cancel(ids), {
-        signal,
-        interruptMessage: "Subagent cancellation aborted.",
-      });
+      let report: ReadonlyArray<CancelResult>;
+      try {
+        report = await runTool(getRuntime(), manager.cancel(ids), {
+          signal,
+          interruptMessage: "Subagent cancellation aborted.",
+        });
+      } catch (error) {
+        // Aborted cancellation: interest was released and the terminal
+        // settlements remain deferred. Flush so they are still delivered.
+        if (sessionContext?.isIdle()) flushResults();
+        throw error;
+      }
+      // Cancellation committed successfully; suppress only the exact terminal
+      // generations it actually cancelled (captured as immutable clones by
+      // the manager). Older queued runs with the same logical id are
+      // unrelated and must still be delivered.
+      resultDelivery.consumeResults(
+        report
+          .filter((entry) => entry.cancelled)
+          .map((entry) => entry.snapshot)
+          .filter((snap): snap is SubagentSnapshot => snap !== undefined),
+      );
 
       const lines = report.map((entry) =>
         entry.cancelled
@@ -788,29 +1248,9 @@ export default function (pi: ExtensionAPI) {
       fallback: deriveBtwTitle(prompt),
     });
 
-    // When this pi session runs inside Herdr, open the side agent as a
-    // visible pane next to the current one; fall back to the in-process
-    // headless subagent when Herdr is not available.
-    const herdrPane = await tryOpenBtwHerdrPane({
-      title,
-      prompt,
-      cwd: ctx.cwd,
-    });
-    if (herdrPane) {
-      deliverBtwEntry({
-        id: herdrPane.paneId,
-        title,
-        status: "running",
-        prompt,
-        answer: `Opened in Herdr pane ${herdrPane.paneId} — the agent is running there and can be followed or taken over from Herdr.`,
-      });
-      ctx.ui.notify(
-        `by the way “${title}” opened in Herdr pane ${herdrPane.paneId}`,
-        "info",
-      );
-      return;
-    }
-
+    // Always route through the manager. The Pi backend will choose a native
+    // Herdr worker pane when available and otherwise use its headless session,
+    // while preserving concurrency, cancellation, settlement, and cleanup.
     let snap: SubagentSnapshot;
     try {
       snap = await runTool(
@@ -836,6 +1276,14 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(
         error instanceof Error ? error.message : String(error),
         "error",
+      );
+      return;
+    }
+
+    if (snap.meta.herdrPaneId) {
+      ctx.ui.notify(
+        `by the way “${title}” opened in Herdr pane ${snap.meta.herdrPaneId}`,
+        "info",
       );
       return;
     }
