@@ -46,6 +46,26 @@ export default function codexAccounts(pi: ExtensionAPI) {
 
       try {
         if (command.action === "save") {
+          // Saving the same Codex identity under a second name (e.g. after a
+          // re-login that returned the same account) creates two files that
+          // both match "current" and confuse switching. Offer an explanation
+          // and a confirmation before duplicating.
+          const sameIdentityName = await store.findCurrentIdentityName(
+            command.name,
+          );
+          if (sameIdentityName !== undefined) {
+            const message = `Current Codex credentials are already saved as "${sameIdentityName}" (same account id). They are the same identity — saving "${command.name}" only duplicates it.`;
+            if (!ctx.hasUI) {
+              ctx.ui.notify(message, "warning");
+              return;
+            }
+            const duplicateAnyway = await ctx.ui.confirm(
+              "Duplicate Codex identity",
+              `${message} Save it anyway under "${command.name}"?`,
+            );
+            if (!duplicateAnyway) return;
+          }
+
           const exists = await store.hasAccount(command.name);
           if (exists) {
             if (!ctx.hasUI) {

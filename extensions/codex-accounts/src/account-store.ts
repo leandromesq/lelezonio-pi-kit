@@ -201,6 +201,49 @@ export class CodexAccountStore {
     );
   }
 
+  /** Name of an already-saved account whose credentials match the CURRENT
+   * auth.json, excluding `targetName` (typically the name being saved).
+   * Returns undefined when the current identity is not saved anywhere. */
+  async findCurrentIdentityName(targetName?: string) {
+    const activeCredentials = await readCredentials(this.authPath).catch(
+      () => undefined,
+    );
+    if (!activeCredentials) return undefined;
+
+    let entries;
+    try {
+      entries = await readdir(this.accountsDirectory, { withFileTypes: true });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        return undefined;
+      }
+      throw error;
+    }
+
+    const names = entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map((entry) => entry.name.slice(0, -".json".length))
+      .filter((name) => ACCOUNT_NAME_PATTERN.test(name));
+
+    for (const name of names) {
+      if (name === targetName) continue;
+      const savedCredentials = await readCredentials(
+        this.accountPath(name),
+      ).catch(() => undefined);
+      if (
+        savedCredentials !== undefined &&
+        credentialsMatch(activeCredentials, savedCredentials)
+      ) {
+        return name;
+      }
+    }
+    return undefined;
+  }
+
   async switchTo(name: string) {
     const savedCredentials = await readCredentials(this.accountPath(name));
     await atomicWrite(this.authPath, savedCredentials.contents);

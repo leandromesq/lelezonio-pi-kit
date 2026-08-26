@@ -116,3 +116,30 @@ test("requires explicit overwrite and valid credential JSON", async () => {
     );
   });
 });
+
+test("detects a duplicate identity saved under another name", async () => {
+  await withCodexHome(async ({ home, store }) => {
+    const primary = credentials("same-account", "token-a");
+    const other = credentials("other-account", "token-b");
+
+    await writeCredentials(home, primary);
+    await store.save("work");
+    await writeCredentials(home, other);
+    await store.save("personal");
+
+    // Current is "personal" (other-account). Called from its own name it is
+    // excluded, and work holds a different identity -> nothing matches.
+    assert.equal(await store.findCurrentIdentityName("personal"), undefined);
+    // Without exclusion the current identity resolves to its own account.
+    assert.equal(await store.findCurrentIdentityName(), "personal");
+
+    // Re-save the SAME identity under a new name -> match.
+    await writeCredentials(home, primary);
+    assert.equal(await store.findCurrentIdentityName("backup"), "work");
+    // Excluding the matching name hides it.
+    assert.equal(await store.findCurrentIdentityName("work"), undefined);
+    // No accounts directory at all -> undefined.
+    const empty = new CodexAccountStore(join(home, "does-not-exist"));
+    assert.equal(await empty.findCurrentIdentityName(), undefined);
+  });
+});
