@@ -54,6 +54,7 @@ import {
 } from "./src/runtime.ts";
 import { sanitizeText } from "./src/ui/output-view.ts";
 import { openTerminalPicker } from "./src/ui/ps.ts";
+import { disposeTakeoverHost } from "../shared/takeover-host.ts";
 
 const WIDGET_KEY = "background-terminals";
 
@@ -199,6 +200,8 @@ export default function (pi: ExtensionAPI) {
     runtime = undefined;
     managerPromise = undefined;
     await closing?.dispose();
+    // Close takeover panes/sockets opened in this session; targets keep running.
+    await disposeTakeoverHost();
   });
 
   // --- Tools -------------------------------------------------------------

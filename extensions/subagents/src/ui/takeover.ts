@@ -13,6 +13,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  takeoverHost,
+  takeoverKey,
+  type TakeoverTarget,
+} from "../../../shared/takeover-host.ts";
 import { formatElapsed, type SubagentSnapshot } from "../domain.ts";
 import { formatContextUtilization } from "../format.ts";
 import type { SubagentReadModel } from "../manager.ts";
@@ -53,13 +58,95 @@ export interface TakeoverOptions {
   readonly badge?: string;
 }
 
+/** Plain-text conversation view for the takeover pane (no TUI styling). */
+export function buildSubagentText(snap: SubagentSnapshot): string {
+  const lines: string[] = [];
+  for (const item of snap.transcript) {
+    if (item.kind === "user") {
+      lines.push(`> ${item.text}`);
+    } else if (item.kind === "assistant") {
+      for (const part of item.parts) {
+        if (part.type === "text" && part.text.trim()) {
+          lines.push(part.text.trim());
+        } else if (part.type === "thinking") {
+          const body = part.redacted ? "…" : part.text.trim();
+          if (body) lines.push(`[thinking] ${body}`);
+        } else if (part.type === "toolCall") {
+          const preview = part.argsPreview?.trim();
+          lines.push(
+            `→ ${part.name}${preview && preview !== "{}" ? ` ${preview}` : ""}`,
+          );
+        }
+      }
+    } else {
+      const preview = (item.outputPreview ?? "").trim()?.split("\n")[0];
+      lines.push(
+        `  ${item.isError ? "error" : "output"}: ${preview || "(no output)"}`,
+      );
+    }
+  }
+  const live = snap.liveAssistant?.text.trim();
+  if (live) lines.push(live);
+  for (const tool of snap.liveTools) {
+    const preview = tool.outputPreview?.trim();
+    lines.push(`→ ${tool.name}${preview ? ` ${preview}` : ""}`);
+  }
+  for (const message of snap.queued) lines.push(`> [queued] ${message.text}`);
+  if (snap.errorText) lines.push(`error: ${snap.errorText}`);
+  return lines.join("\n");
+}
+
+/** Normalized snapshot for the takeover bridge. */
+export function subagentTarget(snap: SubagentSnapshot): TakeoverTarget {
+  return {
+    kind: "subagent",
+    id: snap.id,
+    title: snap.title,
+    status: snap.status,
+    since: snap.createdAt,
+    text: buildSubagentText(snap),
+  };
+}
+
+/**
+ * Try to open this subagent in a Herdr takeover pane. Returns true when the
+ * pane is showing/controlling the same existing session; callers then skip
+ * the in-session overlay. Any failure falls through to the overlay.
+ */
+export async function tryOpenInHerdrPane(
+  ctx: ExtensionCommandContext,
+  view: SubagentReadModel,
+  id: string,
+): Promise<boolean> {
+  const snap = view.get(id);
+  if (!snap) return false;
+  const host = takeoverHost();
+  const key = takeoverKey("subagent", id);
+  const paneId = await host.open({
+    target: () => {
+      const current = view.get(id);
+      return current ? subagentTarget(current) : undefined;
+    },
+    actions: {
+      send: (text: string) => view.requestSend(id, text),
+      abort: () => view.requestAbort(id),
+    },
+    cwd: snap.cwd,
+    subscribe: () => view.subscribeTo(id, () => host.refresh(key)),
+  });
+  if (!paneId) return false;
+  ctx.ui.notify(`Subagent ${id} taken over in Herdr pane ${paneId}`, "info");
+  return true;
+}
+
 export async function openSubagentTakeover(
   ctx: ExtensionCommandContext,
   view: SubagentReadModel,
   id: string,
   options?: TakeoverOptions,
-) {
-  if (!view.get(id)) return;
+): Promise<boolean> {
+  if (!view.get(id)) return false;
+  if (await tryOpenInHerdrPane(ctx, view, id)) return true;
   await ctx.ui.custom<null>(
     (tui, theme, keybindings, done) =>
       new TakeoverView(tui, theme, keybindings, id, view, done, options),
@@ -68,6 +155,7 @@ export async function openSubagentTakeover(
       overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
     },
   );
+  return false;
 }
 
 export async function openSubagentPicker(
@@ -94,8 +182,9 @@ export async function openSubagentPicker(
     if (!picked) return;
     if (!view.get(picked)) continue;
 
-    await openSubagentTakeover(ctx, view, picked);
-    // After leaving the takeover view, fall back to the dashboard.
+    const openedPane = await openSubagentTakeover(ctx, view, picked);
+    if (openedPane) return;
+    // After leaving the in-session takeover view, return to the dashboard.
   }
 }
 

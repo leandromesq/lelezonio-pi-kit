@@ -79,6 +79,7 @@ import {
   type SubagentRuntime,
 } from "./src/runtime.ts";
 import { openSubagentPicker, openSubagentTakeover } from "./src/ui/takeover.ts";
+import { disposeTakeoverHost } from "../shared/takeover-host.ts";
 
 const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
@@ -290,6 +291,8 @@ export default function (pi: ExtensionAPI) {
     // Disposing the runtime runs the manager finalizer, which tears down all
     // subagent scopes (and, later, their real child processes).
     await closing?.dispose();
+    // Close takeover panes/sockets opened in this session; targets keep running.
+    await disposeTakeoverHost();
   });
 
   // --- Tools -------------------------------------------------------------

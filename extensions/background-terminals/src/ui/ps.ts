@@ -15,6 +15,11 @@ import type {
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  takeoverHost,
+  takeoverKey,
+  type TakeoverTarget,
+} from "../../../shared/takeover-host.ts";
 import { formatElapsed, formatExit, type TerminalSnapshot } from "../domain.ts";
 import type { TerminalReadModel } from "../manager.ts";
 import { createOutputLineCache, sanitizeText } from "./output-view.ts";
@@ -60,6 +65,49 @@ function statusWord(snap: TerminalSnapshot, theme: Theme) {
 
 // --- Entry point ---------------------------------------------------------------
 
+/** Normalized snapshot for the takeover bridge (stdout main, stderr toggle). */
+export function terminalTarget(snap: TerminalSnapshot): TakeoverTarget {
+  return {
+    kind: "terminal",
+    id: snap.id,
+    title: snap.title,
+    status: snap.status,
+    since: snap.createdAt,
+    text: snap.stdout.text,
+    secondaryText: snap.stderr.text,
+  };
+}
+
+/**
+ * Try to open this terminal in a Herdr takeover pane (read-only + kill).
+ * Returns true when the pane took over; callers keep the in-session overlay
+ * otherwise.
+ */
+export async function tryOpenTerminalTakeoverPane(
+  ctx: ExtensionCommandContext,
+  view: TerminalReadModel,
+  id: string,
+): Promise<boolean> {
+  const snap = view.get(id);
+  if (!snap) return false;
+  const host = takeoverHost();
+  const key = takeoverKey("terminal", id);
+  const paneId = await host.open({
+    target: () => {
+      const current = view.get(id);
+      return current ? terminalTarget(current) : undefined;
+    },
+    actions: {
+      kill: () => view.requestKill(id),
+    },
+    cwd: snap.cwd,
+    subscribe: () => view.subscribeTo(id, () => host.refresh(key)),
+  });
+  if (!paneId) return false;
+  ctx.ui.notify(`Terminal ${id} taken over in Herdr pane ${paneId}`, "info");
+  return true;
+}
+
 export async function openTerminalPicker(
   ctx: ExtensionCommandContext,
   view: TerminalReadModel,
@@ -84,6 +132,8 @@ export async function openTerminalPicker(
     if (!picked) return;
     if (!view.get(picked)) continue;
 
+    if (await tryOpenTerminalTakeoverPane(ctx, view, picked)) return;
+
     await ctx.ui.custom<null>(
       (tui, theme, keybindings, done) =>
         new TerminalDetailView(tui, theme, keybindings, picked, view, done),
@@ -92,7 +142,9 @@ export async function openTerminalPicker(
         overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
       },
     );
-    // After leaving the detail view, fall back to the dashboard.
+    // After leaving the detail view, fall back to the dashboard. A successful
+    // pane take-over returns above: the pane replaces the UI, so reopening the
+    // dashboard here would loop.
   }
 }
 

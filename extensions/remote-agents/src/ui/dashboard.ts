@@ -12,6 +12,7 @@ import {
 } from "../domain.ts";
 import type { RemoteAgentReadModel } from "../manager.ts";
 import { buildTranscriptLines, sanitizeText } from "./transcript.ts";
+import { openRemoteTakeoverPaneOr } from "./pane.ts";
 
 function configuredKeys(
   keybindings: KeybindingsManager,
@@ -61,7 +62,8 @@ export async function openRemotePicker(
       },
     );
     if (!picked) return;
-    await openRemoteTakeover(ctx, view, picked);
+    const openedPane = await openRemoteTakeover(ctx, view, picked);
+    if (openedPane) return;
   }
 }
 
@@ -69,16 +71,18 @@ export async function openRemoteTakeover(
   ctx: ExtensionCommandContext,
   view: RemoteAgentReadModel,
   id: string,
-) {
-  if (!view.get(id)) return;
-  view.requestRefresh(id);
-  await ctx.ui.custom<null>(
-    (tui, theme, keybindings, done) =>
-      new RemoteTakeover(tui, theme, keybindings, id, view, done),
-    {
-      overlay: true,
-      overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
-    },
+): Promise<boolean> {
+  const snap = view.get(id);
+  if (!snap) return false;
+  return openRemoteTakeoverPaneOr(ctx, view, id, () =>
+    ctx.ui.custom<null>(
+      (tui, theme, keybindings, done) =>
+        new RemoteTakeover(tui, theme, keybindings, id, view, done),
+      {
+        overlay: true,
+        overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%" },
+      },
+    ),
   );
 }
 

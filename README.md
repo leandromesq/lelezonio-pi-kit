@@ -11,6 +11,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 - Named Pi/Codex subagent profiles with configurable models and thinking effort
 - Fast Codex CLI account saving and switching with `/codex`
 - Multi-agent workflows with phased and parallel execution
+- Take over subagents, background terminals, and remote agents in a Herdr pane when running inside Herdr (one live viewer, never a second Pi; falls back to the in-session overlays outside Herdr)
 - Background terminals for servers, watchers, and long-running commands
 - Persistent remote Pi agents over SSH and Herdr, with context handoff and reconnectable monitoring
 - First-class `fd` and `rg` tools
@@ -127,6 +128,23 @@ Run `/codex` to select an account. The switch updates Codex CLI credentials for 
 - `/git <target-branch>` inspects the repository, proposes logical commits and PR text for approval, pushes, and creates a GitHub PR with an explicit base branch.
 
 The PR workflow requires an authenticated [GitHub CLI](https://cli.github.com/) installation.
+
+## Take over in a Herdr pane
+
+When Pi runs inside Herdr (`HERDR_ENV=1`), selecting **take over** for a
+subagent (`/subagents`), a background terminal (`/ps`), or a remote agent
+(`/remotes`) opens a new Herdr pane that shows and controls the **same
+process** â€” it never starts a second Pi. The pane runs a thin viewer over a
+loopback JSONL bridge: live snapshot, `i`/Enter to compose and send for
+subagents/remotes (all printable characters type freely), Ctrl+C (with confirmation) to
+abort/kill/cancel, `r` to refresh a remote, `t` to toggle terminal
+stdout/stderr, `q` to detach (the target keeps running).
+
+Outside Herdr, or whenever the pane cannot be opened (including when the
+viewer fails to authenticate), the in-session overlays are used exactly as
+before. `/btw` keeps launching a real `pi -p` in a pane. The design, protocol
+bounds, and lifecycle are documented in
+[docs/takeover-herdr.md](docs/takeover-herdr.md).
 
 ## Development
 
