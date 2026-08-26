@@ -103,15 +103,15 @@ Profiles live in [`subagents.json`](subagents.json):
 
 | Profile    | Harness | Model                           | Thinking | Intended use                        |
 | ---------- | ------- | ------------------------------- | -------- | ----------------------------------- |
-| `planner`  | Codex   | `gpt-5.6-luna`                  | `max`    | Difficult planning and architecture |
+| `planner`  | Pi      | `openai-codex/gpt-5.6-luna`     | `high`   | Difficult planning and architecture |
 | `coder`    | Pi      | `opencode-go/deepseek-v4-flash` | `high`   | Implementation                      |
-| `reviewer` | Codex   | `gpt-5.6-luna`                  | `high`   | Review and research                 |
+| `reviewer` | Pi      | `opencode-go/gpt-5.6-luna`      | `high`   | Review and research                 |
 
 Explicit spawn fields override profile values. Profile values override per-harness defaults. The concurrency cap is also configured in this file.
 
-The main agent executes small tasks directly and delegates only independent, complex, long, or parallelizable work to subagents. Codex runs `planner` and `reviewer` (gpt-5.6-luna), Pi runs `coder` (opencode-go/deepseek-v4-flash), and profile-less spawns default to the `pi` harness. See AGENTS.md for the full delegation policy.
+The main agent executes small tasks directly and delegates only independent, complex, long, or parallelizable work to subagents. All named profiles run on the Pi harness: `planner` uses `openai-codex/gpt-5.6-luna`, `coder` uses `opencode-go/deepseek-v4-flash`, and `reviewer` uses `opencode-go/gpt-5.6-luna`. Profile-less spawns also default to the Pi harness. The Codex harness is reserved for tasks that require tooling unavailable in Pi, such as an MCP integration exposed by Codex CLI. See AGENTS.md for the full delegation policy.
 
-These model names reflect my accounts and preferences. Replace them with models available from `pi --list-models` and your Codex CLI installation.
+These model names reflect my accounts and preferences. Replace them with models and providers available from `pi --list-models`; Codex-harness profiles additionally require a compatible Codex CLI installation.
 
 Save the Codex CLI account that is currently authenticated, then repeat after logging into each account you use:
 

@@ -4,20 +4,19 @@
   "harnesses": {
     "pi": {
       "model": "opencode-go/gpt-5.6-luna",
-      "thinking": "max"
+      "thinking": "high"
     },
     "codex": {
       "model": "gpt-5.6-luna",
-      "thinking": "max"
+      "thinking": "high"
     }
   },
   "profiles": {
     "planner": {
-      "harness": "codex",
-      "model": "gpt-5.6-luna",
-      "thinking": "max",
-      "readOnly": true,
-      "contextMode": "summary"
+      "harness": "pi",
+      "model": "openai-codex/gpt-5.6-luna",
+      "thinking": "high",
+      "readOnly": true
     },
     "coder": {
       "harness": "pi",
@@ -27,11 +26,10 @@
       "maxDepth": 1
     },
     "reviewer": {
-      "harness": "codex",
-      "model": "gpt-5.6-luna",
+      "harness": "pi",
+      "model": "opencode-go/gpt-5.6-luna",
       "thinking": "high",
-      "readOnly": true,
-      "tools": ["read", "grep", "find", "ls"]
+      "readOnly": true
     }
   }
 }

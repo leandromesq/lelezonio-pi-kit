@@ -36,16 +36,32 @@ Profiles can also be shipped **per project**: a `.pi/subagents.json` in the
 project root overlays the global config (same schema, project wins by profile
 name; resolved from the caller's cwd).
 
+This setup defaults all named profiles to the Pi harness. Override a spawn to
+the Codex harness only when the task requires tooling unavailable in Pi, such
+as an MCP integration exposed by Codex CLI.
+
 Example (this setup):
 
 ```json
 {
-  "planner": { "harness": "codex", "readOnly": true, "contextMode": "summary" },
-  "coder": { "harness": "pi", "allowChildren": ["reviewer"], "maxDepth": 1 },
+  "planner": {
+    "harness": "pi",
+    "model": "openai-codex/gpt-5.6-luna",
+    "thinking": "high",
+    "readOnly": true
+  },
+  "coder": {
+    "harness": "pi",
+    "model": "opencode-go/deepseek-v4-flash",
+    "thinking": "high",
+    "allowChildren": ["reviewer"],
+    "maxDepth": 1
+  },
   "reviewer": {
-    "harness": "codex",
-    "readOnly": true,
-    "tools": ["read", "grep", "find", "ls"]
+    "harness": "pi",
+    "model": "opencode-go/gpt-5.6-luna",
+    "thinking": "high",
+    "readOnly": true
   }
 }
 ```
