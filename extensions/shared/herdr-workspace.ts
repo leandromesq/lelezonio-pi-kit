@@ -376,8 +376,9 @@ export interface WorkerPaneHandle {
    * by liveness watchdogs for worker TUIs.
    */
   getAgentState(): Promise<string | undefined>;
-  /** Whether a non-shell foreground process still owns the worker pane. */
-  isWorkerRunning?(): Promise<boolean>;
+  /** Whether a non-shell foreground process still owns the worker pane.
+   * Undefined means the liveness probe itself failed and must not settle. */
+  isWorkerRunning?(): Promise<boolean | undefined>;
   /** `pane report-metadata` — display-only metadata for this pane. */
   reportMetadata(options: {
     readonly title?: string;
@@ -880,7 +881,7 @@ export function createWorkerWorkspaceController(
           const processes = output
             ? resultOf(output).process_info?.foreground_processes
             : undefined;
-          if (!processes) return false;
+          if (!processes) return undefined;
           return processes.some((process) => {
             const name = process.name ?? "";
             return !/^(?:pwsh|powershell|cmd)(?:\.exe)?$/i.test(name);
@@ -1112,11 +1113,22 @@ export function createWorkerWorkspaceController(
 
 // --- Process-wide singleton (one workspace per parent pi session) ---------------
 
-let singleton: WorkerWorkspaceController | undefined;
-/** Controllers already handed to disposeWorkerWorkspace (or dispose()). They
- * must never be returned again — a disposed workspace cannot be reused, and
- * recreating from a stale controller would leak duplicate workspaces. */
-const disposedControllers = new WeakSet<WorkerWorkspaceController>();
+/** Pi loads extensions independently, so the same shared source can exist as
+ * more than one ESM module instance. Module-local state therefore creates one
+ * workspace per extension. Symbol.for anchors the registry on the process
+ * global object, making every copy converge on the same controller. */
+const WORKSPACE_REGISTRY = Symbol.for("lelezonio.pi.worker-workspace");
+interface WorkspaceRegistry {
+  controller?: WorkerWorkspaceController;
+  sessionKey?: string;
+  disposed: WeakSet<WorkerWorkspaceController>;
+}
+const processGlobal = globalThis as typeof globalThis & {
+  [WORKSPACE_REGISTRY]?: WorkspaceRegistry;
+};
+const registry = (processGlobal[WORKSPACE_REGISTRY] ??= {
+  disposed: new WeakSet<WorkerWorkspaceController>(),
+});
 
 /**
  * The shared worker workspace for the current pi session (created lazily on
@@ -1130,13 +1142,26 @@ export function workerWorkspaceForSession(
   sessionId: string,
   projectRoot: string,
 ): WorkerWorkspaceController {
-  if (singleton && !disposedControllers.has(singleton)) return singleton;
+  const sessionKey = `${sessionId}\0${path.resolve(projectRoot)}`;
+  const existing = registry.controller;
+  if (
+    existing &&
+    registry.sessionKey === sessionKey &&
+    !registry.disposed.has(existing)
+  ) {
+    return existing;
+  }
+  if (existing && !registry.disposed.has(existing)) {
+    registry.disposed.add(existing);
+    void existing.dispose();
+  }
   const created = createWorkerWorkspaceController({
     project,
     sessionId,
     projectRoot,
   });
-  singleton = created;
+  registry.controller = created;
+  registry.sessionKey = sessionKey;
   return created;
 }
 
@@ -1148,10 +1173,11 @@ export function workerWorkspaceForSession(
  * workspace actually closes (taken-over panes survive until then).
  */
 export function disposeWorkerWorkspace(): Promise<void> {
-  const workspace = singleton;
-  singleton = undefined;
+  const workspace = registry.controller;
+  registry.controller = undefined;
+  registry.sessionKey = undefined;
   if (!workspace) return Promise.resolve();
-  disposedControllers.add(workspace);
+  registry.disposed.add(workspace);
   return workspace.dispose();
 }
 
@@ -1159,5 +1185,6 @@ export function disposeWorkerWorkspace(): Promise<void> {
 export function setWorkerWorkspaceForTests(
   controller: WorkerWorkspaceController | undefined,
 ): void {
-  singleton = controller;
+  registry.controller = controller;
+  registry.sessionKey = controller ? "test" : undefined;
 }

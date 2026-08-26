@@ -1718,7 +1718,7 @@ export function makeHerdrWorkerSession(
         : pane.getAgentState().then((agentState) => agentState !== undefined);
       void liveness
         .then((running) => {
-          if (state.runActive && !running) {
+          if (state.runActive && running === false) {
             settleRun({
               _tag: "Failed",
               errorText:

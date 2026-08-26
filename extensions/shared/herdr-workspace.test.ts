@@ -1184,6 +1184,23 @@ test("workerWorkspaceForSession shares one controller; disposal resets it", asyn
   }
 });
 
+test("independent ESM copies share the process-global workspace registry", async () => {
+  setWorkerWorkspaceForTests(undefined);
+  const copy = await import(`./herdr-workspace.ts?copy=${Date.now()}`);
+  try {
+    const first = workerWorkspaceForSession("agent", "parent", "/tmp/project");
+    const second = copy.workerWorkspaceForSession(
+      "agent",
+      "parent",
+      "/tmp/project",
+    );
+    assert.equal(second, first);
+  } finally {
+    await disposeWorkerWorkspace();
+    copy.setWorkerWorkspaceForTests(undefined);
+  }
+});
+
 test("disposeWorkerWorkspace with no controller resolves immediately", async () => {
   setWorkerWorkspaceForTests(undefined);
   await disposeWorkerWorkspace();
