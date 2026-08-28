@@ -54,3 +54,6 @@ checkpoints/
 
 # Runtime credential snapshots for the codex-accounts extension
 /codex-accounts/
+
+# Wallpaper-synced theme (changes with the desktop wallpaper)
+/themes/noctalia.json
