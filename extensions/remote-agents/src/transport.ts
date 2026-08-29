@@ -116,18 +116,23 @@ export class SshTransport {
       { input: helper, timeoutMs: 20_000 },
     );
     const pingOutput = await this.execute(
-      `exec /usr/bin/python3 ${shellQuote(helperPath)}`,
+      `export PATH="$HOME/.local/bin:$PATH"; exec python3 ${shellQuote(helperPath)}`,
       { input: JSON.stringify({ action: "ping" }), timeoutMs: 20_000 },
     );
     const ping = JSON.parse(pingOutput.trim().split(/\r?\n/).at(-1) ?? "") as {
       ok?: boolean;
-      result?: { protocol?: number; ok?: boolean };
+      result?: { protocol?: number; ok?: boolean; status?: string };
       error?: string;
     };
-    if (!ping.ok || !ping.result?.ok || ping.result.protocol !== 1) {
+    if (!ping.ok) throw new Error(ping.error ?? "Remote helper ping failed");
+    if (ping.result?.protocol !== 1) {
       throw new Error(
-        ping.error ??
-          `Remote helper protocol mismatch (expected 1, received ${ping.result?.protocol ?? "unknown"})`,
+        `Remote helper protocol mismatch (expected 1, received ${ping.result?.protocol ?? "unknown"})`,
+      );
+    }
+    if (!ping.result.ok) {
+      throw new Error(
+        `Remote Herdr server is not running${ping.result.status ? `: ${ping.result.status}` : ""}`,
       );
     }
   }
@@ -138,7 +143,7 @@ export class SshTransport {
   ) {
     await this.ensureHelper();
     const output = await this.execute(
-      `exec /usr/bin/python3 ${shellQuote(this.config.remoteHelper)}`,
+      `export PATH="$HOME/.local/bin:$PATH"; exec python3 ${shellQuote(this.config.remoteHelper)}`,
       {
         ...options,
         input: JSON.stringify(request),

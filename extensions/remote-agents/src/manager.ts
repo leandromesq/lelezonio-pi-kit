@@ -281,11 +281,15 @@ export class RemoteAgentManager {
             snapshot.finalText = structured.text.slice(-FINAL_TEXT_MAX_CHARS);
             snapshot.sessionPath = structured.sessionPath;
             snapshot.resultMissingSince = undefined;
-          } else {
+          } else if (
+            snapshot.status === "done" &&
+            !snapshot.promptObservedActivity
+          ) {
             snapshot.resultMissingSince ??= Date.now();
             if (Date.now() - snapshot.resultMissingSince < RESULT_GRACE_MS) {
               // Pi can briefly appear idle/done while its startup prompt is
-              // still queued. A completed assistant session is authoritative.
+              // still queued. Once activity was observed, Herdr's settled
+              // state is authoritative even when it omits agent_session.
               snapshot.status = "working";
               snapshot.settledAt = undefined;
             } else {
@@ -293,6 +297,11 @@ export class RemoteAgentManager {
               snapshot.errorText =
                 "Remote agent settled without producing an assistant result";
             }
+          } else {
+            // Herdr versions that do not expose agent_session cannot provide a
+            // structured result. Keep the settled state and use the captured
+            // terminal transcript as the completion fallback.
+            snapshot.resultMissingSince = undefined;
           }
         }
       }

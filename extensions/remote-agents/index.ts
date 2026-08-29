@@ -30,8 +30,9 @@ import { HerdrClient } from "./src/herdr-client.ts";
 import { RemoteAgentManager } from "./src/manager.ts";
 import { RemoteJobStore } from "./src/persistence.ts";
 import { detectLocalGitProject, remoteProjectLocation } from "./src/project.ts";
+import { openRemoteUi } from "./src/remote-ui.ts";
 import { SshTransport } from "./src/transport.ts";
-import { openRemotePicker, openRemoteTakeover } from "./src/ui/dashboard.ts";
+import { openRemotePicker } from "./src/ui/dashboard.ts";
 
 const RESULT_TRANSCRIPT_CHARS = 24 * 1024;
 
@@ -402,13 +403,37 @@ export default function (pi: ExtensionAPI) {
     };
   };
 
+  const openRemoteWindow = async (
+    snapshot: RemoteAgentSnapshot,
+    ctx: ExtensionContext,
+    force = false,
+  ) => {
+    try {
+      await openRemoteUi(config, snapshot.title, force);
+    } catch (error) {
+      ctx.ui.notify(
+        `Remote agent started, but the Herdr window could not be opened: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+  };
+
+  const spawnPrepared = async (
+    prepared: Awaited<ReturnType<typeof prepareRemote>>,
+    ctx: ExtensionContext,
+  ) => {
+    const snapshot = await prepared.remote.spawn(prepared.spawn);
+    await openRemoteWindow(snapshot, ctx);
+    return snapshot;
+  };
+
   const startRemote = async (
     instructions: string,
     ctx: ExtensionContext,
     options: Parameters<typeof prepareRemote>[2] = {},
   ) => {
     const prepared = await prepareRemote(instructions, ctx, options);
-    return prepared.remote.spawn(prepared.spawn);
+    return spawnPrepared(prepared, ctx);
   };
 
   pi.registerCommand("remote", {
@@ -473,8 +498,13 @@ export default function (pi: ExtensionAPI) {
             "Starting remote agent on macmini...",
           );
           loader.onAbort = () => done(null);
-          prepared.remote
-            .spawn({ ...prepared.spawn, signal: loader.signal })
+          spawnPrepared(
+            {
+              ...prepared,
+              spawn: { ...prepared.spawn, signal: loader.signal },
+            },
+            ctx,
+          )
             .then(done)
             .catch((error) => {
               ctx.ui.notify(
@@ -487,8 +517,10 @@ export default function (pi: ExtensionAPI) {
         },
       );
       if (!snapshot) return;
-      ctx.ui.notify(`Started ${snapshot.id} on macmini`, "info");
-      await openRemoteTakeover(ctx, (await getManager()).view, snapshot.id);
+      ctx.ui.notify(
+        `Started ${snapshot.id} on macmini and opened its remote Herdr window`,
+        "info",
+      );
     },
   });
 
@@ -501,7 +533,14 @@ export default function (pi: ExtensionAPI) {
       );
       return;
     }
-    await openRemotePicker(ctx, remote.view);
+    await openRemotePicker(ctx, remote.view, async (id) => {
+      const snapshot = remote.get(id);
+      if (!snapshot) {
+        ctx.ui.notify(`Remote agent ${id} no longer exists`, "warning");
+        return;
+      }
+      await openRemoteWindow(snapshot, ctx, true);
+    });
   };
 
   pi.registerCommand("remotes", {

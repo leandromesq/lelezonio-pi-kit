@@ -5,10 +5,12 @@ Persistent remote Pi agents on the Tailscale-connected `macmini`, managed throug
 ## Verified environment
 
 - SSH alias: `macmini`
-- Local SSH client: `C:\Windows\System32\OpenSSH\ssh.exe`
-- Remote Herdr: `/usr/local/bin/herdr` (`0.7.5`, protocol 17)
-- Remote Python: `/usr/bin/python3`
-- Remote Pi is started by Herdr from the interactive zsh environment.
+- Local SSH client: `ssh`
+- Remote OS: NixOS Linux (`x86_64`) reached through the `macmini` Tailscale/SSH alias
+- Remote Herdr: `~/.local/bin/herdr` (`0.8.2`, protocol 20), kept running by the enabled `herdr-server.service` user unit
+- Remote Python and Git: resolved from the SSH environment's `PATH`
+- Remote Pi: `~/.local/bin/pi` (`0.84.3`), authenticated from the remote machine's existing Codex OAuth session
+- The SSH helper prepends `~/.local/bin` so NixOS batch shells can find Herdr and Pi.
 
 The Phase 0 spike verified this sequence over batch-mode SSH:
 
@@ -39,16 +41,20 @@ Optional global configuration: `~/.pi/agent/remote-agents.json`.
 ```json
 {
   "host": "macmini",
-  "sshExecutable": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
-  "remoteHelper": "/Users/leandrom/.local/share/pi-remote/helper.py",
-  "projectsRoot": "/Users/leandrom/Projects",
-  "worktreesRoot": "/Users/leandrom/Worktrees",
+  "sshExecutable": "ssh",
+  "remoteHelper": "/home/leandrom/.local/share/pi-remote/helper.py",
+  "projectsRoot": "/home/leandrom/Projects",
+  "worktreesRoot": "/home/leandrom/Worktrees",
+  "openRemoteUiOnSpawn": true,
+  "terminalExecutable": "kitty",
   "pollIntervalMs": 3000,
   "maxConcurrent": 3
 }
 ```
 
 Local Git repositories resolve by repository name beneath `projectsRoot`; working subdirectories are preserved. Missing projects require explicit approval before cloning from the local origin. Non-Git jobs use `worktreesRoot`, and only one active writer is permitted per Git project.
+
+After a successful spawn, `openRemoteUiOnSpawn` opens a separate Kitty OS window running `herdr --remote macmini`. The launcher removes inherited `HERDR_*` variables before starting Kitty, so the new OS window is not rejected as a nested client. Selecting a job with Enter in `/remotes` opens the same external Herdr window instead of the old transcript overlay. The remote job remains successful if Kitty cannot be launched; Pi reports the UI launch failure as a warning. Set `openRemoteUiOnSpawn` to `false` to keep automatic spawn windows disabled; jobs can still be opened explicitly from `/remotes`.
 
 ## Commands and tools
 

@@ -7,6 +7,8 @@ export interface RemoteAgentsConfig {
   readonly remoteHelper: string;
   readonly projectsRoot: string;
   readonly worktreesRoot: string;
+  readonly openRemoteUiOnSpawn: boolean;
+  readonly terminalExecutable: string;
   readonly pollIntervalMs: number;
   readonly maxConcurrent: number;
 }
@@ -17,9 +19,11 @@ export function defaultRemoteAgentsConfig(): RemoteAgentsConfig {
   return {
     host: "macmini",
     sshExecutable: process.platform === "win32" ? windowsSsh : "ssh",
-    remoteHelper: "/Users/leandrom/.local/share/pi-remote/helper.py",
-    projectsRoot: "/Users/leandrom/Projects",
-    worktreesRoot: "/Users/leandrom/Worktrees",
+    remoteHelper: "/home/leandrom/.local/share/pi-remote/helper.py",
+    projectsRoot: "/home/leandrom/Projects",
+    worktreesRoot: "/home/leandrom/Worktrees",
+    openRemoteUiOnSpawn: true,
+    terminalExecutable: "kitty",
     pollIntervalMs: 3_000,
     maxConcurrent: 3,
   };
@@ -60,10 +64,20 @@ export function parseRemoteAgentsConfig(value: unknown): RemoteAgentsConfig {
     defaults.worktreesRoot,
     "worktreesRoot",
   );
+  const openRemoteUiOnSpawn =
+    value.openRemoteUiOnSpawn ?? defaults.openRemoteUiOnSpawn;
+  const terminalExecutable =
+    typeof value.terminalExecutable === "string"
+      ? value.terminalExecutable.trim()
+      : defaults.terminalExecutable;
   const pollIntervalMs = value.pollIntervalMs ?? defaults.pollIntervalMs;
   const maxConcurrent = value.maxConcurrent ?? defaults.maxConcurrent;
-  if (!host || !sshExecutable || !remoteHelper)
-    throw new Error("host, sshExecutable, and remoteHelper must not be empty");
+  if (!host || !sshExecutable || !remoteHelper || !terminalExecutable)
+    throw new Error(
+      "host, sshExecutable, remoteHelper, and terminalExecutable must not be empty",
+    );
+  if (typeof openRemoteUiOnSpawn !== "boolean")
+    throw new Error("openRemoteUiOnSpawn must be a boolean");
   if (
     typeof pollIntervalMs !== "number" ||
     !Number.isInteger(pollIntervalMs) ||
@@ -85,6 +99,8 @@ export function parseRemoteAgentsConfig(value: unknown): RemoteAgentsConfig {
     remoteHelper,
     projectsRoot,
     worktreesRoot,
+    openRemoteUiOnSpawn,
+    terminalExecutable,
     pollIntervalMs,
     maxConcurrent,
   };

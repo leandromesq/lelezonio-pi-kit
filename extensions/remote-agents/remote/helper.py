@@ -2,14 +2,22 @@
 """Stable JSON/stdin adapter around Herdr's CLI for the Pi remote extension."""
 
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
 
 PROTOCOL = 1
-HERDR = "/usr/local/bin/herdr"
-GIT = "/usr/bin/git"
+
+
+def executable(name: str, override: str):
+    return os.environ.get(override) or shutil.which(name) or name
+
+
+HERDR = executable("herdr", "PI_REMOTE_HERDR")
+GIT = executable("git", "PI_REMOTE_GIT")
 
 
 def run(*args: str):
@@ -70,7 +78,9 @@ def handle(request):
     action = request.get("action")
     if action == "ping":
         status = subprocess.run([HERDR, "status", "server"], capture_output=True, text=True, timeout=10)
-        return {"protocol": PROTOCOL, "ok": status.returncode == 0, "status": status.stdout.strip()}
+        output = (status.stdout or status.stderr).strip()
+        running = any(line.strip() == "status: running" for line in output.splitlines())
+        return {"protocol": PROTOCOL, "ok": status.returncode == 0 and running, "status": output}
     if action == "list":
         return result(run("agent", "list"))
     if action == "get":

@@ -31,6 +31,8 @@ const config: RemoteAgentsConfig = {
   remoteHelper: "/tmp/helper.py",
   projectsRoot: "/remote/Projects",
   worktreesRoot: "/remote/Worktrees",
+  openRemoteUiOnSpawn: false,
+  terminalExecutable: "kitty",
   pollIntervalMs: 60_000,
   maxConcurrent: 3,
 };
@@ -237,6 +239,12 @@ test("manager does not settle on the unchanged idle state before a prompt starts
     current = agent(snapshot.name, "working", 12);
     assert.equal((await manager.refresh(snapshot.id)).status, "working");
     current = agent(snapshot.name, "done", 13);
+    const transcriptFallback = await manager.refresh(snapshot.id, {
+      transcript: true,
+    });
+    assert.equal(transcriptFallback.status, "done");
+    assert.equal(transcriptFallback.finalText, undefined);
+
     resultAvailable = true;
     const finished = await manager.refresh(snapshot.id, { transcript: true });
     assert.equal(finished.status, "done");

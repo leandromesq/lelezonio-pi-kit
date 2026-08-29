@@ -22,7 +22,7 @@ Use the `remote_*` tools supplied by the remote-agents extension.
 - If a remote project is missing, ask the user before setting `clone_if_missing`; never transmit a credential-bearing Git URL.
 - Non-Git jobs run from the configured remote `Worktrees` folder.
 - Blocked-agent questions are delivered automatically. Answer them with `remote_send` after obtaining any input needed from the user.
-- In `/remotes`, `d` closes and forgets the selected workspace. `/remote-clean` removes all settled stale workspaces.
+- In `/remotes`, Enter opens the selected job in a separate Kitty window through `herdr --remote macmini`; `d` closes and forgets the selected workspace. `/remote-clean` removes all settled stale workspaces.
 
 ## Interactive Herdr remote attach
 

@@ -45,6 +45,7 @@ function oneLine(text: string) {
 export async function openRemotePicker(
   ctx: ExtensionCommandContext,
   view: RemoteAgentReadModel,
+  openSelected: (id: string) => Promise<void>,
 ) {
   const selection = { index: 0, id: undefined as string | undefined };
   while (true) {
@@ -61,8 +62,8 @@ export async function openRemotePicker(
       },
     );
     if (!picked) return;
-    const openedPane = await openRemoteTakeover(ctx, view, picked);
-    if (openedPane) return;
+    await openSelected(picked);
+    return;
   }
 }
 
@@ -211,7 +212,7 @@ class RemoteDashboard implements Component {
       truncateToWidth(
         this.theme.fg(
           "dim",
-          `${configuredKeys(this.keybindings, "tui.select.confirm")} inspect · x cancel · d delete · r refresh · ${configuredKeys(this.keybindings, "tui.select.cancel")} close`,
+          `${configuredKeys(this.keybindings, "tui.select.confirm")} open Herdr · x cancel · d delete · r refresh · ${configuredKeys(this.keybindings, "tui.select.cancel")} close`,
         ),
         width,
       ),

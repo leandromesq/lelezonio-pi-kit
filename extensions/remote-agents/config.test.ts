@@ -10,6 +10,19 @@ test("remote roots are explicit and normalized", () => {
   });
   assert.equal(config.projectsRoot, "/Users/remote/Projects");
   assert.equal(config.worktreesRoot, "/Users/remote/Worktrees");
+  assert.equal(config.openRemoteUiOnSpawn, true);
+  assert.equal(config.terminalExecutable, "kitty");
+});
+
+test("remote UI launch settings are validated", () => {
+  assert.throws(
+    () => parseRemoteAgentsConfig({ openRemoteUiOnSpawn: "yes" }),
+    /must be a boolean/,
+  );
+  assert.throws(
+    () => parseRemoteAgentsConfig({ terminalExecutable: " " }),
+    /must not be empty/,
+  );
 });
 
 test("remote roots must be absolute", () => {
