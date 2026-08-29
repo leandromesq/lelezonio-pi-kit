@@ -97,6 +97,9 @@ export interface HerdrWorkerDeps {
   readonly pollIntervalMs: number;
   /** Interrupt fallback: local settle if the parser misses the abort. */
   readonly interruptFallbackMs: number;
+  /** Maximum grace period for a Pi initial prompt to produce a first user
+   * turn/session entry before the worker sends one Enter-only retry. */
+  readonly initialSubmissionWatchdogMs?: number;
   /** Liveness probe gap while a run produces no new file lines. Undefined →
    * never probe (tests) — production always probes. */
   readonly livenessProbeEveryMs: number | undefined;
@@ -1426,6 +1429,11 @@ interface WorkerState {
   askedQuestionIds: Set<string>;
   meta: SubagentMeta;
   marker?: string;
+  /** A Pi first user entry is the observable proof that the initial prompt
+   * actually submitted. A session header alone is not a turn. */
+  initialTurnObserved: boolean;
+  initialWatchdogActive: boolean;
+  initialWatchdogGeneration: number;
 }
 
 const boundedError = (error: unknown) =>
@@ -1445,6 +1453,8 @@ function emitOutcome(
   state.runStarted = false;
   state.runError = undefined;
   state.interruptRequested = false;
+  state.initialWatchdogActive = false;
+  state.initialWatchdogGeneration += 1;
   clearInterruptFallback(state);
   emit({ _tag: "RunSettled", outcome });
 }
@@ -1483,6 +1493,10 @@ export function makeHerdrWorkerSession(
     const clock = deps.clock ?? Date.now;
     const sleepMs = deps.sleep ?? sleepReal;
     const pollIntervalMs = deps.pollIntervalMs;
+    const initialSubmissionWatchdogMs = Math.max(
+      1,
+      deps.initialSubmissionWatchdogMs ?? 10_000,
+    );
     const agentName = technicalAgentName(
       task.parent.parentSessionId ?? "session",
       task.logicalId ?? "sa",
@@ -1581,6 +1595,9 @@ export function makeHerdrWorkerSession(
       askedQuestionIds: new Set<string>(),
       meta: { backend: kind },
       marker: initialCodexMarker,
+      initialTurnObserved: false,
+      initialWatchdogActive: false,
+      initialWatchdogGeneration: 0,
     };
 
     const pane = yield* Eff.tryPromise(() =>
@@ -1685,17 +1702,6 @@ export function makeHerdrWorkerSession(
         emit(metaEvent(state.meta));
       }
       return reopened;
-    };
-
-    /** Submit a prompt via the LOW-LEVEL transport (`pane send-text` + Enter),
-     * retrying only while the fresh TUI boots (bounded by the deadline). */
-    const submitPrompt = async (text: string): Promise<void> => {
-      if (state.closed || !state.pane)
-        throw new Error("subagent pane is closed");
-      // WorkerPaneHandle owns the only safe retries: send-text retries only
-      // before delivery, and Enter retries without retyping. Retrying the
-      // whole pair here could duplicate text after a partial success.
-      await state.pane.submitText(text);
     };
 
     /** Close the pane after a settled run unless the user took it over. */
@@ -1866,23 +1872,125 @@ export function makeHerdrWorkerSession(
         : text;
     };
 
-    /** Submit the initial prompt of an already-active run and report working. */
-    const submitRunPrompt = (promptText: string) => {
-      void submitPrompt(promptText)
-        .then(() => report("working"))
-        .catch((error) => {
-          if (state.closed || !state.runActive) return;
-          state.runError = boundedError(error);
-          if (state.pane) {
-            void state.pane.close().catch(() => {});
-            state.pane = undefined;
-          }
-          settleRun({
-            _tag: "Failed",
-            errorText: state.runError,
-            partialText: state.lastAssistantText || undefined,
-          });
+    /** Settle the one allowed recovery path when the Pi TUI accepted text but
+     * never produced a first user turn. This is deliberately a worker-level
+     * diagnostic as well as a failed outcome: Herdr's idle report alone is
+     * not a useful completion signal to the parent manager. */
+    const failInitialSubmission = async () => {
+      if (
+        state.closed ||
+        !state.runActive ||
+        !state.initialWatchdogActive ||
+        state.initialTurnObserved
+      )
+        return;
+      state.initialWatchdogActive = false;
+      const reportedState = await state.pane
+        ?.getAgentState()
+        .catch(() => undefined);
+      const message =
+        `Pi worker initial prompt made no observable first turn after an ` +
+        `Enter-only retry (Herdr state: ${reportedState ?? "unknown"}); ` +
+        `the worker remained at zero turns`;
+      emit({ _tag: "BackendError", message });
+      await report("blocked", message);
+      settleRun({
+        _tag: "Failed",
+        errorText: message,
+        partialText: state.lastAssistantText || undefined,
+      });
+    };
+
+    /** Watch the initial Pi submission in two bounded phases. The first phase
+     * gives the TUI time to consume the text and Enter. If no first user entry
+     * is observed, the second phase sends Enter only — never the text again —
+     * to recover the startup race seen with Pi workers. */
+    const startInitialSubmissionWatchdog = () => {
+      if (kind !== "pi" || state.initialWatchdogActive) return;
+      state.initialWatchdogActive = true;
+      const generation = ++state.initialWatchdogGeneration;
+      const waitForProgress = async () => {
+        const deadline = clock() + initialSubmissionWatchdogMs;
+        // The attempt cap keeps a badly behaved fake clock/sleep from turning
+        // this bounded watchdog into an infinite loop. Production clocks also
+        // satisfy the deadline check on every poll.
+        const maxPolls =
+          Math.ceil(initialSubmissionWatchdogMs / Math.max(1, pollIntervalMs)) +
+          1;
+        for (let poll = 0; poll < maxPolls; poll += 1) {
+          if (
+            state.closed ||
+            !state.runActive ||
+            !state.initialWatchdogActive ||
+            state.initialWatchdogGeneration !== generation ||
+            state.initialTurnObserved
+          )
+            return true;
+          const remaining = deadline - clock();
+          if (remaining <= 0) return false;
+          await sleepMs(Math.min(Math.max(1, pollIntervalMs), remaining));
+        }
+        return state.initialTurnObserved;
+      };
+
+      void (async () => {
+        if (await waitForProgress()) return;
+        if (
+          state.closed ||
+          !state.runActive ||
+          !state.initialWatchdogActive ||
+          state.initialTurnObserved
+        )
+          return;
+        const pane = state.pane;
+        if (!pane) {
+          await failInitialSubmission();
+          return;
+        }
+        await pane.sendEnter();
+        if (await waitForProgress()) return;
+        await failInitialSubmission();
+      })().catch((error) => {
+        if (
+          state.closed ||
+          !state.runActive ||
+          state.initialWatchdogGeneration !== generation
+        )
+          return;
+        const message = `Could not retry the Pi worker initial submission: ${boundedError(error)}`;
+        emit({ _tag: "BackendError", message });
+        settleRun({
+          _tag: "Failed",
+          errorText: message,
+          partialText: state.lastAssistantText || undefined,
         });
+      });
+    };
+
+    /** Submit a prompt after text delivery has been separated from Enter. */
+    const submitRunPrompt = (promptText: string, initial = false) => {
+      void (async () => {
+        const pane = state.pane;
+        if (!pane) throw new Error("subagent pane is closed");
+        await pane.sendText(promptText);
+        // Mark the text as delivered before any Enter call. If Enter races
+        // TUI startup, the watchdog may safely press Enter without retyping.
+        if (initial && kind === "pi") startInitialSubmissionWatchdog();
+        await pane.sendEnter();
+        await report("working");
+      })().catch((error) => {
+        if (state.closed || !state.runActive) return;
+        state.runError = boundedError(error);
+        if (state.pane) {
+          void state.pane.close().catch(() => {});
+          state.pane = undefined;
+        }
+        settleRun({
+          _tag: "Failed",
+          errorText: state.runError,
+          partialText: state.lastAssistantText || undefined,
+        });
+      });
     };
 
     const beginRun = (text: string) => submitRunPrompt(startRunState(text));
@@ -1996,6 +2104,13 @@ export function makeHerdrWorkerSession(
         // PiSessionFileReader already emits this MetaChanged event; keep the
         // session metadata in sync without duplicating it in the transcript.
         state.meta = { ...state.meta, modelLabel: parsed.state.modelLabel };
+      }
+      if (
+        state.initialWatchdogActive &&
+        parsed.events.some((event) => event._tag === "UserMessage")
+      ) {
+        state.initialTurnObserved = true;
+        state.initialWatchdogActive = false;
       }
       if (!state.runActive) return;
       if (!state.runStarted && parsed.events.length > 0) {
@@ -2299,7 +2414,7 @@ export function makeHerdrWorkerSession(
       // cannot race startup input or be submitted twice.
       void report("working");
     } else {
-      submitRunPrompt(initialPromptText);
+      submitRunPrompt(initialPromptText, true);
     }
 
     return {

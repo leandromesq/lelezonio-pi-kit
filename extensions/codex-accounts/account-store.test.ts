@@ -132,10 +132,7 @@ test("save requires Pi credentials first and valid auth.json", async () => {
     );
 
     await writeFile(join(dir, "auth.json"), "not-json", "utf8");
-    await assert.rejects(
-      () => store.save("broken"),
-      /not valid JSON/,
-    );
+    await assert.rejects(() => store.save("broken"), /not valid JSON/);
   });
 });
 
@@ -148,9 +145,7 @@ test("requires explicit overwrite", async () => {
     // Overwrite path replaces the stored snapshot.
     await writeAuth(dir, authStore(credential("second", "other-token")));
     await store.save("primary", { overwrite: true });
-    assert.deepEqual(await store.list(), [
-      { name: "primary", active: true },
-    ]);
+    assert.deepEqual(await store.list(), [{ name: "primary", active: true }]);
   });
 });
 

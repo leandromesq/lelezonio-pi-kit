@@ -350,6 +350,18 @@ export interface WorkerPaneHandle {
   /** `pane rename` — relabel the pane. */
   rename(label: string): Promise<void>;
   /**
+   * Deliver text without pressing a key. Once this resolves, the text may
+   * already be in the TUI input buffer and must never be sent again.
+   */
+  sendText(text: string): Promise<void>;
+  /**
+   * Press Enter only, with the same bounded transient-busy retry as the
+   * combined submit operation. This is intentionally separate from
+   * sendText() so callers can recover an Enter/startup race without
+   * retyping already-delivered text.
+   */
+  sendEnter(): Promise<void>;
+  /**
    * Submit text plus Enter to the pane's agent via the LOW-LEVEL transport:
    * `pane send-text <pane> <text>` then `pane send-keys <pane> enter`.
    * `agent prompt` is deliberately NOT used — live spikes proved it fails
@@ -737,6 +749,23 @@ export function createWorkerWorkspaceController(
     }
   };
 
+  /** Press Enter without touching the input buffer. */
+  const sendEnterWithRetry = async (paneId: string): Promise<void> => {
+    const deadline = Date.now() + runRetryDeadlineMs;
+    for (;;) {
+      try {
+        await call(["pane", "send-keys", paneId, "enter"], cliTimeoutMs);
+        return;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("agent_pane_busy") || Date.now() >= deadline) {
+          throw error;
+        }
+        await sleep(runRetryDelayMs);
+      }
+    }
+  };
+
   const closeBounded = async (args: ReadonlyArray<string>): Promise<void> => {
     await Promise.race([
       call(args, closeTimeoutMs),
@@ -828,32 +857,15 @@ export function createWorkerWorkspaceController(
         rename: async (next) => {
           await call(["pane", "rename", allocatedPaneId, next], cliTimeoutMs);
         },
+        sendText: (text) => sendTextWithRetry(allocatedPaneId, text),
+        sendEnter: () => sendEnterWithRetry(allocatedPaneId),
         submitText: async (text) => {
           // Low-level transport (live-proven): type the text, then Enter.
           // Once send-text delivered, the text sits in the input box —
           // retrying the PAIR would double-type it. Only the Enter key is
           // retried, boundedly and only on transient pane-busy errors.
           await sendTextWithRetry(allocatedPaneId, text);
-          const enterDeadline = Date.now() + runRetryDeadlineMs;
-          for (;;) {
-            try {
-              await call(
-                ["pane", "send-keys", allocatedPaneId, "enter"],
-                cliTimeoutMs,
-              );
-              return;
-            } catch (error) {
-              const message =
-                error instanceof Error ? error.message : String(error);
-              if (
-                !message.includes("agent_pane_busy") ||
-                Date.now() >= enterDeadline
-              ) {
-                throw error;
-              }
-              await sleep(runRetryDelayMs);
-            }
-          }
+          await sendEnterWithRetry(allocatedPaneId);
         },
         reportState: async (state, message) => {
           const args = [

@@ -94,7 +94,9 @@ Copy any memory directories you intentionally use. Keep the backup until the new
 
 ```json
 {
-  "theme": "github-dark-default",
+  "theme": "noctalia",
+  "tuiMode": "fullscreen",
+  "quietStartup": true,
   "packages": []
 }
 ```
@@ -109,7 +111,7 @@ Hound is an optional local MCP service that adds `web_search`, `web_fetch`, `web
 
 ```sh
 python3 -m venv ~/.local/share/hound-venv
-~/.local/share/hound-venv/bin/python -m pip install --upgrade "hound-mcp[all]==13.1.2"
+~/.local/share/hound-venv/bin/python -m pip install --upgrade "hound-mcp[all]==13.2.0"
 ~/.local/share/hound-venv/bin/python -m playwright install chromium
 
 mkdir -p ~/.local/bin
@@ -127,7 +129,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ```powershell
 $venv = Join-Path $HOME ".local\share\hound-venv"
 python -m venv $venv
-& "$venv\Scripts\python.exe" -m pip install --upgrade "hound-mcp[all]==13.1.2"
+& "$venv\Scripts\python.exe" -m pip install --upgrade "hound-mcp[all]==13.2.0"
 & "$venv\Scripts\python.exe" -m playwright install chromium
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -139,10 +141,10 @@ if (($userPath -split ";") -notcontains $scripts) {
 
 Restart the terminal after changing the user `PATH`.
 
-Install the Pi extension globally from the maintained repository. `v13.1.2` includes important SSRF fixes and is the matching current release:
+Install the Pi extension globally from the maintained repository. `v13.2.0` includes the earlier SSRF fixes and is the matching current release:
 
 ```sh
-pi install git:github.com/dondai44423/master-fetch@v13.1.2
+pi install git:github.com/dondai44423/master-fetch@v13.2.0
 ```
 
 Do not install the legacy `npm:@houndmcp/hound-mcp-pi` package; its published release still points at the old repository.
@@ -162,7 +164,7 @@ If Hound was installed through the old npm package, replace it with the maintain
 
 ```sh
 pi uninstall npm:@houndmcp/hound-mcp-pi
-pi install git:github.com/dondai44423/master-fetch@v13.1.2
+pi install git:github.com/dondai44423/master-fetch@v13.2.0
 ```
 
 ### Update
@@ -171,7 +173,6 @@ Update the engine with its built-in updater. To update the Pi extension, replace
 
 ```sh
 hound -u
-pi uninstall git:github.com/dondai44423/master-fetch@v13.1.2
 pi install git:github.com/dondai44423/master-fetch@v<version>
 ```
 
@@ -179,7 +180,7 @@ pi install git:github.com/dondai44423/master-fetch@v<version>
 
 Configure named roles, per-harness defaults, and the concurrency cap in [`subagents.json`](subagents.json). A spawn can select a `profile`; explicit `harness`, `model`, and `reasoning_effort` values override it. Profile values override the selected harness defaults.
 
-The included configuration runs `planner` and `reviewer` on Codex (`gpt-5.6-luna`) and `coder` on Pi (`opencode-go/deepseek-v4-flash`). Replace unavailable models with entries from:
+The included configuration runs all named profiles on the Pi harness: `planner` uses `openai-codex/gpt-5.6-luna`, `coder` uses `opencode-go/deepseek-v4-flash`, and `reviewer` uses `opencode-go/gpt-5.6-luna`. The Codex harness remains available for tasks that require Codex-only tooling or when the Pi worker transport is unavailable. Replace unavailable models with entries from:
 
 ```sh
 pi --list-models
@@ -251,9 +252,9 @@ If automatic provisioning does not support your platform, install both binaries 
 
 ## Fullscreen TUI
 
-The setup enables Pi's native fullscreen TUI through `"tuiMode": "fullscreen"` in `settings.json`. The transcript scrolls independently while queued messages, status, widgets, editor, and footer remain fixed at the bottom.
+The setup enables Pi's native fullscreen TUI through `"tuiMode": "fullscreen"` in `settings.json`. The transcript scrolls independently while queued messages, status, widgets, editor, and footer remain fixed at the bottom. It also enables Pi's supported `"quietStartup": true` setting so the custom header stays clean without mutating Pi's internal component tree; resource conflicts and diagnostics remain available through Pi's configuration surfaces.
 
-Change the setting to `"regular"` if you prefer the terminal's native scrollback.
+Change `tuiMode` to `"regular"` if you prefer the terminal's native scrollback, or disable `quietStartup` if you want the complete loaded-resource listing on every launch.
 
 ## Updating
 

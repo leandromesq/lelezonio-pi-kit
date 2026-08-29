@@ -25,6 +25,7 @@ import {
   ASK_USER_TOOL_DESCRIPTION,
   buildAskUserResultMessage,
 } from "./prompt.ts";
+import { pageQuestionScroll, renderAskUserLayout } from "./src/layout.ts";
 
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 5;
@@ -72,29 +73,6 @@ interface DisplayOption {
   label: string;
   description?: string;
   isOther?: boolean;
-}
-
-function wrapText(text: string, width: number): string[] {
-  const lines: string[] = [];
-  for (const paragraph of text.split("\n")) {
-    const words = paragraph.split(/\s+/).filter(Boolean);
-    if (words.length === 0) {
-      lines.push("");
-      continue;
-    }
-    let current = "";
-    for (const word of words) {
-      const candidate = current ? `${current} ${word}` : word;
-      if (candidate.length > width && current) {
-        lines.push(current);
-        current = word;
-      } else {
-        current = candidate;
-      }
-    }
-    if (current) lines.push(current);
-  }
-  return lines;
 }
 
 export default function askUser(pi: ExtensionAPI) {
@@ -145,190 +123,225 @@ export default function askUser(pi: ExtensionAPI) {
       ];
 
       const showQuestion = (uiSignal: AbortSignal) =>
-        ctx.ui.custom<SelectionResult>((tui, theme, _kb, done) => {
-          let optionIndex = 0;
-          let editMode = false;
-          let cachedLines: string[] | undefined;
+        ctx.ui.custom<SelectionResult>(
+          (tui, theme, _kb, done) => {
+            let optionIndex = 0;
+            let editMode = false;
+            let detailsExpanded = false;
+            let questionScroll = 0;
+            let questionLineCount = 1;
+            let questionVisibleLines = 1;
+            let cachedLines: string[] | undefined;
 
-          let settled = false;
+            let settled = false;
 
-          function finish(result: SelectionResult) {
-            if (settled) return;
-            settled = true;
-            uiSignal.removeEventListener("abort", cancel);
-            done(result);
-          }
-
-          function cancel() {
-            finish(null);
-          }
-
-          uiSignal.addEventListener("abort", cancel, { once: true });
-          if (uiSignal.aborted) queueMicrotask(cancel);
-
-          const editorTheme: EditorTheme = {
-            borderColor: (s) => theme.fg("accent", s),
-            selectList: {
-              selectedPrefix: (t) => theme.fg("accent", t),
-              selectedText: (t) => theme.fg("accent", t),
-              description: (t) => theme.fg("muted", t),
-              scrollInfo: (t) => theme.fg("dim", t),
-              noMatch: (t) => theme.fg("warning", t),
-            },
-          };
-          const editor = new Editor(tui, editorTheme);
-
-          editor.onSubmit = (value) => {
-            const trimmed = value.trim();
-            if (trimmed) {
-              finish({ answer: trimmed, wasCustom: true });
-            } else {
-              editMode = false;
-              editor.setText("");
-              refresh();
+            function finish(result: SelectionResult) {
+              if (settled) return;
+              settled = true;
+              uiSignal.removeEventListener("abort", cancel);
+              done(result);
             }
-          };
 
-          function refresh() {
-            cachedLines = undefined;
-            tui.requestRender();
-          }
-
-          function selectOption(index: number) {
-            const selected = allOptions[index];
-            if (selected.isOther) {
-              optionIndex = index;
-              editMode = true;
-              refresh();
-            } else {
-              finish({
-                answer: selected.label,
-                wasCustom: false,
-                index: index + 1,
-              });
+            function cancel() {
+              finish(null);
             }
-          }
 
-          function handleInput(data: string) {
-            if (editMode) {
-              if (matchesKey(data, Key.escape)) {
+            uiSignal.addEventListener("abort", cancel, { once: true });
+            if (uiSignal.aborted) queueMicrotask(cancel);
+
+            const editorTheme: EditorTheme = {
+              borderColor: (s) => theme.fg("accent", s),
+              selectList: {
+                selectedPrefix: (t) => theme.fg("accent", t),
+                selectedText: (t) => theme.fg("accent", t),
+                description: (t) => theme.fg("muted", t),
+                scrollInfo: (t) => theme.fg("dim", t),
+                noMatch: (t) => theme.fg("warning", t),
+              },
+            };
+            const editor = new Editor(tui, editorTheme);
+
+            editor.onSubmit = (value) => {
+              const trimmed = value.trim();
+              if (trimmed) {
+                finish({ answer: trimmed, wasCustom: true });
+              } else {
                 editMode = false;
                 editor.setText("");
                 refresh();
+              }
+            };
+
+            function refresh() {
+              cachedLines = undefined;
+              tui.requestRender();
+            }
+
+            function selectOption(index: number) {
+              const selected = allOptions[index];
+              if (selected.isOther) {
+                optionIndex = index;
+                editMode = true;
+                detailsExpanded = false;
+                refresh();
+              } else {
+                finish({
+                  answer: selected.label,
+                  wasCustom: false,
+                  index: index + 1,
+                });
+              }
+            }
+
+            function handleInput(data: string) {
+              if (editMode) {
+                if (matchesKey(data, Key.escape)) {
+                  editMode = false;
+                  editor.setText("");
+                  refresh();
+                  return;
+                }
+                editor.handleInput(data);
+                refresh();
                 return;
               }
-              editor.handleInput(data);
-              refresh();
-              return;
-            }
 
-            if (matchesKey(data, Key.up)) {
-              optionIndex =
-                (optionIndex - 1 + allOptions.length) % allOptions.length;
-              refresh();
-              return;
-            }
-            if (matchesKey(data, Key.down)) {
-              optionIndex = (optionIndex + 1) % allOptions.length;
-              refresh();
-              return;
-            }
-
-            // Number keys jump straight to an option
-            if (
-              data.length === 1 &&
-              data >= "1" &&
-              data <= String(allOptions.length)
-            ) {
-              selectOption(Number(data) - 1);
-              return;
-            }
-
-            if (matchesKey(data, Key.enter)) {
-              selectOption(optionIndex);
-              return;
-            }
-
-            if (matchesKey(data, Key.escape)) {
-              finish(null);
-            }
-          }
-
-          function render(width: number): string[] {
-            if (cachedLines) return cachedLines;
-
-            const lines: string[] = [];
-            const add = (s: string) => lines.push(truncateToWidth(s, width));
-
-            const title = " Question ";
-            add(
-              theme.fg(
-                "accent",
-                `─${title}${"─".repeat(Math.max(0, width - title.length - 1))}`,
-              ),
-            );
-            for (const line of wrapText(
-              params.question,
-              Math.max(10, width - 2),
-            )) {
-              add(` ${theme.fg("text", theme.bold(line))}`);
-            }
-            lines.push("");
-
-            for (let i = 0; i < allOptions.length; i++) {
-              const opt = allOptions[i];
-              const selected = i === optionIndex;
-              const prefix = selected ? theme.fg("accent", " ❯ ") : "   ";
-              const marker = opt.isOther ? "✎" : `${i + 1}.`;
-              const label = `${marker} ${opt.label}`;
-
-              if (selected || (opt.isOther && editMode)) {
-                add(prefix + theme.fg("accent", label));
-              } else {
-                add(prefix + theme.fg(opt.isOther ? "muted" : "text", label));
+              if (matchesKey(data, Key.up)) {
+                optionIndex =
+                  (optionIndex - 1 + allOptions.length) % allOptions.length;
+                refresh();
+                return;
+              }
+              if (matchesKey(data, Key.down)) {
+                optionIndex = (optionIndex + 1) % allOptions.length;
+                detailsExpanded = false;
+                refresh();
+                return;
               }
 
-              if (opt.description) {
-                add(`      ${theme.fg("muted", opt.description)}`);
+              if (
+                matchesKey(data, Key.pageUp) ||
+                matchesKey(data, Key.ctrl("u"))
+              ) {
+                questionScroll = pageQuestionScroll(
+                  questionScroll,
+                  -1,
+                  questionLineCount,
+                  questionVisibleLines,
+                );
+                refresh();
+                return;
+              }
+              if (
+                matchesKey(data, Key.pageDown) ||
+                matchesKey(data, Key.ctrl("d"))
+              ) {
+                questionScroll = pageQuestionScroll(
+                  questionScroll,
+                  1,
+                  questionLineCount,
+                  questionVisibleLines,
+                );
+                refresh();
+                return;
+              }
+              if (matchesKey(data, Key.home)) {
+                questionScroll = 0;
+                refresh();
+                return;
+              }
+              if (matchesKey(data, Key.end)) {
+                questionScroll = Math.max(
+                  0,
+                  questionLineCount - Math.max(1, questionVisibleLines),
+                );
+                refresh();
+                return;
+              }
+
+              if (
+                matchesKey(data, Key.tab) &&
+                allOptions[optionIndex]?.description
+              ) {
+                detailsExpanded = !detailsExpanded;
+                refresh();
+                return;
+              }
+
+              // Number keys jump straight to an option
+              if (
+                data.length === 1 &&
+                data >= "1" &&
+                data <= String(allOptions.length)
+              ) {
+                selectOption(Number(data) - 1);
+                return;
+              }
+
+              if (matchesKey(data, Key.enter)) {
+                selectOption(optionIndex);
+                return;
+              }
+
+              if (matchesKey(data, Key.escape)) {
+                finish(null);
               }
             }
 
-            if (editMode) {
-              lines.push("");
-              add(theme.fg("muted", " Your answer:"));
-              for (const line of editor.render(width - 2)) {
-                add(` ${line}`);
-              }
-            }
+            function render(width: number): string[] {
+              if (cachedLines) return cachedLines;
 
-            lines.push("");
-            if (editMode) {
-              add(theme.fg("dim", " Enter submit • Esc back to options"));
-            } else {
-              add(
-                theme.fg(
-                  "dim",
-                  ` ↑↓ or 1-${allOptions.length} select • Enter confirm • Esc dismiss`,
-                ),
+              const rendered = renderAskUserLayout(
+                {
+                  width,
+                  terminalRows: tui.terminal.rows,
+                  question: params.question,
+                  options: allOptions,
+                  optionIndex,
+                  questionScroll,
+                  detailsExpanded,
+                  editMode,
+                  editorLines: editMode
+                    ? editor.render(Math.max(1, width - 2))
+                    : undefined,
+                },
+                {
+                  accent: (text) => theme.fg("accent", text),
+                  bold: (text) => theme.bold(text),
+                  border: (text) => theme.fg("accent", text),
+                  dim: (text) => theme.fg("dim", text),
+                  muted: (text) => theme.fg("muted", text),
+                  text: (text) => theme.fg("text", text),
+                },
               );
+              questionScroll = rendered.questionScroll;
+              questionLineCount = rendered.questionLineCount;
+              questionVisibleLines = rendered.questionVisibleLines;
+              cachedLines = rendered.lines;
+              return rendered.lines;
             }
-            add(theme.fg("accent", "─".repeat(width)));
 
-            cachedLines = lines;
-            return lines;
-          }
-
-          return {
-            render,
-            invalidate: () => {
-              cachedLines = undefined;
+            return {
+              render,
+              invalidate: () => {
+                cachedLines = undefined;
+              },
+              handleInput,
+              dispose: () => {
+                uiSignal.removeEventListener("abort", cancel);
+              },
+            };
+          },
+          {
+            overlay: true,
+            overlayOptions: {
+              anchor: "center",
+              margin: 1,
+              width: "95%",
+              maxHeight: "90%",
             },
-            handleInput,
-            dispose: () => {
-              uiSignal.removeEventListener("abort", cancel);
-            },
-          };
-        });
+          },
+        );
 
       pi.events.emit(HERDR_BLOCKED_EVENT, {
         active: true,

@@ -29,16 +29,6 @@ import {
   type GitInfoState,
   type ModelInfoState,
 } from "../shared/dashboard-state.ts";
-interface RenderableNode {
-  children?: RenderableNode[];
-  invalidate(): void;
-  render(width: number): string[];
-}
-
-interface DashboardTui extends RenderableNode {
-  requestRender(force?: boolean): void;
-}
-
 const TITLE_LINES = [
   "▀████████████▀",
   " ╘███    ███  ",
@@ -62,47 +52,6 @@ function sanitizeTerminalLabel(text: string) {
     .replace(CSI_PATTERN, "")
     .replace(ESCAPE_PATTERN, "")
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
-}
-
-function hasChildren(
-  component: RenderableNode,
-): component is RenderableNode & { children: RenderableNode[] } {
-  return Array.isArray(component.children);
-}
-
-function renderedText(component: RenderableNode) {
-  try {
-    return component.render(200).join("\n").replace(ANSI_PATTERN, "");
-  } catch {
-    return "";
-  }
-}
-
-function hideThemesSection(component: RenderableNode) {
-  if (!hasChildren(component)) return false;
-
-  for (let index = 0; index < component.children.length; index += 1) {
-    const child = component.children[index]!;
-    const firstLine = renderedText(child)
-      .split("\n")
-      .find((line) => line.trim())
-      ?.trim();
-
-    if (firstLine === "[Themes]") {
-      const removeCount =
-        component.children[index + 1] &&
-        renderedText(component.children[index + 1]!).trim() === ""
-          ? 2
-          : 1;
-      component.children.splice(index, removeCount);
-      component.invalidate();
-      return true;
-    }
-
-    if (hideThemesSection(child)) return true;
-  }
-
-  return false;
 }
 
 function formatTokens(tokens: number) {
@@ -552,8 +501,6 @@ export default function uiCustomization(pi: ExtensionAPI) {
   let modelInfo = emptyModelInfoState();
   let gitInfo = emptyGitInfoState();
   let requestRender: (() => void) | undefined;
-  let activeTui: DashboardTui | undefined;
-  let themeRemovalTimers: Array<ReturnType<typeof setTimeout>> = [];
 
   const stopModelListener = pi.events.on(MODEL_INFO_CHANNEL, (value) => {
     if (!isModelInfoState(value)) return;
@@ -566,19 +513,6 @@ export default function uiCustomization(pi: ExtensionAPI) {
     gitInfo = value;
     requestRender?.();
   });
-
-  function scheduleThemeRemoval(tui: DashboardTui) {
-    for (const timer of themeRemovalTimers) clearTimeout(timer);
-    themeRemovalTimers = [];
-
-    for (const delay of [0, 50, 250, 1_000]) {
-      themeRemovalTimers.push(
-        setTimeout(() => {
-          if (hideThemesSection(tui)) tui.requestRender(true);
-        }, delay),
-      );
-    }
-  }
 
   function renderFooterLines(
     ctx: ExtensionContext,
@@ -639,9 +573,7 @@ export default function uiCustomization(pi: ExtensionAPI) {
     if (ctx.mode !== "tui") return;
 
     ctx.ui.setHeader((tui, theme) => {
-      activeTui = tui;
       requestRender = () => tui.requestRender();
-      scheduleThemeRemoval(tui);
 
       return {
         render(width: number) {
@@ -684,16 +616,9 @@ export default function uiCustomization(pi: ExtensionAPI) {
     install(ctx);
   });
 
-  pi.on("resources_discover", () => {
-    if (activeTui) scheduleThemeRemoval(activeTui);
-  });
-
   pi.on("session_shutdown", (_event, ctx) => {
     stopModelListener();
     stopGitListener();
-    for (const timer of themeRemovalTimers) clearTimeout(timer);
-    themeRemovalTimers = [];
-    activeTui = undefined;
     requestRender = undefined;
     if (ctx.mode === "tui") {
       ctx.ui.setHeader(undefined);

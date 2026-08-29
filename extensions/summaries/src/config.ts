@@ -31,7 +31,10 @@ export interface SummaryConfig {
 export const DEFAULT_SUMMARY_CONFIG: SummaryConfig = {
   provider: "opencode-go",
   model: "deepseek-v4-flash",
-  reasoning: "high",
+  // Recaps are a small structured-output task. Leaving reasoning off keeps
+  // the answer budget available for the JSON/tool arguments and reduces
+  // latency; users can still opt into a level with /summary-model.
+  reasoning: "off",
 };
 
 const extensionDirectory = dirname(dirname(fileURLToPath(import.meta.url)));

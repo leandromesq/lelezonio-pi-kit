@@ -14,10 +14,7 @@ export function parseCodexCommand(args: string): CodexCommand {
   if (!input) return { action: "select" };
 
   const [action, ...rest] = input.split(/\s+/);
-  if (
-    (action !== "save" && action !== "remove") ||
-    rest.length !== 1
-  ) {
+  if ((action !== "save" && action !== "remove") || rest.length !== 1) {
     throw new Error(
       `Usage: /${COMMAND_NAME}, /${COMMAND_NAME} save <name> or /${COMMAND_NAME} remove <name>`,
     );

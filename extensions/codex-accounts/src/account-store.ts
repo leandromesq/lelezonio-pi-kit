@@ -108,9 +108,7 @@ function credentialsMatch(
   const firstIdentity = credentialIdentity(first.credential);
   const secondIdentity = credentialIdentity(second.credential);
   if (firstIdentity && secondIdentity) return firstIdentity === secondIdentity;
-  return (
-    JSON.stringify(first.credential) === JSON.stringify(second.credential)
-  );
+  return JSON.stringify(first.credential) === JSON.stringify(second.credential);
 }
 
 async function atomicWrite(path: string, contents: Buffer) {
@@ -141,13 +139,11 @@ async function withAuthStoreLock<T>(
   await mkdir(dirname(authPath), { recursive: true, mode: 0o700 });
   await writeFile(authPath, "{}", { flag: "wx", mode: 0o600 }).catch(
     (error: unknown) => {
-      if (
-        !(
-          error instanceof Error &&
-          "code" in error &&
-          error.code === "EEXIST"
-        )
-      ) {
+      if (!(
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "EEXIST"
+      )) {
         throw error;
       }
     },

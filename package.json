@@ -1,9 +1,9 @@
 {
   "private": true,
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.84.3",
-    "@earendil-works/pi-coding-agent": "^0.84.3",
-    "@earendil-works/pi-tui": "^0.84.3",
+    "@earendil-works/pi-ai": "^0.84.4",
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@earendil-works/pi-tui": "^0.84.4",
     "@effect/platform-node": "^4.0.0-beta.99",
     "acorn": "^8.17.0",
     "effect": "^4.0.0-beta.99",

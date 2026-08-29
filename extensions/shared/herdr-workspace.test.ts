@@ -510,6 +510,22 @@ test("submitText uses the low-level transport: send-text then send-keys enter", 
   ]);
 });
 
+test("sendEnter is an Enter-only transport operation", async () => {
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  const pane = await controller.openWorker({
+    category: "subagents",
+    title: "sa",
+    cwd: "C:\\w",
+    launch: ["node", "cli.js"],
+    agent: { label: "sa", state: "idle" },
+  });
+  assert.ok(pane);
+  herdr.calls.length = 0;
+  await pane.sendEnter();
+  assert.deepEqual(herdr.calls, [["pane", "send-keys", "w1:p1", "enter"]]);
+});
+
 test("submitText retries agent_pane_busy on the send-text only, boundedly", async () => {
   const herdr = fakeHerdr();
   let failureCount = 0;

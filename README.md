@@ -19,7 +19,8 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 - Composable one-turn prompt snippets via `Alt+S`
 - YouTube transcript extraction through a cross-platform skill
 - Git status, changed-file browser, PR information, `/yeet`, and guarded `/git <target-branch>` workflows
-- Multiple-choice `ask_user` tool
+- Height-aware multiple-choice `ask_user` tool with scrollable context and expandable descriptions
+- `/kit` control centre and `/perf` lightweight runtime diagnostics
 - Automatic run summaries and conversation export
 - No Claude Code, Firecrawl, or external memory package dependencies
 
@@ -36,7 +37,9 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 | `file-search`          | Typed `fd` and `rg` model tools                                                                                     |
 | `git-info`             | Branch/PR dashboard state, `/lg`, and `/pr`                                                                         |
 | `git-pr`               | `/yeet` and guarded `/git <target-branch>` workflows                                                                |
+| `kit`                  | `/kit` control centre for discovering and launching setup features                                                  |
 | `model-info`           | Model, thinking, context, and cost state for the dashboard                                                          |
+| `performance`          | `/perf` bounded turn/tool latency and process diagnostics without polling                                           |
 | `prompt-snippets`      | One-turn composable behavior rules selected with `Alt+S` or `/snippets`                                             |
 | `remote-agents`        | Persistent remote Pi jobs over SSH and Herdr with `/remote` and `/remotes`                                          |
 | `subagents`            | Pi and Codex children (Herdr-native TUIs in Herdr, in-process outside), profiles, result delivery, and `/subagents` |

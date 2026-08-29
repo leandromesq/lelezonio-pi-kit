@@ -35,6 +35,7 @@ interface StubWorkspace {
   opened: Array<WorkerLaunchOptions>;
   prompts: string[];
   keys: string[][];
+  enters: number;
   closed: string[];
   focused: string[];
   states: Array<{ pane: string; state: string }>;
@@ -45,6 +46,7 @@ interface StubWorkspace {
   submitError?: Error;
   focusError?: Error;
   closeError?: Error;
+  onEnter?: (count: number) => void;
 }
 
 function stubWorkspace(
@@ -54,6 +56,7 @@ function stubWorkspace(
     opened: [],
     prompts: [],
     keys: [],
+    enters: 0,
     closed: [],
     focused: [],
     states: [],
@@ -81,6 +84,15 @@ function stubWorkspace(
           ws.keys.push(keys);
         },
         rename: async () => {},
+        sendText: async (text) => {
+          if (ws.submitError) throw ws.submitError;
+          ws.prompts.push(text);
+        },
+        sendEnter: async () => {
+          if (ws.submitError) throw ws.submitError;
+          ws.enters += 1;
+          ws.onEnter?.(ws.enters);
+        },
         submitText: async (text) => {
           if (ws.submitError) throw ws.submitError;
           ws.prompts.push(text);
@@ -466,6 +478,109 @@ test("worker startup exit before a session file settles as failed", async () => 
         if (event.outcome._tag === "Failed")
           assert.match(event.outcome.errorText, /exited before producing/);
       }
+    },
+  );
+});
+
+test("pi initial submission watchdog retries Enter once without retyping and settles zero-turn idle", async () => {
+  const ws = stubWorkspace(() => "idle");
+  const root = freshSessionRoot();
+  let now = 0;
+  const fakeSleep = async (ms: number) => {
+    now += ms;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+  await withSession(
+    "pi",
+    testDeps(ws, root, {
+      clock: () => now,
+      sleep: fakeSleep,
+      pollIntervalMs: 5,
+      initialSubmissionWatchdogMs: 10,
+    }),
+    task("never submits"),
+    async (_session, events) => {
+      await waitFor(
+        () => events.some((event) => event._tag === "RunSettled"),
+        "zero-turn startup watchdog",
+      );
+      assert.equal(ws.prompts.length, 1, "initial text is delivered once");
+      assert.equal(ws.prompts[0], "never submits");
+      assert.equal(ws.enters, 2, "initial Enter plus one Enter-only retry");
+      assert.equal(
+        events.filter((event) => event._tag === "RunStarted").length,
+        1,
+      );
+      const diagnostic = events.find((event) => event._tag === "BackendError");
+      assert.equal(diagnostic?._tag, "BackendError");
+      if (diagnostic?._tag === "BackendError") {
+        assert.match(diagnostic.message, /zero turns/);
+        assert.match(diagnostic.message, /Enter-only retry/);
+      }
+      const settledEvent = events.find((event) => event._tag === "RunSettled");
+      assert.equal(settledEvent?._tag, "RunSettled");
+      if (settledEvent?._tag === "RunSettled") {
+        assert.equal(settledEvent.outcome._tag, "Failed");
+        if (settledEvent.outcome._tag === "Failed")
+          assert.match(settledEvent.outcome.errorText, /zero turns/);
+      }
+      await waitFor(() => ws.closed.length === 1, "failed worker close");
+      assert.ok(Number.isFinite(now), "fake clock advanced deterministically");
+    },
+  );
+});
+
+test("pi initial Enter-only retry recovers a startup-raced submission", async () => {
+  const ws = stubWorkspace();
+  const root = freshSessionRoot();
+  const sessionDir = path.join(root, "sessions", "sa-3");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  ws.onEnter = (count) => {
+    if (count !== 2) return;
+    const id = piNativeSessionId(ws);
+    const file = path.join(sessionDir, `2026-01-01T00-00-00_${id}.jsonl`);
+    fs.writeFileSync(
+      file,
+      [
+        ...piSessionLines("C:\\work\\proj", id),
+        piUserLine("u1", "raced prompt"),
+        piAssistantLine("a1", "recovered"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+  };
+  let now = 0;
+  const fakeSleep = async (ms: number) => {
+    now += ms;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+  await withSession(
+    "pi",
+    testDeps(ws, root, {
+      clock: () => now,
+      sleep: fakeSleep,
+      pollIntervalMs: 5,
+      initialSubmissionWatchdogMs: 10,
+    }),
+    task("raced prompt"),
+    async (_session, events) => {
+      await waitFor(
+        () => events.some((event) => event._tag === "RunSettled"),
+        "recovered startup-raced run",
+      );
+      assert.equal(ws.prompts.length, 1);
+      assert.equal(ws.enters, 2, "only the Enter key was retried");
+      assert.equal(
+        events.some((event) => event._tag === "BackendError"),
+        false,
+      );
+      const settledEvent = events.find((event) => event._tag === "RunSettled");
+      assert.equal(settledEvent?._tag, "RunSettled");
+      if (settledEvent?._tag === "RunSettled")
+        assert.deepEqual(settledEvent.outcome, {
+          _tag: "Completed",
+          finalText: "recovered",
+        });
     },
   );
 });
