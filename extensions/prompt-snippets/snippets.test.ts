@@ -17,14 +17,18 @@ const snippetsDir = join(extensionDir, "snippets");
 
 const CATALOG = [
   "ask-questions.md",
-  "delegate-exploration.md",
   "diagnose-report.md",
+  "evidence-report.md",
+  "host-check.md",
+  "minimal-diff.md",
   "orchestrator-mode.md",
+  "plan-first.md",
+  "regression-test.md",
   "session-kickoff.md",
-  "verify-not-assume.md",
+  "ship.md",
 ];
 
-test("catalog contains the six expected snippet files", () => {
+test("catalog contains exactly the expected snippet files", () => {
   const files = readdirSync(snippetsDir)
     .filter((file) => file.endsWith(".md"))
     .sort();
@@ -49,11 +53,15 @@ test("catalog placements and sort orders match the intended design", () => {
 
   const expected: Record<string, { placement: string; order: number }> = {
     "ask-questions.md": { placement: "append", order: 10 },
-    "verify-not-assume.md": { placement: "append", order: 20 },
-    "delegate-exploration.md": { placement: "append", order: 30 },
+    "evidence-report.md": { placement: "append", order: 20 },
     "diagnose-report.md": { placement: "append", order: 40 },
+    "minimal-diff.md": { placement: "append", order: 50 },
+    "regression-test.md": { placement: "append", order: 70 },
+    "ship.md": { placement: "append", order: 80 },
     "session-kickoff.md": { placement: "prepend", order: 10 },
+    "plan-first.md": { placement: "prepend", order: 20 },
     "orchestrator-mode.md": { placement: "prepend", order: 30 },
+    "host-check.md": { placement: "prepend", order: 40 },
   };
   for (const [file, want] of Object.entries(expected)) {
     const snippet = byId.get(file);

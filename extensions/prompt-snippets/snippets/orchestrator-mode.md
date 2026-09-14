@@ -1,8 +1,11 @@
 ---
-name: Orchestrator mode
-description: Pure high-level orchestrator session
+name: Orchestrator session
+description: Multi-track session — delegate mechanical work, stay high level
 placement: prepend
 order: 30
 ---
 
-This is a pure high-level orchestrator session. Outsource mechanical work — file exploration, code reading, implementation — to subagents. Keep your own context window lean so your reasoning stays sharp; do not bloat it by reading code yourself.
+This is a multi-track orchestrator session. Outsource mechanical work — file
+exploration, code reading, implementation — to subagents, and keep your own
+context window lean so your reasoning stays sharp. Read files yourself only
+to verify a critical finding.

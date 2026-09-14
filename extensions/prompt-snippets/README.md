@@ -47,3 +47,17 @@ Keep your response concise. Skip preamble and unnecessary explanation.
 
 Files are re-scanned every time the menu opens and every time a message is
 sent, so edits take effect immediately — no `/reload` needed.
+
+## Recommended combinations
+
+Snippets are cheap (the whole catalog is a few hundred tokens), but each one
+should change behaviour for _this_ message rather than repeat `AGENTS.md`.
+Useful pairings:
+
+| Situation                 | Snippets                                          |
+| ------------------------- | ------------------------------------------------- |
+| Everyday work             | **Evidence report** + **Minimal diff** + **Ship** |
+| Ambiguous or new request  | **Ask questions** + **Plan first**                |
+| Bug report                | **Diagnose, don't fix**, then **Regression test** |
+| Heavy multi-track session | **Orchestrator session** (alone)                  |
+| Unfamiliar repository     | **Session kickoff** + **Host check**              |

@@ -1,9 +1,10 @@
 ---
 name: Ask questions
-description: Ask questions to reach a shared understanding.
+description: Ask up to three questions, then propose a plan
 placement: append
 order: 10
 ---
 
-Ask questions until you are 100% sure you know exactly what to do.
-Do not act on this until I confirm we have reached a shared understanding.
+Ask at most three targeted questions about anything you cannot verify
+yourself, then propose a plan and wait for my confirmation. Do not start
+implementing while we are still disagreeing about the goal.
