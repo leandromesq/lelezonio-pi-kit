@@ -1,6 +1,7 @@
 {
   "defaultHarness": "pi",
   "maxConcurrent": 3,
+  "resultMaxBytes": 8192,
   "harnesses": {
     "pi": {
       "model": "opencode-go/deepseek-v4.1-flash",

@@ -40,6 +40,10 @@ export interface SubagentsConfig {
   readonly maxConcurrent: number;
   readonly harnesses: Partial<Record<BackendName, HarnessConfig>>;
   readonly profiles: Readonly<Record<string, SubagentProfileConfig>>;
+  /** Max bytes of a settled subagent's final output injected into the
+   * parent's context. Unset = extension default (24 KB). Project overlay
+   * wins over global when set. */
+  readonly resultMaxBytes?: number;
 }
 
 export interface SpawnOverrides {
@@ -264,7 +268,13 @@ export function parseSubagentsConfig(value: unknown): SubagentsConfig {
     }
   }
 
-  return { defaultHarness, maxConcurrent, harnesses, profiles };
+  const resultMaxBytes = optionalInt(
+    value.resultMaxBytes,
+    "resultMaxBytes",
+    1024,
+  );
+
+  return { defaultHarness, maxConcurrent, harnesses, profiles, resultMaxBytes };
 }
 
 export function loadSubagentsConfig(filePath: string): SubagentsConfig {
@@ -300,6 +310,7 @@ export function loadConfigMerged(
       maxConcurrent: project.maxConcurrent,
       harnesses: { ...globalConfig.harnesses, ...project.harnesses },
       profiles: { ...globalConfig.profiles, ...project.profiles },
+      resultMaxBytes: project.resultMaxBytes ?? globalConfig.resultMaxBytes,
     };
   }
   mergedCache.set(base, merged);

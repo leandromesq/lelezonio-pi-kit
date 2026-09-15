@@ -203,6 +203,12 @@ export default function (pi: ExtensionAPI) {
   const subagentConfig = loadSubagentsConfig(
     path.join(getAgentDir(), "subagents.json"),
   );
+  /** Result bytes injected into the parent context (subagents.json knob:
+   * resultMaxBytes). Smaller values keep the parent's LLM context lean in
+   * subagent-heavy sessions; the full output stays in the child session
+   * file, visible via /subagents takeover. */
+  const resultMaxBytes =
+    subagentConfig.resultMaxBytes ?? SUBAGENT_OUTPUT_MAX_BYTES;
   const profileNames = Object.keys(subagentConfig.profiles);
   const profileSummary =
     profileNames.length > 0 ? profileNames.join(", ") : "none";
@@ -492,7 +498,7 @@ export default function (pi: ExtensionAPI) {
           title: snap.title,
           status: snap.status,
           errorText: snap.errorText,
-          output: truncatedOutput(snap),
+          output: truncatedOutput(snap, resultMaxBytes),
           question: snap.question?.text,
           usageText,
         }),
@@ -535,7 +541,7 @@ export default function (pi: ExtensionAPI) {
       status: snap.status,
       errorText: snap.errorText,
       prompt: snap.prompt,
-      answer: truncatedOutput(snap),
+      answer: truncatedOutput(snap, resultMaxBytes),
     });
     ui?.notify(
       snap.status === "error"
