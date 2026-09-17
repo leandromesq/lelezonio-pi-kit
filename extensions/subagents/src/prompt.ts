@@ -2,7 +2,7 @@
 
 /** Describes subagent_spawn, including harnesses and the fixed concurrency cap. */
 export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
-  "Spawn a background subagent: a fully autonomous, headless agent with its own context window and trust-aware harness permissions (untrusted Codex projects are read-only). You choose the harness it runs on: pi (in-process pi session, inherits this environment's tools and config) or codex (Codex CLI). Fire-and-forget: this returns immediately with an id. The subagent's final output is queued back to you as a message when it settles, or collect it explicitly with subagent_wait. Children cannot orchestrate more agents/workflows or see this conversation, so the prompt must be self-contained; pi children CAN clarify ambiguous requirements via ask_question, which arrives as a question on their result. Choose an allowlisted profile to let a child delegate constrained subtasks. For multi-step pipelines with phase dependencies, use the workflow tool instead of hand-chaining subagents. Only use trusted working directories. A configured concurrency cap applies across all harnesses.";
+  "Spawn a background subagent: a fully autonomous agent with its own context window and trust-aware harness permissions (untrusted Codex projects are read-only). You choose the harness it runs on: pi (Herdr worker TUI when available, otherwise an in-process session) or codex (Codex CLI). Profile tool restrictions apply in either mode. Fire-and-forget: this returns an id after launch setup without waiting for the task to finish. The subagent's final output is queued back to you as a message when it settles, or collect it explicitly with subagent_wait. Children cannot orchestrate more agents/workflows or see this conversation, so the prompt must be self-contained; pi children CAN clarify ambiguous requirements via ask_question, which arrives as a question on their result. Choose an allowlisted profile to let a child delegate constrained subtasks. For multi-step pipelines with phase dependencies, use the workflow tool instead of hand-chaining subagents. Only use trusted working directories. A configured concurrency cap applies across all harnesses.";
 
 /** Adds background subagent delegation to the parent model's available-tools prompt. */
 export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
@@ -19,11 +19,11 @@ export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
 export const SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS = {
   prompt:
     "Task prompt for the subagent. Must be self-contained: include all needed context, file paths, and what to report back.",
-  name: "Short human-readable name hint for this subagent; the auto-naming model may refine it for listings and the UI",
+  name: "Short human-readable name for this subagent; used directly without an extra naming-model request",
   profile:
     "Named role from subagents.json. It supplies the harness, model, reasoning effort, tool policy (readOnly/tools), optional system prompt, context mode, and nesting allowlist.",
   harness:
-    'Harness to run the subagent on: "pi" (in-process pi session; inherits this environment) or "codex" (Codex CLI). Omit to use the profile or configured default.',
+    'Harness to run the subagent on: "pi" (Herdr worker TUI when available, otherwise in-process) or "codex" (Codex CLI). Omit to use the profile or configured default.',
   workingDir:
     "Trusted working directory for the autonomous child (default: current working directory)",
   model:

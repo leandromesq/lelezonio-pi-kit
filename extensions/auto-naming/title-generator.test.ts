@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   fallbackTitle,
+  generateTaskTitle,
   normalizeTitle,
   parseTitleResponse,
 } from "./src/title-generator.ts";
@@ -28,6 +29,47 @@ test("falls back to the first meaningful task line", () => {
     "Add a workspace label",
   );
   assert.equal(fallbackTitle("\n\t"), "coding task");
+});
+
+test("an explicit title bypasses model discovery and authentication", async () => {
+  const modelRegistry = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error("Naming must not access the model registry");
+      },
+    },
+  ) as NonNullable<Parameters<typeof generateTaskTitle>[0]["modelRegistry"]>;
+  assert.equal(
+    await generateTaskTitle({
+      modelRegistry,
+      config: {
+        enabled: true,
+        provider: "test",
+        model: "test",
+        reasoning: "off",
+      },
+      prompt: "A long implementation task",
+      hint: "  focused worker  ",
+    }),
+    "focused worker",
+  );
+});
+
+test("an empty hint retains the safe fallback without a registry", async () => {
+  assert.equal(
+    await generateTaskTitle({
+      config: {
+        enabled: true,
+        provider: "test",
+        model: "test",
+        reasoning: "off",
+      },
+      prompt: "Investigate lifecycle",
+      hint: "  ",
+    }),
+    "Investigate lifecycle",
+  );
 });
 
 test("rejects responses without a usable title", () => {

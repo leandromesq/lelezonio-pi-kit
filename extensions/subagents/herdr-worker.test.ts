@@ -17,11 +17,14 @@ import type {
 } from "../shared/herdr-workspace.ts";
 import {
   makeHerdrWorkerSession,
+  piResumeLaunch,
+  piWorkerLaunch,
   resetHerdrWorkerDepsForTests,
   setHerdrWorkerDepsForTests,
   trySpawnHerdrWorker,
   type HerdrWorkerDeps,
 } from "./src/backends/herdr-worker.ts";
+import { toolPolicyFor } from "./src/profile.ts";
 import type { SubagentSession } from "./src/backend.ts";
 import type { ParentContext, SpawnTask, SubagentEvent } from "./src/domain.ts";
 
@@ -1233,4 +1236,128 @@ test("concurrent take over on a running pi session both resolve true without int
       );
     },
   );
+});
+
+// --- Pi launch tool policy -----------------------------------------------------
+
+/** Extract the tool-policy flags from a raw pi argv (fresh or resume). */
+function toolPolicyArgs(argv: ReadonlyArray<string>): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === "--tools" || argv[i] === "--exclude-tools") {
+      out.push(argv[i], argv[i + 1]);
+    }
+  }
+  return out;
+}
+
+const PI_LAUNCH_OPTIONS = {
+  nodePath: "node",
+  piCliPath: "C:/pi/cli.js",
+  sessionDir: "C:/sessions/sa-3",
+};
+
+test("pi launch: read-only profiles get a real --tools allowlist on fresh AND resume", () => {
+  const readOnly = task("review the diff", {
+    parent: parentCtx({ toolPolicy: toolPolicyFor({ readOnly: true }) }),
+  });
+  const fresh = piWorkerLaunch(readOnly, {
+    ...PI_LAUNCH_OPTIONS,
+    sessionId: "sid-1",
+  });
+  const resume = piResumeLaunch(readOnly, {
+    ...PI_LAUNCH_OPTIONS,
+    sessionFilePath: "C:/sessions/sa-3/sess.jsonl",
+  });
+
+  for (const argv of [fresh.argv, resume]) {
+    const index = argv.indexOf("--tools");
+    assert.ok(index >= 0, `--tools missing from ${argv.join(" ")}`);
+    const allowed = argv[index + 1].split(",");
+    assert.deepEqual(allowed, ["read", "grep", "find", "ls", "ask_question"]);
+    // PowerShell and extension-backed write/execute/remote tools are simply
+    // not named, so no incomplete exclusion universe can let them through.
+    for (const blocked of [
+      "powershell",
+      "bash",
+      "write",
+      "edit",
+      "bg_start",
+      "bg_kill",
+      "remote_spawn",
+      "remote_send",
+      "subagent_spawn",
+      "subagent_wait",
+      "workflow",
+      "ask_user",
+    ]) {
+      assert.equal(
+        allowed.includes(blocked),
+        false,
+        `${blocked} must be denied`,
+      );
+    }
+  }
+  // Fresh launch and resume carry the exact same tool policy.
+  assert.deepEqual(toolPolicyArgs(fresh.argv), toolPolicyArgs(resume));
+});
+
+test("pi launch: custom tools profiles also launch with an allowlist on fresh AND resume", () => {
+  const custom = task("inspect", {
+    parent: parentCtx({ toolPolicy: { tools: ["read", "git_status"] } }),
+  });
+  const fresh = piWorkerLaunch(custom, {
+    ...PI_LAUNCH_OPTIONS,
+    sessionId: "sid-2",
+  });
+  const resume = piResumeLaunch(custom, {
+    ...PI_LAUNCH_OPTIONS,
+    sessionFilePath: "C:/sessions/sa-3/other.jsonl",
+  });
+  for (const argv of [fresh.argv, resume]) {
+    const index = argv.indexOf("--tools");
+    assert.ok(index >= 0, `--tools missing from ${argv.join(" ")}`);
+    assert.deepEqual(argv[index + 1].split(","), [
+      "read",
+      "git_status",
+      "ask_question",
+    ]);
+    assert.equal(argv.includes("--exclude-tools"), false);
+  }
+  assert.deepEqual(toolPolicyArgs(fresh.argv), toolPolicyArgs(resume));
+});
+
+test("pi launch: a normal coder keeps the default surface plus the orchestration denylist", () => {
+  const coder = task("implement it");
+  const fresh = piWorkerLaunch(coder, {
+    ...PI_LAUNCH_OPTIONS,
+    sessionId: "sid-3",
+  });
+  const resume = piResumeLaunch(coder, {
+    ...PI_LAUNCH_OPTIONS,
+    sessionFilePath: "C:/sessions/sa-3/third.jsonl",
+  });
+  for (const argv of [fresh.argv, resume]) {
+    assert.equal(
+      argv.includes("--tools"),
+      false,
+      "the default surface must not be narrowed to an allowlist",
+    );
+    const index = argv.indexOf("--exclude-tools");
+    assert.ok(index >= 0, `--exclude-tools missing from ${argv.join(" ")}`);
+    const denied = argv[index + 1].split(",");
+    for (const name of [
+      "subagent_spawn",
+      "subagent_send",
+      "subagent_wait",
+      "workflow",
+      "ask_user",
+    ]) {
+      assert.ok(denied.includes(name), `${name} must be denied`);
+    }
+    // The child keeps its one orchestration channel and its full coder tools.
+    assert.equal(denied.includes("ask_question"), false);
+    assert.equal(denied.includes("powershell"), false);
+  }
+  assert.deepEqual(toolPolicyArgs(fresh.argv), toolPolicyArgs(resume));
 });

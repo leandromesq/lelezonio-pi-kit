@@ -9,19 +9,32 @@ import * as path from "node:path";
 import type { ContextMode } from "./config.ts";
 import type { ChildToolPolicy, NestContext } from "./domain.ts";
 
-/** Builtin pi tool names available in a child session. */
-export const PI_BUILTIN_TOOLS = [
-  "read",
-  "write",
-  "edit",
-  "bash",
-  "grep",
-  "find",
-  "ls",
-] as const;
-
 /** Default surface for read-only profiles. */
 export const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
+
+/**
+ * Orchestration tools disabled on every child surface unless a profile's
+ * explicit allowlist names them (`subagent_spawn` is additionally kept for a
+ * genuinely nesting-capable child — see `childToolLoadout`). `ask_question`
+ * is deliberately absent: every child, narrowed or not, keeps the ability to
+ * ask the orchestrator.
+ */
+export const CHILD_ORCHESTRATION_TOOLS = [
+  "subagent_spawn",
+  "subagent_send",
+  "subagent_wait",
+  "subagent_cancel",
+  "subagent_check",
+  "subagent_list",
+  "workflow",
+  "ask_user",
+] as const;
+
+/** Ask-the-orchestrator tool kept in every child, allowlist or default. */
+export const CHILD_ASK_TOOL = "ask_question";
+
+/** Nesting bridge kept only for genuinely nesting-capable children. */
+export const CHILD_NESTED_SPAWN_TOOL = "subagent_spawn";
 
 /** Derive the child tool policy from a profile's behavior. */
 export function toolPolicyFor(behavior: {
@@ -37,19 +50,44 @@ export function toolPolicyFor(behavior: {
   return behavior.tools ? { tools: behavior.tools } : {};
 }
 
-/** Tools that must be EXCLUDED (e.g. via `--exclude-tools`) given a policy.
- * An explicit allowlist flips the model: everything built-in not listed is
- * excluded. readOnly without an allowlist excludes the writing trio. */
-export function extraExcludedTools(
+/** Resolved child tool surface for one profile. */
+export interface ChildToolLoadout {
+  /** Explicit allowlist. When present, every tool not named is disabled —
+   * built-in, extension-registered, or SDK custom. `undefined` keeps the
+   * normal default surface minus `exclude`. */
+  readonly tools?: readonly string[];
+  /** Names disabled after the allowlist/default surface is applied. */
+  readonly exclude: readonly string[];
+}
+
+/**
+ * Resolve the concrete child tool surface. A narrowed profile (read-only or
+ * explicit `tools`) always produces a REAL allowlist, so a built-in or
+ * extension tool that is not named (PowerShell, bg_start, remote_*…) cannot
+ * leak in through an incomplete exclusion universe. The default (unnarrowed)
+ * surface stays denylist-based so a normal coder keeps every tool it needs.
+ *
+ * `nestedSpawn` grants the nesting bridge only when the caller genuinely
+ * provides a nested-spawn callback and an allowlist of child profiles.
+ */
+export function childToolLoadout(
   policy: ChildToolPolicy | undefined,
-): readonly string[] {
-  if (!policy) return [];
-  const tools = policy.tools;
-  if (tools) {
-    return PI_BUILTIN_TOOLS.filter((tool) => !tools.includes(tool));
+  options: { readonly nestedSpawn?: boolean } = {},
+): ChildToolLoadout {
+  const nested: readonly string[] = options.nestedSpawn
+    ? [CHILD_NESTED_SPAWN_TOOL]
+    : [];
+  const allowlist =
+    policy?.tools ?? (policy?.readOnly ? READ_ONLY_TOOLS : undefined);
+  if (allowlist) {
+    return {
+      tools: [...new Set([...allowlist, CHILD_ASK_TOOL, ...nested])],
+      exclude: [],
+    };
   }
-  if (policy.readOnly) return ["write", "edit", "bash"];
-  return [];
+  return {
+    exclude: CHILD_ORCHESTRATION_TOOLS.filter((tool) => !nested.includes(tool)),
+  };
 }
 
 /** Resolve the effective system-prompt text for a profile: either the inline

@@ -38,21 +38,10 @@ import { SendError, SpawnError } from "../domain.ts";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
+import { childToolLoadout } from "../profile.ts";
 import { trySpawnHerdrWorker } from "./herdr-worker.ts";
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
-
-/** Tools that headless children must not receive. Everything else stays enabled. */
-const CHILD_EXCLUDED_TOOL_NAMES = [
-  "subagent_spawn",
-  "subagent_wait",
-  "subagent_cancel",
-  "subagent_check",
-  "subagent_list",
-  "subagent_send",
-  "workflow",
-  "ask_user",
-] as const;
 
 // --- Model + effort resolution -----------------------------------------------
 
@@ -284,6 +273,11 @@ const makePiSession = (
     const thinkingLevel = (task.reasoningEffort ??
       task.parent.inheritedThinkingLevel) as ThinkingLevel | undefined;
 
+    // A genuinely nesting-capable child keeps its in-process spawn bridge;
+    // everyone else gets no orchestration tools beyond ask_question.
+    const nestedSpawn = Boolean(task.parent.spawnChild && task.parent.nest);
+    const loadout = childToolLoadout(task.parent.toolPolicy, { nestedSpawn });
+
     const session = yield* Effect.tryPromise({
       try: async () => {
         const { loader, settingsManager } = await createChildResources(
@@ -297,12 +291,16 @@ const makePiSession = (
           resourceLoader: loader,
           model,
           thinkingLevel,
-          // Profile tool policy: an explicit allowlist narrows the child's
-          // surface (read-only profiles default to read/grep/find/ls).
-          tools: task.parent.toolPolicy?.tools
-            ? [...task.parent.toolPolicy.tools]
-            : undefined,
-          excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES],
+          // Profile tool policy: a narrowed profile (read-only or explicit
+          // `tools`) launches with a REAL SDK allowlist that also covers
+          // extension-registered and custom tools, so PowerShell and
+          // extension-backed execution tools cannot leak in. The default
+          // surface keeps the orchestration denylist so a normal coder keeps
+          // every tool it needs.
+          ...(loadout.tools ? { tools: [...loadout.tools] } : {}),
+          ...(loadout.exclude.length > 0
+            ? { excludeTools: [...loadout.exclude] }
+            : {}),
           customTools: [
             ...(task.parent.spawnChild && task.parent.nest
               ? [

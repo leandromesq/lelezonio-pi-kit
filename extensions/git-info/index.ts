@@ -21,7 +21,13 @@ import {
   type GitInfoRuntime,
 } from "./src/runtime.ts";
 
-const POLL_INTERVAL_MS = 3_000;
+import {
+  shouldRefreshAfterTool,
+  shouldTrackGit,
+} from "./src/refresh-policy.ts";
+
+const POLL_INTERVAL_MS = 15_000;
+const REFRESH_DEBOUNCE_MS = 500;
 const GIT_TIMEOUT_MS = 3_000;
 const GH_TIMEOUT_MS = 10_000;
 
@@ -58,6 +64,7 @@ export default function gitInfo(pi: ExtensionAPI) {
   let currentContext: ExtensionContext | undefined;
   let generation = 0;
   let queriedPrBranch: string | null = null;
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   const refreshCoordinator = makeRefreshCoordinator();
 
   const getRuntime = () => (runtime ??= createRuntime());
@@ -180,7 +187,14 @@ export default function gitInfo(pi: ExtensionAPI) {
     );
 
   const refreshInBackground = (ctx: ExtensionContext) => {
-    forkBackground(refreshIfIdle(ctx));
+    if (!shouldTrackGit(ctx.mode)) return;
+    if (refreshTimer) clearTimeout(refreshTimer);
+    const scheduledGeneration = generation;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined;
+      if (scheduledGeneration === generation)
+        forkBackground(refreshIfIdle(ctx));
+    }, REFRESH_DEBOUNCE_MS);
   };
 
   const stopRefreshListener = pi.events.on(REFRESH_CHANNEL, () => {
@@ -199,8 +213,11 @@ export default function gitInfo(pi: ExtensionAPI) {
 
     // Do not block Pi startup on GitHub/network I/O. The initial refresh publishes
     // state when it completes; polling continues to keep it current afterwards.
-    refreshInBackground(ctx);
-    pollingFiber = forkBackground(poll());
+    if (shouldTrackGit(ctx.mode)) {
+      currentContext = ctx;
+      refreshInBackground(ctx);
+      pollingFiber = forkBackground(poll());
+    }
   });
 
   pi.on("input", (_event, ctx) => {
@@ -208,13 +225,15 @@ export default function gitInfo(pi: ExtensionAPI) {
     return { action: "continue" };
   });
 
-  pi.on("tool_execution_end", (_event, ctx) => {
-    refreshInBackground(ctx);
+  pi.on("tool_execution_end", (event, ctx) => {
+    if (shouldRefreshAfterTool(event.toolName)) refreshInBackground(ctx);
   });
 
   pi.on("session_shutdown", async () => {
     stopRefreshListener();
     generation += 1;
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = undefined;
     currentContext = undefined;
     pollingFiber = undefined;
     const closing = runtime;

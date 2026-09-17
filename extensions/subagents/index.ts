@@ -101,7 +101,11 @@ import {
   SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS,
   SUBAGENT_WAIT_TOOL_DESCRIPTION,
 } from "./src/prompt.ts";
-import { createDeferredResultDelivery } from "./src/result-delivery.ts";
+import {
+  createDeferredResultDelivery,
+  settledResult,
+  type SettledResult,
+} from "./src/result-delivery.ts";
 import {
   createSubagentRuntime,
   runTool,
@@ -154,7 +158,7 @@ function describeSubagent(snap: SubagentSnapshot) {
 }
 
 function truncatedOutput(
-  snap: SubagentSnapshot,
+  snap: Pick<SubagentSnapshot, "finalText" | "meta">,
   maxBytes = SUBAGENT_OUTPUT_MAX_BYTES,
 ): string {
   const output = snap.finalText || "(no output)";
@@ -217,7 +221,7 @@ export default function (pi: ExtensionAPI) {
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
-  const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>(
+  const resultDelivery = createDeferredResultDelivery<SettledResult>(
     (snap) => `${snap.id}:${snap.run}`,
   );
   /** Session-scoped friendly names (optional `name` at spawn) → id. */
@@ -480,7 +484,7 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const deliverResult = (snap: SubagentSnapshot) => {
+  const deliverResult = (snap: SettledResult) => {
     const usageText = (() => {
       const { tokens, contextWindow } = snap.usage ?? {};
       if (tokens === undefined && contextWindow === undefined) return undefined;
@@ -563,8 +567,8 @@ export default function (pi: ExtensionAPI) {
     // active wait/cancel is only a provisional claim: if that tool is aborted
     // after settlement, automatic delivery must still have the result.
     // The live snapshot can mutate if the same session is restarted, so defer
-    // an immutable top-level/meta copy for each settled run.
-    resultDelivery.defer(structuredClone(snap));
+    // a compact immutable result for each settled run, not its transcript.
+    resultDelivery.defer(settledResult(snap));
     if (!consumed && sessionContext?.isIdle()) flushResults();
   };
 

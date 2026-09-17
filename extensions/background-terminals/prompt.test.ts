@@ -9,14 +9,15 @@ import {
   buildTerminalResultMessage,
 } from "./src/prompt.ts";
 
-test("start descriptions identify the platform-specific shell contract", () => {
-  assert.match(BG_START_TOOL_DESCRIPTION, /sh -c on POSIX/);
-  assert.match(BG_START_TOOL_DESCRIPTION, /cmd\.exe \/d \/s \/c on Windows/);
-  assert.match(BG_START_PARAMETER_DESCRIPTIONS.command, /sh -c on POSIX/);
-  assert.match(
-    BG_START_PARAMETER_DESCRIPTIONS.command,
-    /cmd\.exe \/d \/s \/c on Windows/,
-  );
+test("start descriptions promise the same shell as the bash tool", () => {
+  // Regression: these used to advertise cmd.exe on Windows. Background
+  // terminals now run in pi's own bash (settings.json shellPath), so a command
+  // written for the bash tool cannot silently become a cmd.exe no-op.
+  assert.match(BG_START_TOOL_DESCRIPTION, /same shell as the bash tool/);
+  assert.match(BG_START_TOOL_DESCRIPTION, /settings\.json shellPath/);
+  assert.equal(/cmd\.exe/.test(BG_START_TOOL_DESCRIPTION), false);
+  assert.match(BG_START_PARAMETER_DESCRIPTIONS.command, /same bash/);
+  assert.equal(/cmd\.exe/.test(BG_START_PARAMETER_DESCRIPTIONS.command), false);
 });
 
 function view(overrides: Partial<OutputView> = {}): OutputView {

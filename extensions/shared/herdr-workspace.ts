@@ -85,6 +85,33 @@ export interface HerdrCliEnvelope {
   };
 }
 
+/**
+ * A herdr CLI envelope error (`{"error":{"code":"workspace_not_found",
+ * "message":"workspace w1E not found"}}`). The machine `code` is preserved
+ * because the human message names the id between the resource and the
+ * verdict — matching on message text alone silently missed every real
+ * "dead resource" error and disabled Herdr spawning for the rest of the
+ * session.
+ */
+export class HerdrCliError extends Error {
+  readonly code: string | undefined;
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = "HerdrCliError";
+    this.code = code;
+  }
+}
+
+/** The envelope error `code`, when the thrown value carries one. */
+export function herdrErrorCode(error: unknown): string | undefined {
+  if (error instanceof HerdrCliError) return error.code;
+  if (error && typeof error === "object" && "code" in error) {
+    const code = (error as { readonly code?: unknown }).code;
+    if (typeof code === "string" && code) return code;
+  }
+  return undefined;
+}
+
 /** Run a herdr CLI subcommand and parse its JSON envelope. */
 export type HerdrRunner = (
   args: ReadonlyArray<string>,
@@ -231,11 +258,25 @@ export function runHerdr(
           return;
         }
         if (parsed.error !== undefined) {
+          // Keep BOTH the machine code and the human message: callers match
+          // the code for dead-resource recovery, and the message keeps
+          // transient markers like `agent_pane_busy` intact.
+          const raw = parsed.error;
+          const code =
+            raw && typeof raw === "object" && "code" in raw
+              ? (raw as { readonly code?: unknown }).code
+              : undefined;
+          const codeText = typeof code === "string" && code ? code : undefined;
+          const message =
+            raw && typeof raw === "object" && "message" in raw
+              ? String((raw as { readonly message?: unknown }).message)
+              : typeof raw === "object"
+                ? JSON.stringify(raw)
+                : String(raw);
           reject(
-            new Error(
-              typeof parsed.error === "object"
-                ? JSON.stringify(parsed.error)
-                : String(parsed.error),
+            new HerdrCliError(
+              codeText ? `${codeText}: ${message}` : message,
+              codeText,
             ),
           );
           return;
@@ -244,6 +285,42 @@ export function runHerdr(
       });
     });
   });
+}
+
+/**
+ * Herdr reports a dead resource two ways and BOTH must be recognized: a
+ * machine `code` on the envelope error (`workspace_not_found`), and a human
+ * message that names the id between the resource and the verdict
+ * (`workspace w1E not found`). A missed match is not a cosmetic bug — the
+ * retry/rebuild path never runs, so every later allocation keeps retrying the
+ * stale id, and Herdr spawning stays silently dead for the rest of the
+ * session (subagents quietly fall back in-process; observers never open).
+ *
+ * Only the strong verdicts ("not found", "does not exist", "no such") may
+ * appear with an id in between; the loose words ("closed", "gone") are
+ * matched only when adjacent to the resource, so an unrelated message can
+ * never trigger the destructive rebuild path.
+ */
+export function isMissingHerdrResource(error: unknown): boolean {
+  const code = herdrErrorCode(error);
+  if (code && /^(?:pane|tab|workspace|agent)_not_found$/.test(code)) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const resource = "(?:pane|tab|workspace|agent)";
+  const strong = "(?:not found|does not exist|no such)";
+  const weak = `(?:${strong}|closed|gone)`;
+  const patterns = [
+    // "workspace not found", "pane already closed"
+    `\\b${resource}\\s+(?:already\\s+)?${weak}\\b`,
+    // "not found: workspace"
+    `\\b${weak}\\s+${resource}\\b`,
+    // "tab was already closed"
+    `\\b${resource}\\s+(?:was|is)\\s+(?:already\\s+)?${weak}\\b`,
+    // "workspace w1E not found" / "pane w1:p1 not found"
+    `\\b${resource}\\b[^\\n]{0,120}?\\b${strong}\\b`,
+  ];
+  return new RegExp(`(?:${patterns.join("|")})`, "i").test(message);
 }
 
 /**
@@ -268,6 +345,18 @@ export function shellQuote(
 
 export type WorkerCategory = "subagents" | "terminals";
 
+/**
+ * Result of a bounded teardown attempt.
+ *
+ *  - `closed`    — Herdr acknowledged the close.
+ *  - `missing`   — the resource was already gone (a user close or a previous
+ *                  attempt); tracking may be dropped safely.
+ *  - `uncertain` — the close timed out or failed on transport. The pane may
+ *                  still be LIVE, so ownership is retained (never forget the
+ *                  workspace) and a bounded retry is recorded.
+ */
+export type HerdrCloseOutcome = "closed" | "missing" | "uncertain";
+
 /** Lazy tab labels inside the worker workspace, per category. */
 export const WORKER_TAB_LABELS: Record<WorkerCategory, string> = {
   subagents: "Subagents",
@@ -285,6 +374,15 @@ const CLI_TIMEOUT_MS = 20_000;
 const CLOSE_TIMEOUT_MS = 10_000;
 const RUN_RETRY_DEADLINE_MS = 15_000;
 const RUN_RETRY_DELAY_MS = 500;
+/**
+ * Retry budget for ONE quarantined pane: the initial close attempt plus the
+ * reconciliation retries triggered by later allocations. Once exhausted the
+ * pane stays quarantined — the controller never forgets it, so the workspace
+ * keeps its owner — but no further automatic close calls are made, so cleanup
+ * can never spin. (Workspace-level closes are bounded differently: one close
+ * per explicit dispose/reconcile request, never a loop.)
+ */
+const MAX_CLOSE_ATTEMPTS = 3;
 /** Source id used when reporting panes as agents / metadata. */
 const AGENT_SOURCE = "pi-workers";
 
@@ -313,6 +411,16 @@ export interface WorkerWorkspaceOptions {
   readonly runRetryDelayMs?: number;
   readonly cliTimeoutMs?: number;
   readonly closeTimeoutMs?: number;
+  /**
+   * Called once before this controller's FIRST `workspace create`, after the
+   * environment gate. The process-wide registry uses it to re-attempt closing
+   * a previous session's workspace whose close was never confirmed. It
+   * resolves `true` only when nothing in the pending set is still unconfirmed;
+   * `false` means a possibly-live workspace survives, so this controller must
+   * NOT build a replacement beside it (allocation reports unavailable and the
+   * caller falls back). A rejected reconcile is treated as unconfirmed.
+   */
+  readonly reconcile?: () => Promise<boolean>;
 }
 
 export interface WorkerLaunchOptions {
@@ -448,8 +556,19 @@ export interface WorkerWorkspaceController {
   }): Promise<TerminalObserverHandle | undefined>;
   /** Focus the whole workspace (take-over entry). */
   focusWorkspace(): Promise<void>;
-  /** Close the workspace, best effort and bounded. Idempotent. */
+  /**
+   * Close the workspace. Idempotent: concurrent calls share one attempt.
+   * Ownership is released ONLY on a confirmed close (`closed`/`missing`);
+   * after an uncertain outcome `workspaceId` stays set, so a possibly-live
+   * workspace is never silently forgotten. Each explicit call makes at most
+   * one close attempt (no internal loop), so a transport that recovers can
+   * still confirm the close later.
+   */
   dispose(): Promise<void>;
+  /**
+   * The owned workspace id, or undefined when none is owned. Retained after an
+   * UNCONFIRMED close because the workspace may still be live.
+   */
   readonly workspaceId: string | undefined;
 }
 
@@ -462,8 +581,24 @@ interface ControllerState {
   rootPaneByCategory: Map<WorkerCategory, string>;
   lastPaneByCategory: Map<WorkerCategory, string>;
   panesByCategory: Map<WorkerCategory, string[]>;
+  /**
+   * Panes whose bounded close did not confirm teardown. They may still be
+   * live, so the workspace must never be forgotten while this is non-empty
+   * (forgetting it would let a replacement workspace leak alongside the
+   * survivor). Each entry carries a bounded retry record.
+   */
+  uncertainCloses: Map<
+    string,
+    { readonly category: WorkerCategory; attempts: number }
+  >;
   usedAgentNames: Set<string>;
   disposed: boolean;
+  /**
+   * Instrumentation: how many `workspace close` calls this controller made.
+   * Always reset when ownership is truthfully released, so it counts the
+   * attempts spent on the CURRENT workspace.
+   */
+  workspaceCloseAttempts: number;
 } /** Native watcher argv for the given spill files (Windows/POSIX). */
 export function observerCommand(
   stdoutPath: string,
@@ -511,24 +646,18 @@ export function createWorkerWorkspaceController(
     rootPaneByCategory: new Map(),
     lastPaneByCategory: new Map(),
     panesByCategory: new Map(),
+    uncertainCloses: new Map(),
     usedAgentNames: new Set(),
     disposed: false,
+    workspaceCloseAttempts: 0,
   };
 
   const call = (args: ReadonlyArray<string>, timeoutMs: number) =>
     runner(args, timeoutMs);
 
-  /** Hermes server errors mention the dead resource; treat as rebuildable. */
-  const isMissingResource = (error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    const resource = "(?:pane|tab|workspace|agent)";
-    const missing = "(?:not found|does not exist|no such|closed|gone)";
-    const wasMissing = `(?:was|is)\\s+(?:already\\s+)?(?:${missing})\\b`;
-    return new RegExp(
-      `(?:\\b${resource}\\s+(?:already\\s+)?${missing}\\b|\\b${missing}\\s+${resource}\\b|\\b${resource}\\s+${wasMissing})`,
-      "i",
-    ).test(message);
-  };
+  /** See isMissingHerdrResource: a dead pane/tab/workspace/agent is
+   * rebuildable (the user closed it), anything else is a real failure. */
+  const isMissingResource = isMissingHerdrResource;
 
   const resultOf = (output: HerdrCliEnvelope) => output.result ?? output;
 
@@ -542,6 +671,8 @@ export function createWorkerWorkspaceController(
 
   /** In-flight workspace creation so concurrent allocators share one. */
   let workspacePromise: Promise<string | undefined> | undefined;
+  /** In-flight disposal so concurrent dispose() calls share one attempt. */
+  let disposalPromise: Promise<void> | undefined;
   /** Per-category allocation chains so parallel openers never share a pane. */
   const allocationChains = new Map<
     WorkerCategory,
@@ -554,6 +685,16 @@ export function createWorkerWorkspaceController(
     if (state.disposed) return undefined;
     if (state.workspaceId) return state.workspaceId;
     if (!environment()) return undefined;
+    // Re-attempt any previous session's unconfirmed close BEFORE creating a
+    // replacement. A close that still cannot be confirmed keeps its workspace
+    // owned, so no replacement is built beside a possibly-live survivor;
+    // allocation reports unavailable instead. Bounded by each retained
+    // controller's own attempt record.
+    if (options.reconcile) {
+      const clear = await options.reconcile().catch(() => false);
+      if (!clear) return undefined;
+      if (state.disposed) return undefined; // a dispose raced the reconcile
+    }
     const output = await call(
       [
         "workspace",
@@ -578,12 +719,14 @@ export function createWorkerWorkspaceController(
     state.initialTabId = tabId;
     state.initialRootPane = rootPane;
     // A dispose raced this create (session shutdown): never leave the
-    // workspace behind — close it and report unavailable.
+    // workspace behind — close it and report unavailable. An UNCERTAIN close
+    // retains ownership plus the bounded attempt record, so a later dispose()
+    // retries it instead of forgetting a possibly-live workspace.
     if (state.disposed) {
-      state.workspaceId = undefined;
-      state.initialTabId = undefined;
-      state.initialRootPane = undefined;
-      await closeBounded(["workspace", "close", workspaceId]);
+      state.workspaceCloseAttempts += 1;
+      const outcome = await closeBounded(["workspace", "close", workspaceId]);
+      if (outcome === "uncertain") return undefined; // ownership retained
+      releaseOwnership();
       return undefined;
     }
     return workspaceId;
@@ -596,6 +739,19 @@ export function createWorkerWorkspaceController(
       workspacePromise = undefined;
     });
     return workspacePromise;
+  };
+
+  /**
+   * Every tab root this category receives must stay tracked: a root pane is
+   * LIVE the moment the tab exists, so leaving it untracked would let the
+   * workspace be forgotten while a pane of it is still alive (e.g. a rebuilt
+   * tab whose root was never appended because a concurrent allocation had
+   * already restored `lastPaneByCategory`).
+   */
+  const trackTabRoot = (category: WorkerCategory, rootPane: string) => {
+    const tracked = state.panesByCategory.get(category);
+    if (!tracked || tracked.includes(rootPane)) return;
+    tracked.push(rootPane);
   };
 
   /** Resolve (or lazily create) the category tab; uses the workspace's
@@ -618,6 +774,7 @@ export function createWorkerWorkspaceController(
       const rootPane = state.initialRootPane;
       state.tabIdByCategory.set(category, tabId);
       state.rootPaneByCategory.set(category, rootPane);
+      trackTabRoot(category, rootPane);
       // Renaming is cosmetic; a failure must not block the worker.
       await call(
         ["tab", "rename", tabId, WORKER_TAB_LABELS[category]],
@@ -648,6 +805,7 @@ export function createWorkerWorkspaceController(
     }
     state.tabIdByCategory.set(category, tabId);
     state.rootPaneByCategory.set(category, rootPane);
+    trackTabRoot(category, rootPane);
     return tabId;
   };
 
@@ -658,14 +816,26 @@ export function createWorkerWorkspaceController(
     category: WorkerCategory,
     cwd: string,
   ): Promise<string | undefined> => {
+    // Reconcile panes whose close never confirmed before allocating: a
+    // quarantined pane may have died in the meantime, and its tab/root must
+    // not be trusted for a fresh split until that is established.
+    await reconcileUncertainPanes();
+    if (state.disposed) return undefined;
     const tabId = await ensureTab(category);
     if (!tabId) return undefined;
+    // A dispose may have started while we suspended at ensureTab: allocating
+    // now would create a pane inside a workspace that is being closed.
+    if (state.disposed) return undefined;
     const root = state.rootPaneByCategory.get(category);
     const last = state.lastPaneByCategory.get(category);
     if (!last) {
       if (!root) return undefined;
       state.lastPaneByCategory.set(category, root);
-      state.panesByCategory.set(category, [root]);
+      // Append instead of replacing: panes whose teardown was never confirmed
+      // must stay owned even after their tab was rebuilt.
+      const tracked = state.panesByCategory.get(category) ?? [];
+      if (!tracked.includes(root)) tracked.push(root);
+      state.panesByCategory.set(category, tracked);
       return root;
     }
     const output = await call(
@@ -766,13 +936,25 @@ export function createWorkerWorkspaceController(
     }
   };
 
-  const closeBounded = async (args: ReadonlyArray<string>): Promise<void> => {
-    await Promise.race([
-      call(args, closeTimeoutMs),
-      sleep(closeTimeoutMs).then(() => {
-        throw new Error("herdr close timed out");
-      }),
-    ]).catch(() => {});
+  /**
+   * Bounded close attempt that reports WHAT happened instead of swallowing
+   * the error. A swallowed failure is how a still-live pane/workspace got
+   * forgotten and a second "Pi Workers" workspace leaked beside it.
+   */
+  const closeBounded = async (
+    args: ReadonlyArray<string>,
+  ): Promise<HerdrCloseOutcome> => {
+    try {
+      await Promise.race([
+        call(args, closeTimeoutMs),
+        sleep(closeTimeoutMs).then(() => {
+          throw new Error("herdr close timed out");
+        }),
+      ]);
+      return "closed";
+    } catch (error) {
+      return isMissingResource(error) ? "missing" : "uncertain";
+    }
   };
 
   const closePane = (paneId: string) => closeBounded(["pane", "close", paneId]);
@@ -820,6 +1002,17 @@ export function createWorkerWorkspaceController(
     await call(["agent", "rename", paneId, name], cliTimeoutMs).catch(() => {});
   };
 
+  /**
+   * Abandon a pane allocated by an open that must not proceed (a dispose
+   * raced it). Bounded close; an UNCERTAIN outcome keeps the pane quarantined
+   * so ownership of the still-possibly-live workspace survives.
+   */
+  const abandonPane = async (category: WorkerCategory, paneId: string) => {
+    const outcome = await closePane(paneId);
+    if (outcome === "uncertain") quarantinePane(category, paneId);
+    else releasePane(category, paneId);
+  };
+
   const openWorkerOnce = async (
     options: WorkerLaunchOptions,
   ): Promise<WorkerPaneHandle | undefined> => {
@@ -836,11 +1029,22 @@ export function createWorkerWorkspaceController(
         ["pane", "rename", allocatedPaneId, options.title],
         cliTimeoutMs,
       );
+      // A dispose that began while this open was suspended must not leave a
+      // live worker behind: abandon the pane instead of launching work into a
+      // workspace that is being closed (no hidden post-dispose allocation).
+      if (state.disposed) {
+        await abandonPane(options.category, allocatedPaneId);
+        return undefined;
+      }
       // Report/rename the pane before dispatching the worker command. Once
       // pane.run succeeds real work may already have started, so no fallible
       // setup step may remain that could trigger an in-process fallback and
       // duplicate the task.
       if (options.agent) await reportAgent(allocatedPaneId, options.agent);
+      if (state.disposed) {
+        await abandonPane(options.category, allocatedPaneId);
+        return undefined;
+      }
       await runWithRetry(["pane", "run", allocatedPaneId, ...options.launch]);
       return {
         paneId: allocatedPaneId,
@@ -934,50 +1138,58 @@ export function createWorkerWorkspaceController(
           await call(["agent", "focus", allocatedPaneId], cliTimeoutMs);
         },
         close: async () => {
-          await closePane(allocatedPaneId);
-          const panes = state.panesByCategory.get(options.category) ?? [];
-          const remaining = panes.filter((id) => id !== allocatedPaneId);
-          if (remaining.length === 0) {
-            dropCategory(options.category);
-          } else {
-            state.panesByCategory.set(options.category, remaining);
-            if (
-              state.lastPaneByCategory.get(options.category) === allocatedPaneId
-            ) {
-              state.lastPaneByCategory.set(options.category, remaining.at(-1)!);
-            }
-            if (
-              state.rootPaneByCategory.get(options.category) === allocatedPaneId
-            ) {
-              state.rootPaneByCategory.set(options.category, remaining[0]!);
-            }
+          const outcome = await closePane(allocatedPaneId);
+          if (outcome === "uncertain") {
+            // The pane may still be live: retain ownership (the workspace is
+            // never forgotten while a quarantined pane exists) and retry a
+            // bounded number of times on later allocations.
+            quarantinePane(options.category, allocatedPaneId);
+            return;
           }
+          releasePane(options.category, allocatedPaneId);
         },
       };
     } catch (error) {
       // Roll back the half-opened pane; the tab/workspace stay for reuse.
       // Active-pane tracking must not leave the closed pane as the next
-      // split target or the category's root. Closing a split only drops it
-      // as the newest pane (the previous newest becomes the split target);
-      // closing the root pane kills its tab, so the whole category must be
-      // re-created (and the initial-tab claim released) on the next open.
-      if (paneId) {
-        await closePane(paneId);
-        const panes = state.panesByCategory.get(options.category) ?? [];
-        const remaining = panes.filter((id) => id !== paneId);
-        state.panesByCategory.set(options.category, remaining);
-        if (state.lastPaneByCategory.get(options.category) === paneId) {
-          const previous = remaining.at(-1);
-          if (previous)
-            state.lastPaneByCategory.set(options.category, previous);
-          else state.lastPaneByCategory.delete(options.category);
-        }
-        if (state.rootPaneByCategory.get(options.category) === paneId) {
-          dropCategory(options.category);
-        }
-      }
+      // split target or the category's root. Re-read the live tracking at
+      // release time (releasePane) so a concurrent allocation in the same
+      // category is never abandoned. An UNCERTAIN close keeps the pane
+      // tracked — ownership must survive until teardown is confirmed.
+      if (paneId) await abandonPane(options.category, paneId);
       throw error;
     }
+  };
+
+  /**
+   * Herdr closes a workspace as soon as its last pane closes. Once we track
+   * no pane at all, the cached workspace id is dead weight: the next
+   * allocation would `tab create` against a closed workspace and only then
+   * discover the loss. Forget it eagerly so the next worker builds a fresh
+   * workspace on the first try. A category that still tracks panes (or a
+   * taken-over observer pane) means the workspace is alive — never forget it.
+   * A QUARANTINED pane (unconfirmed close) may also still be live: keeping
+   * the workspace claim is exactly what prevents a replacement from leaking
+   * beside it.
+   */
+  const forgetPaneLessWorkspace = () => {
+    if (state.uncertainCloses.size > 0) return;
+    // A disposal already in flight owns the outcome: clearing the id here
+    // would make attemptDisposal "retain" an ownership that no longer exists
+    // and drop the controller from the pending-closure retries.
+    if (state.disposed || disposalPromise) return;
+    const anyTrackedPane = [...state.panesByCategory.values()].some(
+      (panes) => panes.length > 0,
+    );
+    if (anyTrackedPane) return;
+    state.workspaceId = undefined;
+    state.initialTabId = undefined;
+    state.initialRootPane = undefined;
+    state.initialTabClaimed = false;
+    state.tabIdByCategory.clear();
+    state.rootPaneByCategory.clear();
+    state.lastPaneByCategory.clear();
+    state.panesByCategory.clear();
   };
 
   /** Drop one category's cached tab/root/newest-pane ids and release the
@@ -996,10 +1208,107 @@ export function createWorkerWorkspaceController(
     }
   };
 
-  /** The whole workspace is gone: close it (bounded; a no-op when the user
-   * already closed it) so a fresh workspace can never leak alongside it,
-   * and forget every cached id. */
-  const dropWorkspace = async (workspaceId: string | undefined) => {
+  /**
+   * Stop tracking one pane after its teardown was CONFIRMED (closed or
+   * already missing). Re-reads the live per-category tracking instead of
+   * assuming the maps still look the way they did before the close await, so
+   * a concurrent allocation that claimed panes in the same category is never
+   * abandoned. Closing the root pane of a still-populated tab promotes the
+   * surviving pane instead of dropping the whole category.
+   */
+  const releasePane = (category: WorkerCategory, paneId: string) => {
+    state.uncertainCloses.delete(paneId);
+    const panes = state.panesByCategory.get(category) ?? [];
+    const remaining = panes.filter((id) => id !== paneId);
+    if (remaining.length === 0) {
+      dropCategory(category);
+      // The last pane is gone: Herdr has already closed the workspace, so
+      // drop our stale claim on it — unless another quarantined pane may
+      // still be live, in which case forgetPaneLessWorkspace keeps it.
+      forgetPaneLessWorkspace();
+      return;
+    }
+    state.panesByCategory.set(category, remaining);
+    if (state.lastPaneByCategory.get(category) === paneId) {
+      state.lastPaneByCategory.set(category, remaining.at(-1)!);
+    }
+    if (state.rootPaneByCategory.get(category) === paneId) {
+      state.rootPaneByCategory.set(category, remaining[0]!);
+    }
+  };
+
+  /**
+   * Forget a category's cached TAB/root/newest-pane ids so the next attempt
+   * rebuilds a tab — WITHOUT discarding the category's tracked panes. Used
+   * when Herdr reports a pane/tab "not found": only the failed resource is
+   * known to be gone, while its siblings may still be live. Tracked panes
+   * therefore keep the workspace owned until their teardown is confirmed.
+   */
+  const invalidateCategoryTab = (category: WorkerCategory) => {
+    const tabId = state.tabIdByCategory.get(category);
+    state.tabIdByCategory.delete(category);
+    state.rootPaneByCategory.delete(category);
+    state.lastPaneByCategory.delete(category);
+    if (tabId !== undefined && state.initialTabId === tabId) {
+      state.initialTabId = undefined;
+      state.initialRootPane = undefined;
+      state.initialTabClaimed = false;
+    }
+  };
+
+  /**
+   * Keep ownership of a pane whose close is unconfirmed and start a bounded
+   * retry record. The pane stays in the normal tracking maps: it may still be
+   * live, and while `uncertainCloses` is non-empty the workspace is never
+   * forgotten (so a replacement can never leak beside the survivor).
+   */
+  const quarantinePane = (category: WorkerCategory, paneId: string) => {
+    // Monotonic per outstanding quarantine: closing the same pane again must
+    // not restart the bounded retry budget.
+    const previous = state.uncertainCloses.get(paneId)?.attempts ?? 0;
+    state.uncertainCloses.set(paneId, {
+      category,
+      attempts: previous + 1,
+    });
+  };
+
+  /** One reconciliation pass is shared by parallel allocators. */
+  let reconcilePromise: Promise<void> | undefined;
+
+  /**
+   * Reconcile quarantined panes before allocating a replacement: retry the
+   * bounded close a few times and release a pane only once its teardown is
+   * confirmed. A pane that still cannot be closed keeps its quarantine (and
+   * the workspace claim) and stops being retried after MAX_CLOSE_ATTEMPTS.
+   */
+  const reconcileUncertainPanes = (): Promise<void> => {
+    if (state.uncertainCloses.size === 0) return Promise.resolve();
+    reconcilePromise ??= (async () => {
+      for (const [paneId, record] of [...state.uncertainCloses]) {
+        if (record.attempts >= MAX_CLOSE_ATTEMPTS) continue;
+        record.attempts += 1;
+        const outcome = await closePane(paneId);
+        if (outcome !== "uncertain") releasePane(record.category, paneId);
+      }
+    })().finally(() => {
+      reconcilePromise = undefined;
+    });
+    return reconcilePromise;
+  };
+
+  /** The whole workspace is gone: close it (a no-op when the user already
+   * closed it) so a fresh workspace can never leak alongside it, and forget
+   * every cached id. Returns false when the close could NOT be confirmed: the
+   * workspace may still be live, so ownership is retained and the caller must
+   * not build a replacement beside it. */
+  const dropWorkspace = async (
+    workspaceId: string | undefined,
+  ): Promise<boolean> => {
+    state.workspaceCloseAttempts += 1;
+    const outcome = workspaceId
+      ? await closeBounded(["workspace", "close", workspaceId])
+      : "missing";
+    if (outcome === "uncertain") return false;
     state.workspaceId = undefined;
     state.initialTabId = undefined;
     state.initialRootPane = undefined;
@@ -1007,7 +1316,53 @@ export function createWorkerWorkspaceController(
     state.tabIdByCategory.clear();
     state.rootPaneByCategory.clear();
     state.lastPaneByCategory.clear();
-    if (workspaceId) await closeBounded(["workspace", "close", workspaceId]);
+    state.panesByCategory.clear();
+    state.uncertainCloses.clear();
+    state.workspaceCloseAttempts = 0;
+    return true;
+  };
+
+  /**
+   * Confirmed teardown: nothing is owned any more, so track nothing and reset
+   * the close-attempt counter for a possible future workspace.
+   */
+  const releaseOwnership = () => {
+    state.workspaceId = undefined;
+    state.initialTabId = undefined;
+    state.initialRootPane = undefined;
+    state.initialTabClaimed = false;
+    state.tabIdByCategory.clear();
+    state.rootPaneByCategory.clear();
+    state.lastPaneByCategory.clear();
+    state.panesByCategory.clear();
+    state.uncertainCloses.clear();
+    state.usedAgentNames.clear();
+    state.workspaceCloseAttempts = 0;
+  };
+
+  /**
+   * One bounded disposal attempt: at most ONE `workspace close` per call, and
+   * concurrent calls share it. Ownership is dropped ONLY when the close is
+   * confirmed (`closed`/`missing`). An UNCERTAIN close keeps the workspace id:
+   * the workspace may still be live, so forgetting it is exactly how a
+   * replacement leaked beside the survivor. `disposed` is set before the first
+   * await, so allocation stops the moment disposal starts.
+   *
+   * Retries are driven only by an explicit dispose/reconcile request, never by
+   * a loop of its own — so this cannot spin, and a transport that recovers can
+   * still confirm the close later (no permanent give-up).
+   */
+  const attemptDisposal = async (): Promise<void> => {
+    state.disposed = true;
+    const workspaceId = state.workspaceId;
+    if (!workspaceId) {
+      releaseOwnership();
+      return;
+    }
+    state.workspaceCloseAttempts += 1;
+    const outcome = await closeBounded(["workspace", "close", workspaceId]);
+    if (outcome === "uncertain") return; // ownership retained for a later retry
+    releaseOwnership();
   };
 
   const openWorker = async (
@@ -1020,16 +1375,22 @@ export function createWorkerWorkspaceController(
       if (isMissingResource(error)) {
         // A user-closed tab/pane reports "not found". Rebuild ONLY the
         // affected category in the CURRENT workspace and retry once — the
-        // other categories (and any taken-over panes) keep living.
-        dropCategory(options.category);
+        // other categories (and any taken-over panes) keep living. The
+        // category's PANES stay tracked: their teardown was never confirmed,
+        // and discarding them is exactly how a live sibling escaped ownership
+        // and the workspace was later forgotten while still populated.
+        invalidateCategoryTab(options.category);
         try {
           return await openWorkerOnce(options);
         } catch (secondError) {
           if (isMissingResource(secondError)) {
             // The workspace itself is gone (the category could not be
             // recreated): close the abandoned workspace so no duplicate
-            // "Pi Workers" workspace leaks behind, then rebuild fresh.
-            await dropWorkspace(state.workspaceId);
+            // "Pi Workers" workspace leaks behind, then rebuild fresh. An
+            // unconfirmed close keeps ownership, so nothing is built beside a
+            // possibly-live workspace.
+            const replaced = await dropWorkspace(state.workspaceId);
+            if (!replaced) return undefined;
             try {
               return await openWorkerOnce(options);
             } catch {
@@ -1115,20 +1476,18 @@ export function createWorkerWorkspaceController(
         );
     },
     async dispose() {
-      if (state.disposed) return;
-      state.disposed = true;
-      const workspaceId = state.workspaceId;
-      state.workspaceId = undefined;
-      state.initialTabId = undefined;
-      state.initialRootPane = undefined;
-      state.tabIdByCategory.clear();
-      state.rootPaneByCategory.clear();
-      state.lastPaneByCategory.clear();
-      state.panesByCategory.clear();
-      state.usedAgentNames.clear();
-      if (workspaceId) {
-        await closeBounded(["workspace", "close", workspaceId]);
+      // Concurrent/duplicate calls share one in-flight attempt. Once nothing
+      // is owned (confirmed teardown) there is nothing left to close, so the
+      // call is a no-op; while the workspace is still owned, each explicit
+      // call retries the bounded close so a recovered transport can confirm it.
+      if (disposalPromise) return disposalPromise;
+      if (state.disposed && state.workspaceId === undefined) {
+        return;
       }
+      disposalPromise = attemptDisposal().finally(() => {
+        disposalPromise = undefined;
+      });
+      return disposalPromise;
     },
     get workspaceId() {
       return state.workspaceId;
@@ -1148,25 +1507,75 @@ interface WorkspaceRegistry {
   controller?: WorkerWorkspaceController;
   sessionKey?: string;
   disposed: WeakSet<WorkerWorkspaceController>;
+  /**
+   * Controllers whose workspace close was never CONFIRMED. Their workspace may
+   * still be live, so they keep ownership and are retained here — never
+   * silently discarded — until a bounded retry confirms teardown. Dropping the
+   * controller instead is how an orphan became invisible and a replacement
+   * workspace leaked beside it.
+   */
+  pendingClosures: Set<WorkerWorkspaceController>;
 }
 const processGlobal = globalThis as typeof globalThis & {
   [WORKSPACE_REGISTRY]?: WorkspaceRegistry;
 };
 const registry = (processGlobal[WORKSPACE_REGISTRY] ??= {
   disposed: new WeakSet<WorkerWorkspaceController>(),
+  pendingClosures: new Set<WorkerWorkspaceController>(),
 });
+
+/**
+ * Dispose one controller and retain it while it still owns a possibly-live
+ * workspace. Each controller bounds its own close attempts; retaining it here
+ * is what lets a later shutdown or a replacement session retry the close
+ * instead of forgetting the workspace. A confirmed teardown (`workspaceId`
+ * becomes undefined) removes it from the pending set.
+ */
+const disposeAndRetain = async (
+  controller: WorkerWorkspaceController,
+): Promise<void> => {
+  registry.disposed.add(controller);
+  try {
+    await controller.dispose();
+  } catch {
+    // dispose() is contractually non-throwing; if that ever regresses, keep
+    // ownership (below) rather than discard a possibly-live workspace.
+  }
+  if (controller.workspaceId !== undefined) {
+    registry.pendingClosures.add(controller);
+  } else {
+    registry.pendingClosures.delete(controller);
+  }
+};
+
+/**
+ * Re-attempt every unconfirmed workspace close. Bounded: one close attempt per
+ * pending controller per pass (never a loop), and stops as soon as every
+ * retained workspace is confirmed closed — so a recovered transport clears the
+ * backlog instead of being permanently blocked.
+ */
+const reconcilePendingClosures = async (): Promise<boolean> => {
+  for (const controller of [...registry.pendingClosures]) {
+    await disposeAndRetain(controller);
+  }
+  return registry.pendingClosures.size === 0;
+};
 
 /**
  * The shared worker workspace for the current pi session (created lazily on
  * first use). Both the subagents and background-terminals extensions call
  * this during session_start and allocate into the same workspace so a
  * session never ends up with more than one "Pi Workers" workspace. After
- * disposal (session shutdown) the next call creates a fresh controller.
+ * disposal (session shutdown) the next call creates a fresh controller; a
+ * previous session's UNCONFIRMED workspace is retained and retried before the
+ * replacement creates its own.
  */
 export function workerWorkspaceForSession(
   project: string,
   sessionId: string,
   projectRoot: string,
+  /** Test seam: override the created controller's CLI/environment wiring. */
+  overrides?: Partial<WorkerWorkspaceOptions>,
 ): WorkerWorkspaceController {
   const sessionKey = `${sessionId}\0${path.resolve(projectRoot)}`;
   const existing = registry.controller;
@@ -1178,13 +1587,20 @@ export function workerWorkspaceForSession(
     return existing;
   }
   if (existing && !registry.disposed.has(existing)) {
-    registry.disposed.add(existing);
-    void existing.dispose();
+    // A different session replaces this one: retain the controller while its
+    // workspace close is unconfirmed instead of discarding it.
+    registry.pendingClosures.add(existing);
+    void disposeAndRetain(existing);
   }
   const created = createWorkerWorkspaceController({
     project,
     sessionId,
     projectRoot,
+    // Before this controller creates its own workspace, retry any previous
+    // session's unconfirmed close so a replacement is never built beside a
+    // possibly-live "Pi Workers" workspace.
+    reconcile: () => reconcilePendingClosures(),
+    ...overrides,
   });
   registry.controller = created;
   registry.sessionKey = sessionKey;
@@ -1195,16 +1611,24 @@ export function workerWorkspaceForSession(
  * Parent shutdown cleanup: close the workspace (bounded). Idempotent and
  * order-independent — whichever of the subagents/background-terminals
  * session_shutdown handlers runs first closes the shared workspace; the
- * second handler's call is a no-op. Targets keep running until the
- * workspace actually closes (taken-over panes survive until then).
+ * second handler's call retries anything still unconfirmed. Targets keep
+ * running until the workspace actually closes (taken-over panes survive until
+ * then). A controller whose close stayed UNCERTAIN is retained (never
+ * discarded) so its workspace is still owned and can be retried.
  */
-export function disposeWorkerWorkspace(): Promise<void> {
-  const workspace = registry.controller;
+export async function disposeWorkerWorkspace(): Promise<void> {
+  const current = registry.controller;
   registry.controller = undefined;
   registry.sessionKey = undefined;
-  if (!workspace) return Promise.resolve();
-  registry.disposed.add(workspace);
-  return workspace.dispose();
+  if (current) registry.pendingClosures.add(current);
+  // Retry the current workspace AND any earlier one whose close was never
+  // confirmed: discarding either would forget a workspace that may still be
+  // live. Each controller bounds its own attempts, so this settles.
+  await Promise.all(
+    [...registry.pendingClosures].map((controller) =>
+      disposeAndRetain(controller),
+    ),
+  );
 }
 
 /** Test seam: replace the singleton so UI entry points are testable. */
@@ -1213,4 +1637,6 @@ export function setWorkerWorkspaceForTests(
 ): void {
   registry.controller = controller;
   registry.sessionKey = controller ? "test" : undefined;
+  // A pending closure from an earlier test must never leak into the next one.
+  registry.pendingClosures.clear();
 }

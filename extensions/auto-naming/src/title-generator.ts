@@ -94,6 +94,10 @@ export async function generateTaskTitle(options: {
   readonly fallback?: string;
   readonly signal?: AbortSignal;
 }) {
+  // A caller-supplied name is already useful. Never put authentication or a
+  // cosmetic model request on the worker launch path just to rewrite it.
+  const explicitTitle = normalizeTitle(options.hint ?? "");
+  if (explicitTitle) return explicitTitle;
   const fallback =
     normalizeTitle(options.fallback ?? "") ?? fallbackTitle(options.prompt);
   if (!options.config.enabled || !options.modelRegistry) return fallback;

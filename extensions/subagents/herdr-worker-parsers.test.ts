@@ -72,36 +72,45 @@ test("piWorkerLaunch passes a private deterministic session and child exclusions
     "high",
     "--approve",
     "--exclude-tools",
-    "subagent_spawn,subagent_wait,subagent_cancel,subagent_check,subagent_list,subagent_send,workflow,ask_user",
+    "subagent_spawn,subagent_send,subagent_wait,subagent_cancel,subagent_check,subagent_list,workflow,ask_user",
   ]);
 });
 
-test("piWorkerLaunch appends profile tool-policy exclusions", () => {
+test("piWorkerLaunch narrows readOnly and custom profiles with a --tools allowlist", () => {
   const base = {
     nodePath: "node",
     piCliPath: "codex.js",
     sessionDir: "C:\\subs\\sa-3",
     sessionId: "019f1234-0000",
   };
-  // readOnly profile: the writing trio is excluded on top of the child
-  // denylist.
+  // readOnly profile: a REAL allowlist (no incomplete exclusion universe),
+  // so powershell and extension-backed execution tools are simply not named.
   const readOnly = piWorkerLaunch(
     task({ parent: { ...task().parent, toolPolicy: { readOnly: true } } }),
     base,
   );
-  const excludes = readOnly.argv[readOnly.argv.indexOf("--exclude-tools") + 1];
-  assert.match(excludes, /subagent_send,workflow,ask_user,write,edit,bash/);
-  // Explicit allowlist: anything built-in not listed is excluded.
+  assert.equal(readOnly.argv.includes("--exclude-tools"), false);
+  const allows = readOnly.argv[readOnly.argv.indexOf("--tools") + 1];
+  assert.deepEqual(allows.split(","), [
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "ask_question",
+  ]);
+  assert.ok(!allows.includes("powershell"), allows);
+  assert.ok(!allows.includes("bash"), allows);
+  assert.ok(!allows.includes("bg_start"), allows);
+  assert.ok(!allows.includes("remote_spawn"), allows);
+  // Explicit allowlist: anything not listed is denied by the same mechanism.
   const narrow = piWorkerLaunch(
     task({
       parent: { ...task().parent, toolPolicy: { tools: ["read", "grep"] } },
     }),
     base,
   );
-  const narrowExcludes =
-    narrow.argv[narrow.argv.indexOf("--exclude-tools") + 1];
-  assert.match(narrowExcludes, /write,edit,bash,find,ls/);
-  assert.ok(!narrowExcludes.includes("read"), narrowExcludes);
+  const narrowAllows = narrow.argv[narrow.argv.indexOf("--tools") + 1];
+  assert.deepEqual(narrowAllows.split(","), ["read", "grep", "ask_question"]);
 });
 
 test("piWorkerLaunch omits model/thinking when unset and flips trust when untrusted", () => {

@@ -1,6 +1,32 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createDeferredResultDelivery } from "./src/result-delivery.ts";
+import {
+  createDeferredResultDelivery,
+  settledResult,
+} from "./src/result-delivery.ts";
+import type { SubagentSnapshot } from "./src/domain.ts";
+
+test("settled delivery copies metadata without traversing the transcript", () => {
+  const snap = {
+    id: "sa-1",
+    run: 1,
+    title: "worker",
+    status: "done",
+    finalText: "result",
+    meta: { sessionFilePath: "session.jsonl" },
+    usage: { tokens: 100 },
+    question: { text: "Which option?" },
+    get transcript() {
+      throw new Error("Transcript must not be accessed");
+    },
+  } as unknown as SubagentSnapshot;
+  const result = settledResult(snap);
+  assert.equal(result.finalText, "result");
+  assert.equal("transcript" in result, false);
+  assert.notEqual(result.meta, snap.meta);
+  assert.notEqual(result.usage, snap.usage);
+  assert.notEqual(result.question, snap.question);
+});
 
 test("a result consumed by a later wait is not delivered", () => {
   const delivery = createDeferredResultDelivery<{

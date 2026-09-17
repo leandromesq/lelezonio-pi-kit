@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   disposeWorkerWorkspace,
+  isMissingHerdrResource,
+  HerdrCliError,
   observerCommand,
   setWorkerWorkspaceForTests,
   shellQuote,
@@ -43,9 +45,14 @@ function fakeHerdr() {
   let paneCounter = 0;
   const callCounts = new Map<string, number>();
   const calls: Array<ReadonlyArray<string>> = [];
+  /** Live panes per workspace; a workspace with no panes is closed. */
+  const panesByWorkspace = new Map<string, Set<string>>();
   /** Queued failures, consumed in order by matching command key. */
-  const failures: Array<{ count: number; message: string; command: string }> =
-    [];
+  const failures: Array<{
+    count: number;
+    error: Error;
+    command: string;
+  }> = [];
 
   const nextPane = (workspaceId: string) => `${workspaceId}:p${++paneCounter}`;
 
@@ -58,35 +65,78 @@ function fakeHerdr() {
       if (failure.command === "*" || failure.command === key) {
         failure.count -= 1;
         if (failure.count <= 0) failures.shift();
-        throw new Error(failure.message);
+        throw failure.error;
       }
     }
     switch (key) {
       case "workspace create": {
         workspaceCounter += 1;
         const ws = `w${workspaceCounter}`;
+        const pane = nextPane(ws);
+        panesByWorkspace.set(ws, new Set([pane]));
         return {
           result: {
             workspace: { workspace_id: ws },
             tab: { tab_id: `${ws}:t1` },
-            root_pane: { pane_id: nextPane(ws) },
+            root_pane: { pane_id: pane },
           },
         };
       }
       case "tab create": {
         const ws = args[args.indexOf("--workspace") + 1];
+        // Faithful to Herdr: a workspace with no panes left is CLOSED, and
+        // every later command against it fails with the real envelope error
+        // (`{"code":"workspace_not_found","message":"workspace w1 not found"}`).
+        // Modeling this is what keeps the stale-workspace-id regression
+        // (Herdr spawning silently dead for the session) from coming back.
+        if (!panesByWorkspace.has(ws)) {
+          throw new HerdrCliError(
+            `workspace_not_found: workspace ${ws} not found`,
+            "workspace_not_found",
+          );
+        }
         const tabNumber = (callCounts.get("tab create") ?? 0) + 1;
         const tabId = `${ws}:t${tabNumber}`;
+        const pane = nextPane(ws);
+        panesByWorkspace.get(ws)?.add(pane);
         return {
           result: {
             tab: { tab_id: tabId },
-            root_pane: { pane_id: nextPane(ws) },
+            root_pane: { pane_id: pane },
           },
         };
       }
       case "pane split": {
-        const workspaceId = args[2].split(":")[0];
-        return { result: { pane: { pane_id: nextPane(workspaceId) } } };
+        const target = args[2];
+        const workspaceId = target.split(":")[0];
+        if (!panesByWorkspace.get(workspaceId)?.has(target)) {
+          throw new HerdrCliError(
+            `pane_not_found: pane ${target} not found`,
+            "pane_not_found",
+          );
+        }
+        const pane = nextPane(workspaceId);
+        panesByWorkspace.get(workspaceId)?.add(pane);
+        return { result: { pane: { pane_id: pane } } };
+      }
+      case "pane close": {
+        const target = args[2];
+        const workspaceId = target.split(":")[0];
+        const panes = panesByWorkspace.get(workspaceId);
+        if (!panes) {
+          throw new HerdrCliError(
+            `pane_not_found: pane ${target} not found`,
+            "pane_not_found",
+          );
+        }
+        panes.delete(target);
+        // Herdr closes a workspace once its last pane is gone.
+        if (panes.size === 0) panesByWorkspace.delete(workspaceId);
+        return {};
+      }
+      case "workspace close": {
+        panesByWorkspace.delete(args[2]);
+        return {};
       }
       default:
         return {};
@@ -99,11 +149,21 @@ function fakeHerdr() {
     calls,
     callCount: (key: string) => callCounts.get(key) ?? 0,
     failNextOnce: (message: string) => {
-      failures.push({ count: 1, message, command: "*" });
+      failures.push({ count: 1, error: new Error(message), command: "*" });
     },
     failNextCommand: (command: string, count: number, message: string) => {
-      failures.push({ count, message, command });
+      failures.push({ count, error: new Error(message), command });
     },
+    /** Queue a PRECISE error shape (e.g. a real HerdrCliError envelope). */
+    failNextError: (error: Error) => {
+      failures.push({ count: 1, error, command: "*" });
+    },
+    /** Simulate the user closing a workspace in Herdr (its panes go with it). */
+    closeWorkspace: (workspaceId: string) => {
+      panesByWorkspace.delete(workspaceId);
+    },
+    /** Workspaces the fake server still holds (an orphan would show up here). */
+    liveWorkspaces: () => [...panesByWorkspace.keys()],
   };
 }
 
@@ -114,12 +174,14 @@ function makeController(options: {
   sessionId?: string;
   platform?: NodeJS.Platform;
   runRetryDeadlineMs?: number;
+  /** Wrap/replace the fake CLI (gating specific commands in race tests). */
+  runner?: HerdrRunner;
 }) {
   const controller = createWorkerWorkspaceController({
     project: options.project ?? "proj",
     sessionId: options.sessionId ?? "01234567-89ab-cdef",
     projectRoot: "C:\\work\\proj",
-    runner: options.herdr.runner,
+    runner: options.runner ?? options.herdr.runner,
     environment: options.environment ?? (() => true),
     platform: options.platform ?? "win32",
     runRetryDeadlineMs: options.runRetryDeadlineMs ?? 5_000,
@@ -777,6 +839,158 @@ test("a failed rollback close is swallowed (best effort)", async () => {
   );
 });
 
+// --- uncertain close: ownership is retained, never forgotten ----------------------
+
+test("a failed pane close retains workspace ownership (no orphan on the next allocation)", async () => {
+  // Audit repro: close fails on the transport, the controller forgets the
+  // workspace, and the next open builds a second "Pi Workers" workspace
+  // beside the still-live one.
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  const first = await controller.openWorker({
+    category: "terminals",
+    title: "a",
+    cwd: "C:\\w",
+    launch: ["x"],
+  });
+  assert.ok(first);
+  assert.equal(controller.workspaceId, "w1");
+  herdr.failNextCommand("pane close", 1, "transport unavailable");
+  await first.close();
+  assert.equal(
+    controller.workspaceId,
+    "w1",
+    "an unconfirmed close keeps owning the workspace",
+  );
+  assert.deepEqual(herdr.liveWorkspaces(), ["w1"]);
+  // The next allocation reconciles the quarantine (retries the close). Once
+  // the pane is confirmed gone the workspace is released and exactly one
+  // fresh workspace is built — never a second one beside a live survivor.
+  const second = await controller.openWorker({
+    category: "terminals",
+    title: "b",
+    cwd: "C:\\w",
+    launch: ["x"],
+  });
+  assert.ok(second);
+  assert.deepEqual(herdr.liveWorkspaces(), [second.workspaceId]);
+  assert.equal(herdr.callCount("workspace create"), 2);
+});
+
+test("dispose after an uncertain pane close still closes the workspace (no shutdown leak)", async () => {
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  const first = await controller.openWorker({
+    category: "terminals",
+    title: "a",
+    cwd: "C:\\w",
+    launch: ["x"],
+  });
+  assert.ok(first);
+  herdr.failNextCommand("pane close", 1, "transport unavailable");
+  await first.close();
+  await controller.dispose();
+  assert.deepEqual(
+    herdr.liveWorkspaces(),
+    [],
+    "dispose still owns (and closes) the workspace after a failed pane close",
+  );
+});
+
+test("a permanently failing close is retried boundedly and keeps ownership", async () => {
+  const BOUNDED_CLOSE_ATTEMPTS = 3; // initial attempt + reconciliation retries
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  const first = await controller.openWorker({
+    category: "terminals",
+    title: "a",
+    cwd: "C:\\w",
+    launch: ["x"],
+  });
+  assert.ok(first);
+  herdr.failNextCommand("pane close", 99, "transport unavailable");
+  await first.close();
+  for (let index = 0; index < 4; index += 1) {
+    const next = await controller.openWorker({
+      category: "terminals",
+      title: `n${index}`,
+      cwd: "C:\\w",
+      launch: ["x"],
+    });
+    assert.ok(next, `allocation ${index} still succeeds`);
+  }
+  assert.equal(
+    controller.workspaceId,
+    "w1",
+    "the workspace stays owned while a pane may still be live",
+  );
+  assert.equal(herdr.callCount("workspace create"), 1, "no replacement leaks");
+  assert.equal(
+    herdr.callCount("pane close"),
+    BOUNDED_CLOSE_ATTEMPTS,
+    "close retries are bounded (never an infinite retry loop)",
+  );
+});
+
+test("a close/open race does not abandon a concurrently allocated pane", async () => {
+  // The first worker's launch is held until a second worker has allocated a
+  // split; the first then FAILS and its rollback closes the category's ROOT
+  // pane. Dropping the whole category there would silently abandon the
+  // second (live) pane and forget a workspace that is still populated.
+  const herdr = fakeHerdr();
+  let releaseRun!: () => void;
+  const runGate = new Promise<void>((resolve) => (releaseRun = resolve));
+  let firstRunStarted!: () => void;
+  const firstRun = new Promise<void>((resolve) => (firstRunStarted = resolve));
+  const gated: HerdrRunner = async (args, timeout) => {
+    if (args[0] === "pane" && args[1] === "run" && args[2] === "w1:p1") {
+      firstRunStarted();
+      await runGate;
+      throw new Error("command failed");
+    }
+    return herdr.runner(args, timeout);
+  };
+  const controller = makeController({ herdr, runner: gated });
+
+  const first = controller.openWorker({
+    category: "terminals",
+    title: "a",
+    cwd: "C:\\w",
+    launch: ["x"],
+  });
+  await firstRun; // the root pane is allocated and launching
+  const second = await controller.openWorker({
+    category: "terminals",
+    title: "b",
+    cwd: "C:\\w",
+    launch: ["x"],
+  });
+  assert.ok(second);
+  assert.equal(second.paneId, "w1:p2");
+
+  releaseRun();
+  assert.equal(await first, undefined, "the failed launch rolls back");
+
+  assert.equal(
+    controller.workspaceId,
+    "w1",
+    "the concurrent pane keeps the workspace owned",
+  );
+  assert.equal(herdr.callCount("workspace create"), 1);
+  assert.deepEqual(herdr.liveWorkspaces(), ["w1"]);
+  // The surviving pane is still the split target: a third worker lands there
+  // instead of rebuilding/abandoning the category.
+  const third = await controller.openWorker({
+    category: "terminals",
+    title: "c",
+    cwd: "C:\\w",
+    launch: ["x"],
+  });
+  assert.ok(third);
+  assert.equal(third.paneId, "w1:p3");
+  assert.equal(herdr.callCount("workspace create"), 1);
+});
+
 test("run retries agent_pane_busy until the deadline", async () => {
   const herdr = fakeHerdr();
   herdr.failNextCommand("pane run", 3, "agent_pane_busy");
@@ -879,6 +1093,85 @@ test("a category rebuild never touches the other category's cached ids", async (
     2,
     "only the terminals tab is rebuilt (w1:t2 subagents + new terminals tab)",
   );
+});
+
+test("a user-closed split target never lets a live sibling be forgotten", async () => {
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  const first = await controller.openWorker({
+    category: "terminals",
+    title: "t1",
+    cwd: "C:\\work",
+    launch: ["tail", "-F"],
+  });
+  const second = await controller.openWorker({
+    category: "terminals",
+    title: "t2",
+    cwd: "C:\\work",
+    launch: ["tail", "-F"],
+  });
+  assert.ok(first && second);
+  assert.equal(herdr.liveWorkspaces().length, 1);
+  // The user closes the split target (the tab and its root pane survive): the
+  // next split reports it missing and the category rebuilds a tab.
+  herdr.failNextOnce("pane not found: w1:p2");
+  const rebuilt = await controller.openWorker({
+    category: "terminals",
+    title: "t3",
+    cwd: "C:\\work",
+    launch: ["tail", "-F"],
+  });
+  assert.ok(rebuilt);
+  // Closing the rebuilt pane must NOT forget the workspace: the sibling pane's
+  // teardown was never confirmed, so it may still be live.
+  await rebuilt.close();
+  assert.equal(
+    controller.workspaceId,
+    "w1",
+    "an unconfirmed sibling keeps the workspace owned",
+  );
+  // The next allocation reuses the owned workspace instead of leaking a second.
+  const later = await controller.openWorker({
+    category: "terminals",
+    title: "t4",
+    cwd: "C:\\work",
+    launch: ["tail", "-F"],
+  });
+  assert.ok(later);
+  assert.equal(herdr.callCount("workspace create"), 1);
+});
+
+test("an unconfirmed stale-workspace close keeps ownership (no orphan)", async () => {
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  await controller.openWorker({
+    category: "terminals",
+    title: "t1",
+    cwd: "C:\\work",
+    launch: ["tail", "-F"],
+  });
+  // The category rebuild fails in a dead workspace, and the close of that
+  // stale workspace cannot be confirmed (transport failure).
+  herdr.failNextOnce("pane not found: w1:p1");
+  herdr.failNextOnce("workspace not found: w1");
+  herdr.failNextCommand("workspace close", 1, "transport unavailable");
+  const next = await controller.openWorker({
+    category: "terminals",
+    title: "t2",
+    cwd: "C:\\work",
+    launch: ["tail", "-F"],
+  });
+  assert.equal(
+    next,
+    undefined,
+    "no replacement beside a possibly-live workspace",
+  );
+  assert.equal(
+    controller.workspaceId,
+    "w1",
+    "ownership survives an unconfirmed workspace close",
+  );
+  assert.deepEqual(herdr.liveWorkspaces(), ["w1"]);
 });
 
 // --- observer lifecycle: settle / take-over ----------------------------------------
@@ -1083,7 +1376,9 @@ test("handler run/sendKeys/rename/reportMetadata target the allocated pane", asy
 test("a failed root-pane open releases the category so the next open rebuilds", async () => {
   const herdr = fakeHerdr();
   const controller = makeController({ herdr });
-  // The FIRST worker is hosted by the root pane; its pane run fails.
+  // The FIRST worker is hosted by the root pane; its pane run fails, so the
+  // rollback closes that pane. It was the workspace's only pane, so Herdr
+  // closes the workspace with it.
   herdr.failNextCommand("pane run", 1, "command failed");
   assert.equal(
     await controller.openWorker({
@@ -1094,8 +1389,13 @@ test("a failed root-pane open releases the category so the next open rebuilds", 
     }),
     undefined,
   );
-  // The category is reset: the next open creates a fresh tab (and pane)
-  // instead of reusing the closed root pane.
+  assert.equal(
+    controller.workspaceId,
+    undefined,
+    "the controller stops claiming the workspace the rollback killed",
+  );
+  // The next open builds a FRESH workspace and hosts the worker in its root
+  // pane — it must never `tab create` into the closed one.
   const recovered = await controller.openWorker({
     category: "subagents",
     title: "t2",
@@ -1103,14 +1403,12 @@ test("a failed root-pane open releases the category so the next open rebuilds", 
     launch: ["node", "cli.js"],
   });
   assert.ok(recovered);
-  assert.equal(recovered.paneId, "w1:p2");
-  const created = herdr.calls.filter(
-    (a) => a[0] === "tab" && a[1] === "create",
-  );
+  assert.equal(recovered.workspaceId, "w2");
+  assert.equal(herdr.callCount("workspace create"), 2);
   assert.equal(
-    created.length,
-    1,
-    "a new tab is created after the root rollback",
+    herdr.calls.filter((a) => a[0] === "tab" && a[1] === "create").length,
+    0,
+    "a fresh workspace needs no extra tab for the first category",
   );
 });
 
@@ -1257,6 +1555,390 @@ test("a dispose racing workspace creation closes the created workspace", async (
   assert.deepEqual(closeCalls, [["workspace", "close", "w9"]]);
 });
 
+// --- truthful disposal: ownership survives an uncertain workspace close ------------
+
+test("an unconfirmed workspace close keeps ownership and retries boundedly", async () => {
+  // Regression: dispose() cleared every id BEFORE its bounded close and
+  // ignored the outcome, so an uncertain close lost the workspace forever.
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  await controller.ensureWorkspace();
+  // The next three close attempts fail on the transport.
+  herdr.failNextCommand("workspace close", 3, "transport unavailable");
+
+  await controller.dispose();
+  assert.equal(
+    controller.workspaceId,
+    "w1",
+    "an unconfirmed close keeps owning the workspace",
+  );
+  assert.deepEqual(herdr.liveWorkspaces(), ["w1"]);
+  assert.equal(
+    await controller.openWorker({
+      category: "terminals",
+      title: "t",
+      cwd: "C:\\w",
+      launch: ["x"],
+    }),
+    undefined,
+    "no new work is allocated once disposal starts",
+  );
+  assert.equal(herdr.callCount("workspace create"), 1, "no replacement leaks");
+
+  // Later dispose calls retry the retained close: ONE bounded attempt per
+  // explicit call (never a loop), so a recovered transport can still confirm.
+  await controller.dispose();
+  await controller.dispose();
+  assert.equal(
+    herdr.callCount("workspace close"),
+    3,
+    "one close attempt per explicit dispose call",
+  );
+  assert.equal(
+    controller.workspaceId,
+    "w1",
+    "ownership is retained truthfully, never reported closed",
+  );
+
+  // The transport recovers: the next explicit request confirms the close and
+  // releases ownership — the retry budget is never exhausted permanently.
+  await controller.dispose();
+  assert.equal(herdr.callCount("workspace close"), 4);
+  assert.equal(controller.workspaceId, undefined);
+  assert.deepEqual(herdr.liveWorkspaces(), []);
+});
+
+test("a workspace close retry that succeeds releases ownership truthfully", async () => {
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  await controller.ensureWorkspace();
+  herdr.failNextCommand("workspace close", 1, "transport unavailable");
+
+  await controller.dispose();
+  assert.equal(controller.workspaceId, "w1", "attempt 1 was uncertain");
+
+  await controller.dispose();
+  assert.equal(
+    controller.workspaceId,
+    undefined,
+    "a confirmed close releases ownership",
+  );
+  assert.deepEqual(herdr.liveWorkspaces(), []);
+  assert.equal(herdr.callCount("workspace close"), 2);
+});
+
+test("concurrent dispose calls share one bounded close attempt", async () => {
+  const herdr = fakeHerdr();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let onCloseStarted!: () => void;
+  const closeStarted = new Promise<void>((resolve) => {
+    onCloseStarted = resolve;
+  });
+  const gated: HerdrRunner = async (args, timeout) => {
+    if (args[0] === "workspace" && args[1] === "close") {
+      onCloseStarted();
+      await gate;
+    }
+    return herdr.runner(args, timeout);
+  };
+  const controller = makeController({ herdr, runner: gated });
+  await controller.ensureWorkspace();
+
+  const first = controller.dispose();
+  await closeStarted;
+  const second = controller.dispose();
+  release();
+  await Promise.all([first, second]);
+
+  assert.equal(
+    herdr.callCount("workspace close"),
+    1,
+    "concurrent dispose calls never double-close",
+  );
+  assert.equal(controller.workspaceId, undefined);
+  assert.deepEqual(herdr.liveWorkspaces(), []);
+});
+
+test("an open racing dispose abandons its pane instead of launching into the closing workspace", async () => {
+  const herdr = fakeHerdr();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let onRenameStarted!: () => void;
+  const renameStarted = new Promise<void>((resolve) => {
+    onRenameStarted = resolve;
+  });
+  const gated: HerdrRunner = async (args, timeout) => {
+    if (args[0] === "pane" && args[1] === "rename") {
+      onRenameStarted();
+      await gate;
+    }
+    return herdr.runner(args, timeout);
+  };
+  const controller = makeController({ herdr, runner: gated });
+
+  const opening = controller.openWorker({
+    category: "terminals",
+    title: "a",
+    cwd: "C:\\w",
+    launch: ["x"],
+  });
+  await renameStarted; // the root pane is allocated, the open is suspended
+  await controller.dispose();
+  release();
+
+  assert.equal(
+    await opening,
+    undefined,
+    "the racing open is abandoned, not launched",
+  );
+  assert.equal(
+    herdr.callCount("pane run"),
+    0,
+    "no work was launched into the closing workspace",
+  );
+  assert.deepEqual(
+    herdr.liveWorkspaces(),
+    [],
+    "the abandoned pane left no orphan behind",
+  );
+});
+
+test("disposeWorkerWorkspace retains an unconfirmed workspace and retries it", async () => {
+  setWorkerWorkspaceForTests(undefined);
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  setWorkerWorkspaceForTests(controller);
+  try {
+    await controller.ensureWorkspace();
+    herdr.failNextCommand("workspace close", 1, "transport unavailable");
+
+    await disposeWorkerWorkspace();
+    assert.equal(
+      controller.workspaceId,
+      "w1",
+      "the registry retains the controller instead of discarding it",
+    );
+    assert.deepEqual(herdr.liveWorkspaces(), ["w1"]);
+
+    // The next shutdown handler retries the retained controller.
+    await disposeWorkerWorkspace();
+    assert.equal(controller.workspaceId, undefined);
+    assert.deepEqual(herdr.liveWorkspaces(), []);
+    assert.equal(herdr.callCount("workspace close"), 2);
+  } finally {
+    setWorkerWorkspaceForTests(undefined);
+  }
+});
+
+test("a replacement session reconciles an unconfirmed workspace before creating its own", async () => {
+  setWorkerWorkspaceForTests(undefined);
+  const herdr = fakeHerdr();
+  const wiring = {
+    runner: herdr.runner,
+    environment: () => true,
+    platform: "linux" as NodeJS.Platform,
+    runRetryDeadlineMs: 5_000,
+    runRetryDelayMs: 1,
+    cliTimeoutMs: 2_000,
+    closeTimeoutMs: 1_000,
+  };
+  try {
+    const first = workerWorkspaceForSession(
+      "p",
+      "session-a",
+      "/tmp/proj",
+      wiring,
+    );
+    assert.equal(await first.ensureWorkspace(), "w1");
+    herdr.failNextCommand("workspace close", 1, "transport unavailable");
+    await disposeWorkerWorkspace();
+    assert.equal(first.workspaceId, "w1", "session A's workspace stays owned");
+
+    const second = workerWorkspaceForSession(
+      "p",
+      "session-b",
+      "/tmp/proj",
+      wiring,
+    );
+    assert.equal(
+      await second.ensureWorkspace(),
+      "w2",
+      "the replacement session creates its own workspace",
+    );
+    assert.equal(
+      first.workspaceId,
+      undefined,
+      "the previous close was retried (and confirmed) before the replacement",
+    );
+    assert.deepEqual(
+      herdr.liveWorkspaces(),
+      ["w2"],
+      "no orphan survived beside the replacement",
+    );
+    assert.equal(herdr.callCount("workspace close"), 2);
+    assert.equal(herdr.callCount("workspace create"), 2);
+  } finally {
+    await disposeWorkerWorkspace();
+    setWorkerWorkspaceForTests(undefined);
+  }
+});
+
+test("a recovered transport lets the replacement session proceed (no permanent dead-end)", async () => {
+  setWorkerWorkspaceForTests(undefined);
+  const herdr = fakeHerdr();
+  const wiring = {
+    runner: herdr.runner,
+    environment: () => true,
+    platform: "linux" as NodeJS.Platform,
+    runRetryDeadlineMs: 5_000,
+    runRetryDelayMs: 1,
+    cliTimeoutMs: 2_000,
+    closeTimeoutMs: 1_000,
+  };
+  try {
+    const first = workerWorkspaceForSession(
+      "p",
+      "session-a",
+      "/tmp/proj",
+      wiring,
+    );
+    assert.equal(await first.ensureWorkspace(), "w1");
+    // Three failed attempts (the dispose plus two reconcile passes) must not
+    // exhaust the retry budget for the process lifetime.
+    herdr.failNextCommand("workspace close", 3, "transport unavailable");
+    await disposeWorkerWorkspace();
+    assert.equal(first.workspaceId, "w1");
+
+    const blocked = workerWorkspaceForSession(
+      "p",
+      "session-b",
+      "/tmp/proj",
+      wiring,
+    );
+    assert.equal(await blocked.ensureWorkspace(), undefined);
+    const alsoBlocked = workerWorkspaceForSession(
+      "p",
+      "session-c",
+      "/tmp/proj",
+      wiring,
+    );
+    assert.equal(await alsoBlocked.ensureWorkspace(), undefined);
+
+    // The transport recovers: the next session reconciles and creates its own
+    // workspace instead of staying blocked forever.
+    const second = workerWorkspaceForSession(
+      "p",
+      "session-d",
+      "/tmp/proj",
+      wiring,
+    );
+    assert.equal(await second.ensureWorkspace(), "w2");
+    assert.equal(first.workspaceId, undefined);
+    assert.deepEqual(herdr.liveWorkspaces(), ["w2"]);
+  } finally {
+    await disposeWorkerWorkspace();
+    setWorkerWorkspaceForTests(undefined);
+  }
+});
+
+test("a replacement session never builds beside an unconfirmable workspace", async () => {
+  setWorkerWorkspaceForTests(undefined);
+  const herdr = fakeHerdr();
+  const wiring = {
+    runner: herdr.runner,
+    environment: () => true,
+    platform: "linux" as NodeJS.Platform,
+    runRetryDeadlineMs: 5_000,
+    runRetryDelayMs: 1,
+    cliTimeoutMs: 2_000,
+    closeTimeoutMs: 1_000,
+  };
+  try {
+    const first = workerWorkspaceForSession(
+      "p",
+      "session-a",
+      "/tmp/proj",
+      wiring,
+    );
+    assert.equal(await first.ensureWorkspace(), "w1");
+    // Every close attempt fails on the transport: the old workspace stays owned.
+    herdr.failNextCommand("workspace close", 8, "transport unavailable");
+    await disposeWorkerWorkspace();
+    assert.equal(first.workspaceId, "w1");
+
+    const second = workerWorkspaceForSession(
+      "p",
+      "session-b",
+      "/tmp/proj",
+      wiring,
+    );
+    assert.equal(
+      await second.ensureWorkspace(),
+      undefined,
+      "an unconfirmed predecessor blocks a replacement workspace",
+    );
+    assert.equal(herdr.callCount("workspace create"), 1);
+    assert.deepEqual(herdr.liveWorkspaces(), ["w1"]);
+  } finally {
+    await disposeWorkerWorkspace();
+    setWorkerWorkspaceForTests(undefined);
+  }
+});
+
+test("a dispose racing workspace creation retains ownership when its close is uncertain", async () => {
+  let releaseCreate!: () => void;
+  const closeCalls: string[][] = [];
+  const runner: HerdrRunner = async (args) => {
+    if (args[0] === "workspace" && args[1] === "create") {
+      await new Promise<void>((resolve) => (releaseCreate = resolve));
+      return Promise.resolve({
+        result: {
+          workspace: { workspace_id: "w9" },
+          tab: { tab_id: "w9:t1" },
+          root_pane: { pane_id: "w9:p1" },
+        },
+      });
+    }
+    if (args[0] === "workspace" && args[1] === "close") {
+      closeCalls.push([...args]);
+      if (closeCalls.length === 1) throw new Error("transport unavailable");
+      return Promise.resolve({});
+    }
+    return Promise.resolve({});
+  };
+  const controller = createWorkerWorkspaceController({
+    project: "p",
+    sessionId: "s",
+    projectRoot: "/tmp",
+    environment: () => true,
+    platform: "linux",
+    runner,
+    cliTimeoutMs: 2_000,
+    closeTimeoutMs: 500,
+  });
+  const creating = controller.ensureWorkspace();
+  await controller.dispose();
+  releaseCreate();
+  assert.equal(await creating, undefined);
+  assert.deepEqual(closeCalls, [["workspace", "close", "w9"]]);
+  assert.equal(
+    controller.workspaceId,
+    "w9",
+    "an uncertain racing close keeps ownership instead of forgetting the workspace",
+  );
+  await controller.dispose();
+  assert.deepEqual(closeCalls, [
+    ["workspace", "close", "w9"],
+    ["workspace", "close", "w9"],
+  ]);
+  assert.equal(
+    controller.workspaceId,
+    undefined,
+    "the retry confirmed teardown and released ownership",
+  );
+});
+
 // --- singleton ---------------------------------------------------------------------
 
 test("workerWorkspaceForSession shares one controller; disposal resets it", async () => {
@@ -1294,4 +1976,137 @@ test("disposeWorkerWorkspace with no controller resolves immediately", async () 
   setWorkerWorkspaceForTests(undefined);
   await disposeWorkerWorkspace();
   assert.ok(true);
+});
+
+// --- dead-resource recognition (real Herdr error shapes) ---------------------------
+
+test("isMissingHerdrResource recognizes the real Herdr error shapes", () => {
+  // The machine code alone is enough (the message may name no id at all).
+  assert.equal(
+    isMissingHerdrResource(new HerdrCliError("EPANEMISSING", "pane_not_found")),
+    true,
+  );
+  // The real envelope: code + a message with the id between resource and verdict.
+  assert.equal(
+    isMissingHerdrResource(
+      new HerdrCliError(
+        "workspace_not_found: workspace w1E not found",
+        "workspace_not_found",
+      ),
+    ),
+    true,
+  );
+  assert.equal(
+    isMissingHerdrResource(new Error("workspace w1E not found")),
+    true,
+  );
+  assert.equal(
+    isMissingHerdrResource(new Error("pane not found: w1:p1")),
+    true,
+  );
+  assert.equal(
+    isMissingHerdrResource(new Error("tab was already closed")),
+    true,
+  );
+  assert.equal(isMissingHerdrResource(new Error("agent is gone")), true);
+  // Transient and unrelated failures must NOT trigger the rebuild path.
+  assert.equal(isMissingHerdrResource(new Error("agent_pane_busy")), false);
+  assert.equal(isMissingHerdrResource(new Error("command failed")), false);
+  assert.equal(isMissingHerdrResource(new Error("herdr exited 1")), false);
+});
+
+test("a user-closed workspace rebuilds fresh instead of retrying the stale id", async () => {
+  // Regression: Herdr's real dead-workspace error names the id between the
+  // resource and the verdict. The recovery matcher required them adjacent, so
+  // the rebuild never ran and every later spawn silently failed against the
+  // closed workspace for the rest of the session.
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  const first = await controller.openWorker({
+    category: "terminals",
+    title: "bt-1",
+    cwd: "C:\work",
+    launch: ["tail", "-F"],
+  });
+  assert.equal(first?.workspaceId, "w1");
+  // The user closes the whole "Pi Workers" workspace in Herdr.
+  herdr.closeWorkspace("w1");
+  const rebuilt = await controller.openWorker({
+    category: "terminals",
+    title: "bt-2",
+    cwd: "C:\work",
+    launch: ["tail", "-F"],
+  });
+  assert.ok(rebuilt, "the next worker still opens after the workspace died");
+  assert.equal(rebuilt.workspaceId, "w2", "a fresh workspace is built");
+  assert.equal(herdr.callCount("workspace create"), 2);
+});
+
+test("closing the last pane forgets the pane-less workspace", async () => {
+  // Regression: closing the observer of a terminal that settled while its
+  // pane was still opening took the workspace down with it, but the
+  // controller kept the dead workspace id, so the next bg_start failed
+  // `tab create` against a closed workspace and never spawned again.
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  const observer = await controller.openObserver({
+    terminalId: "bt-1",
+    title: "t",
+    cwd: "C:\work",
+    stdoutPath: "a.log",
+    stderrPath: "b.log",
+  });
+  assert.ok(observer);
+  const firstWorkspace = observer.pane.workspaceId;
+  await observer.settle();
+  assert.equal(
+    controller.workspaceId,
+    undefined,
+    "the controller forgets the workspace Herdr just closed",
+  );
+  const next = await controller.openObserver({
+    terminalId: "bt-2",
+    title: "t2",
+    cwd: "C:\work",
+    stdoutPath: "c.log",
+    stderrPath: "d.log",
+  });
+  assert.ok(next, "the next observer opens a fresh workspace");
+  assert.notEqual(next.pane.workspaceId, firstWorkspace);
+  assert.equal(herdr.callCount("workspace create"), 2);
+  assert.equal(
+    herdr.calls.filter((a) => a[0] === "tab" && a[1] === "create").length,
+    0,
+    "no wasted tab create against the closed workspace",
+  );
+});
+
+test("a taken-over observer pane keeps the workspace alive for the next worker", async () => {
+  const herdr = fakeHerdr();
+  const controller = makeController({ herdr });
+  const observer = await controller.openObserver({
+    terminalId: "bt-1",
+    title: "t",
+    cwd: "C:\work",
+    stdoutPath: "a.log",
+    stderrPath: "b.log",
+  });
+  assert.ok(observer);
+  assert.equal(await observer.takeOver(), true);
+  await observer.settle();
+  assert.equal(
+    controller.workspaceId,
+    "w1",
+    "a taken-over pane survives settle, so the workspace stays",
+  );
+  const next = await controller.openObserver({
+    terminalId: "bt-2",
+    title: "t2",
+    cwd: "C:\work",
+    stdoutPath: "c.log",
+    stderrPath: "d.log",
+  });
+  assert.ok(next);
+  assert.equal(next.pane.workspaceId, "w1", "reused workspace");
+  assert.equal(herdr.callCount("workspace create"), 1);
 });

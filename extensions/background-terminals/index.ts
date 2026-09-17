@@ -31,11 +31,21 @@ import type {
   ExtensionContext,
   ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import {
+  getAgentDir,
+  getMarkdownTheme,
+  getShellConfig,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { TerminalSnapshot } from "./src/domain.ts";
-import { TerminalManager, type TerminalManagerShape } from "./src/manager.ts";
+import {
+  setTerminalShell,
+  TerminalManager,
+  type TerminalManagerShape,
+  type TerminalShell,
+} from "./src/manager.ts";
 import {
   BG_KILL_PARAMETER_DESCRIPTIONS,
   BG_KILL_TOOL_DESCRIPTION,
@@ -70,6 +80,35 @@ import {
 } from "../shared/herdr-workspace.ts";
 
 const WIDGET_KEY = "background-terminals";
+
+/**
+ * The shell background terminals run in.
+ *
+ * A background terminal must use the SAME shell the model writes for — pi's
+ * bash tool — so this mirrors pi's own resolution (`shellPath` from
+ * settings.json, else the discovered Git Bash on Windows/other platforms).
+ * Spawning bash-written commands in cmd.exe made them echo themselves and
+ * exit in milliseconds, which also tore the watcher pane straight back down.
+ *
+ * Undefined only when no shell can be resolved at all (no bash installed):
+ * the manager then keeps its platform fallback rather than failing bg_start.
+ */
+function resolveTerminalShell(
+  ctx: ExtensionContext,
+): TerminalShell | undefined {
+  try {
+    const settings = SettingsManager.create(ctx.cwd, getAgentDir());
+    const config = getShellConfig(settings.getShellPath());
+    return {
+      shell: config.shell,
+      args: config.args,
+      commandTransport: config.commandTransport,
+      commandPrefix: settings.getShellCommandPrefix(),
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 export default function (pi: ExtensionAPI) {
   let runtime: TerminalRuntime | undefined;
@@ -190,6 +229,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     sessionContext = ctx;
     if (ctx.hasUI) ui = ctx.ui;
+    // The session's shell is resolved once: every background terminal runs
+    // the same bash the model's bash tool uses (see resolveTerminalShell).
+    setTerminalShell(resolveTerminalShell(ctx));
     // One ephemeral "Pi Workers" workspace per parent pi session, shared via
     // the process-wide singleton; observers allocate into it lazily on the
     // first bg_start.
@@ -216,6 +258,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     sessionContext = undefined;
     resultDelivery.clear();
+    setTerminalShell(undefined);
     unsubStatus?.();
     unsubStatus = undefined;
     try {
@@ -279,9 +322,13 @@ export default function (pi: ExtensionAPI) {
         manager.start({ command, title, cwd }),
       );
 
-      // Inside Herdr, open a watcher pane over the terminal's spill files
-      // (silent no-op outside Herdr or when spilling is unavailable).
-      await coordinator?.attach(snap);
+      // Inside Herdr, open a watcher pane over the terminal's spill files.
+      // Visualization is OPTIONAL and must not sit on the launch critical
+      // path: attach() schedules the pane open and returns immediately. The
+      // coordinator keeps it tracked (joinable via /ps, cancellable on
+      // settle/shutdown), so a slow or unavailable Herdr never delays
+      // bg_start and never leaks a late pane.
+      coordinator?.attach(snap);
 
       return {
         content: [{ type: "text", text: buildStartResult(snap) }],

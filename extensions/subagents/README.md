@@ -1,9 +1,11 @@
 # Subagents extension
 
 Delegates work to autonomous background subagents with their own context
-windows. Two real backends — **pi** (in-process `AgentSession`) and **codex**
-(`codex app-server` JSON-RPC, or a native Codex TUI in a Herdr pane) — behind
-one normalized manager, plus native Herdr panes when available.
+windows. Two backends share one normalized manager: **pi** (a native Pi TUI
+in a Herdr pane when available, otherwise an in-process `AgentSession`) and
+**codex** (a native Codex TUI in Herdr, otherwise `codex app-server` JSON-RPC).
+Nesting-capable Pi children stay in-process so their constrained spawn bridge
+can call the parent manager.
 
 ## Tools (model-facing)
 
@@ -26,8 +28,8 @@ Profiles define the spawn policy the model can choose by name:
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `harness`, `model`, `thinking` | Backend, model, reasoning effort.                                                                                                                                                                                                                              |
 | `systemPrompt` / `promptFile`  | System prompt injected above the task (`promptFile` is relative to the agent dir). Exactly one may be set.                                                                                                                                                     |
-| `tools`                        | Explicit pi tool allowlist (builtin names: `read write edit bash grep find ls`). Everything not listed is excluded.                                                                                                                                            |
-| `readOnly`                     | Removes write/edit/bash and forces Codex sandbox `read-only` regardless of project trust.                                                                                                                                                                      |
+| `tools`                        | Explicit Pi tool allowlist covering builtin, extension, and custom tools. Unlisted tools are excluded; `ask_question` and an authorized nesting bridge are added intentionally.                                                                                |
+| `readOnly`                     | Defaults to a Pi allowlist of `read,grep,find,ls` (overridden by explicit `tools`, plus the question/authorized nesting bridge), blocking PowerShell and other unlisted tools. Forces Codex sandbox `read-only` regardless of project trust.                   |
 | `allowChildren` + `maxDepth`   | Constrained nesting: the child may spawn only these profiles, at most `maxDepth` deep (top level = 0). Nesting-capable children run **headless** (the child's `subagent_spawn` is an in-process callback). Default `maxDepth` = 1 when `allowChildren` is set. |
 | `contextMode`                  | `standalone` (default) or `summary` (prepends a compact parent-session context frame).                                                                                                                                                                         |
 | `cwd`                          | Default working directory for this profile (resolved relative to the caller's cwd); the model's explicit `working_dir` overrides it.                                                                                                                           |
@@ -52,14 +54,14 @@ Example (this setup):
   },
   "coder": {
     "harness": "pi",
-    "model": "opencode-go/deepseek-v4-flash",
+    "model": "opencode-go/deepseek-v4.1-flash",
     "thinking": "high",
     "allowChildren": ["reviewer"],
     "maxDepth": 1
   },
   "reviewer": {
     "harness": "pi",
-    "model": "opencode-go/gpt-5.6-luna",
+    "model": "opencode-go/deepseek-v4.1-flash",
     "thinking": "high",
     "readOnly": true
   }
@@ -97,13 +99,35 @@ Children inherit the parent's project-trust decision:
 - codex: untrusted directories run `sandbox: read-only`; read-only profiles
   force read-only even when trusted.
 
+Explicit `tools` is an authoritative capability grant, even with `readOnly`:
+only include tools appropriate for the intended restriction.
+
+Pi tool policy is identical for fresh and resumed workers. Default coder
+profiles keep ordinary tools but exclude parent orchestration; narrowed
+profiles use an explicit allowlist. **This is not an OS sandbox:** trusted
+extensions still load and execute code. Project trust is unchanged.
+
 ## Reliability model
 
 - Settlements are delivered once, FIFO, keyed by `id:runGeneration` — a
   session that runs multiple turns never overwrites an undelivered result.
 - `wait`/`cancel` consume exactly the run generations they return; aborted
   waiters leave results queued for automatic delivery.
-- Delivered results are immutable `structuredClone` snapshots.
+- Delivered results copy only the settled run's notification fields; the full
+  transcript is neither cloned nor retained by the delivery queue.
+
+## Remaining limits
+
+- Tool allowlists do not reduce extension discovery/loading. Minimal per-role
+  extension bundles and workflow-child loadouts remain follow-up work.
+- Read-only profiles currently have no dedicated Git status/diff tools; they
+  also do not automatically gain `rg`/`fd` extension tools.
+- Native Herdr launch/resume policy is regression-tested with injected
+  runners; this delivery does not claim an end-to-end live-TUI benchmark.
+- Context/compaction settings, model effort, and SDK versions are unchanged.
+
+See [the delivery record](../../docs/reviews/2026-09-17-pi-fix-plan.md)
+and [Herdr lifecycle documentation](../../docs/takeover-herdr.md).
 
 ## Tests
 

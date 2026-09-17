@@ -1,7 +1,7 @@
 # Workers, take-over, and tails in Herdr
 
 When this Pi session runs inside Herdr (`HERDR_ENV=1`), all extensions route
-their observable work through one shared ephemeral
+their observable work through one shared session-owned
 `Pi Workers · <project> · <short-session>` workspace (created lazily with
 `--no-focus`; the first requested category claims the workspace's initial
 tab/root pane, the second gets a `tab create`). Everything is opened with an
@@ -11,7 +11,8 @@ shims on Windows — and panes are reported to Herdr as agents
 focused/prompted/keystroked by pane id.
 
 - **Subagents** (`/subagents`): Pi and Codex children spawn as real
-  interactive TUIs in the Subagents tab. Take-over focuses the live pane
+  interactive TUIs in the Subagents tab, except nesting-capable Pi children,
+  which stay in-process to retain their constrained spawn bridge. Take-over focuses the live pane
   (running, never interrupting) or reopens + resumes the exact native session
   (settled, `pi --session <path>` / `codex resume <id>`).
 - **Background terminals** (`/ps`): a watcher pane in the Terminals tab tails
@@ -71,8 +72,12 @@ deleted on scope close or manager prune, so children stay discoverable and
 resumable (`/subagents` take-over reopens with `pi --session <path>`). One
 child self-gate: the summaries extension disables itself when `PI_SUBAGENT=1`
 (a recap inside a child is unorchestrated extra model activity that races the
-pane closing); other child extensions stay available, and tools were already
-excluded at launch.
+pane closing); other child extensions still load, but the launch policy
+filters their tools. Read-only/custom-tool profiles use a strict allowlist
+covering builtin, extension, and custom tools; default profiles use the
+parent-orchestration denylist. `ask_question` remains available intentionally.
+This is a tool-surface restriction, not an OS sandbox or a minimal extension
+runtime; project-trust checks remain in force.
 
 ### Pi discovery and parsing
 
@@ -82,8 +87,9 @@ UUID and passes `--session-id <uuid>` plus a **persistent per-agent
 same tree normal sessions live in; stale files from a crashed parent can
 never hijack the watch because discovery checks our fresh session id). The
 launch also carries `--name`, the model, the thinking level, the project
-trust flag, and the child tool denylist (`subagent_*`, `workflow`,
-`ask_user`). The session JSONL is then tailed incrementally — replay from
+trust flag, and the resolved child tool policy: `--tools` for narrowed
+profiles, otherwise `--exclude-tools` for parent orchestration (`subagent_*`,
+`workflow`, `ask_user`). The session JSONL is then tailed incrementally — replay from
 byte 0 when the file is found (a fast tiny prompt may have already produced
 the whole run), deduped by entry id so compaction rewrites never double-emit —
 and translated into the existing normalized `SubagentEvent`s (user/assistant
@@ -115,7 +121,8 @@ events. The rollout path and native session id are stored in subagent meta.
 ### Steering, interrupts, take-over
 
 Resumes rebuild the EXACT original launch policy in a fresh pane: Pi gets
-`--session <path>` plus model, thinking level, tool exclusions, trust, and
+`--session <path>` plus model, thinking level, the same tool allowlist or
+exclusions, trust, and
 name; Codex gets `resume <id>` plus `--cd`, model, reasoning effort via
 `-c model_reasoning_effort=...`, sandbox, approval, and (for a queued settled
 run) its marked positional prompt.
@@ -141,18 +148,23 @@ run) its marked positional prompt.
 
 ## Background terminals: observer workspace
 
-On every `bg_start`, when Herdr is available, the extension opens a watcher
-pane in the shared workspace's Terminals tab running a plain spill-file tail
-(Windows uses two `Get-Content -Wait` background jobs merged with
-`Receive-Job`; POSIX uses `tail -F`). Lifecycle:
+On every `bg_start`, when Herdr is available, the extension schedules a
+watcher pane in the shared workspace's Terminals tab running a plain
+spill-file tail (Windows uses two `Get-Content -Wait` background jobs merged
+with `Receive-Job`; POSIX uses `tail -F`). The open is **asynchronous**: it
+never sits on the launch critical path, but it stays tracked (joinable by
+`/ps`, cancelled on settle/shutdown, abandoned after a total deadline with a
+late pane stopped instead of leaked). Lifecycle:
 
-- `/ps` selecting a terminal marks its observer **taken over** and focuses it;
-  the pane then survives the terminal's settle at its shell prompt.
+- `/ps` selecting a terminal joins a still-opening observer, marks it
+  **taken over**, and focuses it; the pane then survives the terminal's
+  settle at its shell prompt.
 - When the terminal settles, the watcher is stopped (ctrl+c) and — unless
   taken over — the pane is closed. The process itself is owned by the
   terminal manager before and after; this layer only observes.
-- `session_shutdown` closes the workspace through the shared controller
-  (`disposeWorkerWorkspace`), bounded.
+- `session_shutdown` stops tracking, settles observers (and any late pane),
+  and closes the workspace through the shared controller
+  (`disposeWorkerWorkspace`), all bounded.
 
 ## Shared workspace
 
@@ -162,8 +174,49 @@ worker of a category runs in the tab's root pane, later workers split the
 newest pane), pane-level `run`/`send-keys`/`prompt`/`report-agent`/
 `report-metadata`/`focus`/`close`/`agent get`, explicit technical agent names,
 and rollback that never leaves a closed root pane as the next split target
-(active pane tracking). `extensions/shared/herdr-pane.ts` keeps the
+(active pane tracking). A pane close is reported as closed / missing /
+**uncertain**: an unconfirmed close keeps the pane quarantined with a bounded
+retry, and the workspace is never forgotten while a quarantined pane may
+still be live — so a replacement workspace can never leak beside a survivor.
+
+Session shutdown follows the same rule. `controller.dispose()` stops new
+allocation synchronously, makes at most one bounded `workspace close` attempt
+per call (concurrent calls share that attempt), and never retries on its own —
+retries happen only when a dispose or a new session asks for them, so cleanup
+cannot spin and a transport that recovers can still confirm the close. A
+workspace is forgotten only when its teardown is confirmed — a confirmed
+`workspace close`, or Herdr auto-closing the workspace after the last
+**tracked** pane was confirmed closed. Panes are dropped from tracking only on
+a confirmed teardown, so an unconfirmed pane (or timeout) keeps the workspace
+owned and a later dispose retries it. The process-wide registry retains such
+controllers in a pending set instead of discarding them; a replacement session
+retries those closes first and, while any close stays unconfirmed, does not
+create a second workspace (allocation reports unavailable and the caller falls
+back). An open that races disposal abandons its pane with a bounded close
+instead of launching work into a closing workspace. No path releases ownership
+while an unconfirmed pane or close is outstanding: a workspace that cannot be
+confirmed closed stays owned and visible instead of being hidden.
+`extensions/shared/herdr-pane.ts` keeps the
 split/run/close API used by `/btw` and re-exports the runner.
+
+## Remaining limits
+
+- Ownership is process-local; recovery after a crash or server restart is not
+  persisted. If the process exits while a close is unconfirmed, the retry
+  record dies with it. No cleanup discovers or closes unrelated workspaces by
+  label.
+- Retrying an uncertain pane close is bounded (three attempts per quarantine)
+  but can delay the next allocation while transport timeouts expire.
+- While a previous workspace close stays unconfirmed, a new session does not
+  create a replacement workspace: each blocked attempt can cost up to one
+  `closeTimeoutMs` (10 s) per retained workspace. The next session retries, so
+  workspace creation resumes as soon as the close is confirmed.
+- Observer deadlines abandon attachment; they do not forcibly cancel an
+  already-running Herdr CLI request. Late panes are cleaned when it returns.
+- Observer creation is not delayed for short commands, and visualization
+  failure still falls back silently to the terminal overlay.
+- Regression tests use injected runners. A live Herdr smoke test and latency
+  benchmark are not claimed by this delivery.
 
 ## Files
 

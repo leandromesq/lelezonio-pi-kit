@@ -168,35 +168,117 @@ export class TerminalManager extends Context.Service<
 
 // --- Process helpers ------------------------------------------------------------
 
-function shellInvocation(command: string) {
+/**
+ * The shell a background terminal runs in.
+ *
+ * A background terminal MUST use the same shell as pi's built-in bash tool
+ * (settings.json `shellPath`, or the discovered Git Bash on Windows): the
+ * model writes commands for that shell, so spawning them in cmd.exe made
+ * ordinary bash commands (`$(...)`, `&&`, `sleep`) echo themselves and exit in
+ * milliseconds. The built-in `bash` tool resolves a bash on Windows even with
+ * no `shellPath` set, so cmd.exe is only ever the last-resort fallback for a
+ * machine with no bash at all.
+ */
+export interface TerminalShell {
+  readonly shell: string;
+  /** Args placed before the command (e.g. `-c`); ignored for stdin transport. */
+  readonly args: readonly string[];
+  /**
+   * `"stdin"` delivers the command through the child's stdin instead of argv
+   * (legacy WSL bash needs `-s`). The manager still closes stdin immediately,
+   * so the terminal has no input surface and sees EOF at once.
+   */
+  readonly commandTransport?: "argv" | "stdin";
+  /** pi's `shellCommandPrefix`, prepended like the built-in bash tool. */
+  readonly commandPrefix?: string;
+  /**
+   * cmd.exe needs ONE pre-quoted command string passed verbatim (`true`); a
+   * real executable (bash, pwsh) must keep Node's own argv quoting (`false`).
+   */
+  readonly windowsVerbatimArguments?: boolean;
+}
+
+/** The historical platform shell, used only when no shell could be resolved. */
+export function platformDefaultShell(): TerminalShell {
   if (process.platform === "win32") {
-    const shell = process.env.ComSpec ?? "cmd.exe";
     return {
-      shell,
-      args: ["/d", "/s", "/c", `"${command}"`],
+      shell: process.env.ComSpec ?? "cmd.exe",
+      args: ["/d", "/s", "/c"],
       windowsVerbatimArguments: true,
     };
   }
+  return { shell: "/bin/sh", args: ["-c"] };
+}
+
+let shellSpec: TerminalShell | undefined;
+
+/** Extensions seed the session shell (from pi settings) before first use. */
+export function setTerminalShell(shell: TerminalShell | undefined): void {
+  shellSpec = shell;
+}
+
+/** The shell background terminals run in. */
+export function terminalShell(): TerminalShell {
+  return shellSpec ?? platformDefaultShell();
+}
+
+export interface ShellInvocation {
+  readonly shell: string;
+  readonly args: string[];
+  readonly windowsVerbatimArguments: boolean;
+  /** Command to write to stdin for `commandTransport: "stdin"`; undefined
+   * when the command already rides in `args`. */
+  readonly writeToStdin?: string;
+}
+
+/** Build the spawn invocation for one command line under `spec`. */
+export function shellInvocation(
+  command: string,
+  spec: TerminalShell = terminalShell(),
+): ShellInvocation {
+  const resolved = spec.commandPrefix
+    ? `${spec.commandPrefix}\n${command}`
+    : command;
+  if (spec.commandTransport === "stdin") {
+    return {
+      shell: spec.shell,
+      args: [...spec.args],
+      windowsVerbatimArguments: false,
+      writeToStdin: resolved,
+    };
+  }
+  const verbatim = spec.windowsVerbatimArguments === true;
   return {
-    shell: "/bin/sh",
-    args: ["-c", command],
-    windowsVerbatimArguments: false,
+    shell: spec.shell,
+    // cmd.exe parses the single `/c` payload itself, so it must arrive as one
+    // pre-quoted (and verbatim) argument — exactly as before this change.
+    args: [...spec.args, verbatim ? `"${resolved}"` : resolved],
+    windowsVerbatimArguments: verbatim,
   };
 }
 
-/** Signal the whole process group on POSIX so descendants (servers a shell
- * command spawned) die with it; a wedged child must not orphan its tree. */
+/**
+ * Signal the whole process group on POSIX so descendants (servers a shell
+ * command spawned) die with it; a wedged child must not orphan its tree.
+ *
+ * Windows needs the opposite treatment. `taskkill /T` WITHOUT `/F` cannot
+ * terminate console processes at all — it fails with "this process can only
+ * be terminated forcefully (with /F)" and, for the tree, "one or more child
+ * processes were still running". The direct-kill fallback then takes out only
+ * the shell, so the real work (a dev server's `node.exe`) is reparented and
+ * leaked forever: once the shell's pid is gone, `taskkill /T` can no longer
+ * reach its children, and the SIGKILL escalation has nothing left to address.
+ * The tree must therefore be killed with `/T /F` in ONE pass while the shell
+ * is still alive. Nothing is given up by this: the "graceful" Windows pass was
+ * never graceful (Node's SIGTERM on Windows is already a forceful
+ * TerminateProcess), it just leaked.
+ */
 function killTree(child: ChildProcess, signal: NodeJS.Signals) {
   if (process.platform === "win32" && child.pid) {
     try {
       const killer = spawn(
         "taskkill",
-        [
-          "/pid",
-          String(child.pid),
-          "/T",
-          ...(signal === "SIGKILL" ? ["/F"] : []),
-        ],
+        ["/pid", String(child.pid), "/T", "/F"],
         { stdio: "ignore", windowsHide: true },
       );
       killer.once("error", () => {
@@ -559,23 +641,32 @@ const makeManager = Effect.gen(function* () {
       );
 
       const doStart = Effect.gen(function* () {
-        const { shell, args, windowsVerbatimArguments } = shellInvocation(
-          options.command,
-        );
+        const invocation = shellInvocation(options.command);
         const child = yield* Effect.try({
           try: () =>
-            spawn(shell, args, {
+            spawn(invocation.shell, invocation.args, {
               cwd: options.cwd,
               env: process.env,
-              // stdin IGNORED: there is no input surface, ever. A process
-              // that reads stdin sees EOF immediately.
-              stdio: ["ignore", "pipe", "pipe"],
+              // stdin is IGNORED: there is no input surface, ever. A process
+              // that reads stdin sees EOF immediately. (The legacy WSL bash
+              // path pipes in the command once and closes stdin at once, so
+              // that guarantee is unchanged.)
+              stdio: [
+                invocation.writeToStdin === undefined ? "ignore" : "pipe",
+                "pipe",
+                "pipe",
+              ],
               // Own process group on POSIX → group kill takes the whole tree.
               detached: process.platform !== "win32",
-              windowsVerbatimArguments,
+              windowsVerbatimArguments: invocation.windowsVerbatimArguments,
             }),
           catch: (error) => new SpawnError({ message: boundedError(error) }),
         });
+        // Deliver the command and immediately close stdin: the terminal can
+        // never be written to afterwards.
+        if (invocation.writeToStdin !== undefined) {
+          child.stdin?.end(invocation.writeToStdin);
+        }
 
         const id = `bt-${++counter}`;
         const entryRef = () => entries.get(id);

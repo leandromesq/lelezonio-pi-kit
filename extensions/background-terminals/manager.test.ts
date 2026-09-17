@@ -16,7 +16,11 @@ import type { TerminalSnapshot } from "./src/domain.ts";
 import {
   MAX_RUNNING,
   MAX_TRACKED,
+  platformDefaultShell,
+  setTerminalShell,
+  shellInvocation,
   TerminalManager,
+  terminalShell,
   type TerminalManagerShape,
 } from "./src/manager.ts";
 import { createTerminalRuntime, runTool } from "./src/runtime.ts";
@@ -172,10 +176,23 @@ test("kill settles a never-exiting process as killed and resolves after settle; 
     assert.equal(report[0].status, "killed");
     assert.equal(report[0].killed, true);
     assert.equal(report[0].wasRunning, true);
-    assert.match(report[0].exit, /^SIG/);
+    assert.ok(report[0].exit.length > 0);
     const after = manager.view.get(snap.id);
     assert.equal(after?.status, "killed");
-    assert.ok(after?.signal);
+    // POSIX kills are signal-based (SIGTERM → SIGKILL). A Windows kill cannot
+    // be: `taskkill /T /F` force-terminates the tree and the OS reports a
+    // plain exit code with NO signal — the same reason the SIGTERM-grace tests
+    // in this file already skip on win32. The user-facing contract (status
+    // "killed", killed true, wasRunning true) is identical on both platforms;
+    // only the exit detail differs. Reporting a fabricated SIGTERM here would
+    // be a lie about how the process actually died.
+    if (process.platform === "win32") {
+      assert.equal(after?.signal, undefined);
+      assert.equal(/^SIG/.test(report[0].exit), false);
+    } else {
+      assert.match(report[0].exit, /^SIG/);
+      assert.ok(after?.signal);
+    }
 
     const second = await runTool(runtime, manager.kill([snap.id]));
     assert.equal(second[0].killed, false);
@@ -732,4 +749,141 @@ test("status returns the snapshot and rejects unknown ids with the known list", 
       /Unknown terminal id "bt-999"\. Known: bt-1\./,
     );
   });
+});
+
+// --- shell resolution (regression: bg_start must not use cmd.exe) ------------------
+
+test("the configured shell is used verbatim with one -c argv", () => {
+  const invocation = shellInvocation("echo $HOME && sleep 1", {
+    shell: "C:\Program Files\Git\bin\bash.exe",
+    args: ["-c"],
+  });
+  assert.equal(invocation.shell, "C:\Program Files\Git\bin\bash.exe");
+  assert.deepEqual(invocation.args, ["-c", "echo $HOME && sleep 1"]);
+  assert.equal(
+    invocation.windowsVerbatimArguments,
+    false,
+    "a real executable keeps Node's argv quoting",
+  );
+  assert.equal(invocation.writeToStdin, undefined);
+});
+
+test("shellCommandPrefix is prepended like the built-in bash tool", () => {
+  const invocation = shellInvocation("npm test", {
+    shell: "/bin/bash",
+    args: ["-c"],
+    commandPrefix: "set -e",
+  });
+  assert.deepEqual(invocation.args, ["-c", "set -e\nnpm test"]);
+});
+
+test("legacy stdin-transport shells deliver the command on stdin", () => {
+  const invocation = shellInvocation("echo hi", {
+    shell: "bash",
+    args: ["-s"],
+    commandTransport: "stdin",
+  });
+  assert.deepEqual(invocation.args, ["-s"]);
+  assert.equal(invocation.writeToStdin, "echo hi");
+});
+
+test("the platform fallback keeps cmd.exe's single verbatim payload", () => {
+  const invocation = shellInvocation("echo hi", {
+    shell: "cmd.exe",
+    args: ["/d", "/s", "/c"],
+    windowsVerbatimArguments: true,
+  });
+  assert.deepEqual(invocation.args, ["/d", "/s", "/c", '"echo hi"']);
+  assert.equal(invocation.windowsVerbatimArguments, true);
+});
+
+test("setTerminalShell overrides the platform default and resets to it", () => {
+  const previous = terminalShell();
+  try {
+    setTerminalShell({ shell: "/usr/bin/env", args: ["bash", "-c"] });
+    assert.deepEqual(terminalShell().args, ["bash", "-c"]);
+    const invocation = shellInvocation("ls");
+    assert.equal(invocation.shell, "/usr/bin/env");
+    assert.deepEqual(invocation.args, ["bash", "-c", "ls"]);
+  } finally {
+    setTerminalShell(undefined);
+  }
+  assert.deepEqual(terminalShell(), platformDefaultShell());
+  assert.deepEqual(previous, platformDefaultShell());
+});
+
+test("a background terminal really runs in the injected shell", async () => {
+  // End-to-end proof: bash-only syntax completes successfully once the shell
+  // is injected, and the terminal settles instead of dying instantly.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bg-shell-"));
+  try {
+    setTerminalShell({
+      shell: "bash",
+      args: ["-c"],
+    });
+    await withManager(async (manager, runtime) => {
+      const snap = await runTool(
+        runtime,
+        manager.start({
+          command: "echo $((6 * 7))",
+          title: "shell",
+          cwd: dir,
+        }),
+      );
+      const { snap: done } = await settlement(manager, snap.id);
+      assert.equal(done.status, "done", done.errorText ?? "");
+      const out = await runTool(runtime, manager.status(snap.id));
+      assert.equal(out.stdout.text.trim(), "42");
+    });
+  } finally {
+    setTerminalShell(undefined);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a killed terminal leaves no orphaned grandchild behind", async () => {
+  // Regression: on Windows the graceful pass used `taskkill /T` WITHOUT `/F`,
+  // which cannot terminate console processes (`this process can only be
+  // terminated forcefully`). It failed, the direct-kill fallback took out only
+  // the shell, and the real work was reparented — unreachable by the later
+  // `/F` escalation because the shell's pid was already gone. Every
+  // never-exiting fixture leaked that way (~40 idle node processes per suite
+  // run), and a killed dev server would have leaked the same way.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bg-orphan-"));
+  const pidFile = path.join(dir, "pid.txt");
+  try {
+    await withManager(async (manager, runtime) => {
+      // The GRANDCHILD writes its own pid: the shell's pid is not what leaks.
+      const script =
+        'const fs = require("node:fs");' +
+        `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));` +
+        "setInterval(() => {}, 1000);";
+      const snap = await runTool(
+        runtime,
+        manager.start({ command: nodeCmd(script), title: "orphan", cwd: dir }),
+      );
+      assert.equal(
+        await pollUntil(() => fs.existsSync(pidFile), 10_000),
+        true,
+        "the fixture reported its pid",
+      );
+      const grandchild = Number(fs.readFileSync(pidFile, "utf8").trim());
+      assert.equal(
+        processGone(grandchild),
+        false,
+        "the fixture is alive before the kill",
+      );
+
+      const [result] = await runTool(runtime, manager.kill([snap.id]));
+      assert.equal(result.killed, true);
+
+      assert.equal(
+        await pollUntil(() => processGone(grandchild), 10_000),
+        true,
+        "the killed terminal's grandchild must not outlive it",
+      );
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

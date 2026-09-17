@@ -318,11 +318,12 @@ const child = yield* Effect.try({
 
 Decisions and rationale:
 
-- **Shell execution.** The model supplies one `command` string; run it through the platform
-  shell (`/bin/sh -c` on POSIX, `cmd.exe /d /s /c` on Windows) so pipes/redirection work. Honor the
-  user's configured shell if convenient (`~/.pi/agent/settings.json` has
-  `"shellPath": ".../zsh-with-rc"`), but `/bin/sh` is an acceptable v1 — document which you
-  pick in the tool description. Never `shell: true` with an args array (double-parse trap).
+- **Shell execution.** The model supplies one `command` string; run it through the same shell
+  the built-in `bash` tool uses (pi's `getShellConfig(settings.shellPath)`, i.e. bash with `-c`)
+  so pipes/redirection work AND a command written for the bash tool behaves identically here.
+  Never `shell: true` with an args array (double-parse trap). The one exception is the legacy
+  WSL bash path (`bash -s`, stdin transport): the command is piped in once and stdin is closed
+  immediately, so the "no subsequent input" guarantee still holds.
 - **`stdin: "ignore"`** enforces the "no subsequent input" requirement at the OS level. A
   process that tries to read stdin gets EOF immediately, which is the honest contract (and the
   tool description must say so — interactive commands will exit or hang, and `bg_kill` is the
@@ -519,7 +520,7 @@ All model-facing strings live in `src/prompt.ts` (subagents convention). Registe
 
 ```ts
 parameters: Type.Object({
-  command: Type.String({ description: "Shell command line to run in the background (sh -c on POSIX, cmd.exe /d /s /c on Windows). It receives no stdin (EOF immediately); interactive commands will not work." }),
+  command: Type.String({ description: "Shell command line to run in the background (run in the same bash the bash tool uses, so bash syntax works). It receives no stdin (EOF immediately); interactive commands will not work." }),
   title: Type.String({ description: "Short human-readable name shown in listings and the UI" }),
   working_dir: Type.Optional(Type.String({ description: "Working directory (default: current working directory)" })),
 })

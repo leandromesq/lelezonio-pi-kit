@@ -136,11 +136,12 @@ test("settlement racing observer creation stops the late pane instead of leaking
     workspace: () => controller,
   });
 
-  const attaching = coordinator.attach(makeTerminal());
+  // attach() only SCHEDULES the open (bg_start must not block on it).
+  coordinator.attach(makeTerminal());
   await Promise.resolve();
   const settling = coordinator.settle(makeTerminal({ status: "done" }));
   release(late.handle);
-  await Promise.all([attaching, settling]);
+  await settling;
 
   assert.equal(late.settleCalls(), 1);
   assert.equal(await coordinator.takeOver("bt-1"), false);
@@ -263,4 +264,90 @@ test("coordinator satisfies the interface surface for index.ts wiring", () => {
   assert.equal(typeof coordinator.takeOver, "function");
   assert.equal(typeof coordinator.settle, "function");
   assert.equal(typeof coordinator.dispose, "function");
+});
+
+// --- async attachment: bg_start must never wait for the pane ----------------------
+
+/** A controller whose observer open is held until the test releases it. */
+function gatedController() {
+  let openCalls = 0;
+  let release!: (handle: TerminalObserverHandle) => void;
+  const opened = new Promise<TerminalObserverHandle>((resolve) => {
+    release = resolve;
+  });
+  const controller = {
+    available: () => true,
+    openObserver: () => {
+      openCalls += 1;
+      return opened;
+    },
+  } as unknown as WorkerWorkspaceController;
+  return {
+    controller,
+    release: (handle: TerminalObserverHandle) => release(handle),
+    openCalls: () => openCalls,
+  };
+}
+
+test("attach returns immediately while a slow pane open is still in flight (bg_start never waits)", () => {
+  const gated = gatedController();
+  const coordinator = createTerminalObserverCoordinator({
+    workspace: () => gated.controller,
+  });
+  const started = Date.now();
+  coordinator.attach(makeTerminal());
+  // Returning synchronously is the contract: bg_start must not await this.
+  assert.ok(Date.now() - started < 50);
+  assert.equal(gated.openCalls(), 1);
+});
+
+test("takeOver joins an in-flight attachment instead of falling back to the overlay", async () => {
+  const late = fakeHandle();
+  const gated = gatedController();
+  const coordinator = createTerminalObserverCoordinator({
+    workspace: () => gated.controller,
+  });
+  coordinator.attach(makeTerminal());
+  const takeover = coordinator.takeOver("bt-1");
+  await Promise.resolve();
+  gated.release(late.handle);
+  assert.equal(await takeover, true);
+  assert.equal(late.takeOverCalls(), 1);
+});
+
+test("dispose during a slow attach settles the late pane and never publishes it", async () => {
+  const late = fakeHandle();
+  const gated = gatedController();
+  const coordinator = createTerminalObserverCoordinator({
+    workspace: () => gated.controller,
+  });
+  coordinator.attach(makeTerminal());
+  const disposing = coordinator.dispose();
+  gated.release(late.handle);
+  await disposing;
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(late.settleCalls(), 1);
+  assert.equal(await coordinator.takeOver("bt-1"), false);
+});
+
+test("the attach deadline bounds a hung open, stops the late pane, and blocks re-attach", async () => {
+  const late = fakeHandle();
+  const gated = gatedController();
+  const coordinator = createTerminalObserverCoordinator({
+    workspace: () => gated.controller,
+    attachTimeoutMs: 20,
+  });
+  coordinator.attach(makeTerminal());
+  assert.equal(
+    await coordinator.takeOver("bt-1"),
+    false,
+    "a /ps selection stops waiting at the attach deadline",
+  );
+  // The open is still running; a duplicate attach must not open a second pane.
+  coordinator.attach(makeTerminal({ title: "renamed" }));
+  assert.equal(gated.openCalls(), 1);
+  gated.release(late.handle);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(late.settleCalls(), 1, "the late pane is stopped, not leaked");
 });

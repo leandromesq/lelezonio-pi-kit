@@ -23,7 +23,7 @@ const RESULT_STDOUT_MAX_LINES = 40;
 const RESULT_STDERR_MAX_LINES = 20;
 
 export const BG_START_TOOL_DESCRIPTION =
-  "Start a long-running shell command as a background terminal (executed via the platform shell — sh -c on POSIX, cmd.exe /d /s /c on Windows). " +
+  "Start a long-running shell command as a background terminal (run in the same shell as the bash tool — bash -c, honoring settings.json shellPath). " +
   "Fire-and-forget: this returns immediately with an id, and you get a message with the final output when the process exits. " +
   "The process receives NO stdin (immediate EOF) and there is no way to send input later — interactive commands will not work; use bg_kill to stop a stuck one. " +
   `Terminals are session-scoped: they are killed when the session ends or reloads. Output shown to you is tail-truncated (stdout ${formatSize(STATUS_STDOUT_MAX)}, stderr ${formatSize(STATUS_STDERR_MAX)}); the full logs are captured to files and in the /ps viewer. ` +
@@ -34,13 +34,14 @@ export const BG_START_PROMPT_SNIPPET =
 
 export const BG_START_PROMPT_GUIDELINES = [
   "Use bg_start for commands expected to run long or indefinitely (servers, watch modes, long builds); use the regular bash tool for quick commands.",
+  "bg_start commands run in the same bash shell as the bash tool (bash syntax, quoting, and $VAR expansion all work).",
   "bg_start processes receive no stdin — never start a command that requires interactive input.",
   "After bg_start, keep working; the exit result arrives automatically. Use bg_status only when you need current output before continuing.",
 ];
 
 export const BG_START_PARAMETER_DESCRIPTIONS = {
   command:
-    "Shell command line to run in the background (sh -c on POSIX, cmd.exe /d /s /c on Windows). It receives no stdin (EOF immediately); interactive commands will not work.",
+    "Shell command line to run in the background (run in the same bash the bash tool uses, so bash syntax works). It receives no stdin (EOF immediately); interactive commands will not work.",
   title: "Short human-readable name shown in listings and the UI",
   workingDir: "Working directory (default: current working directory)",
 };

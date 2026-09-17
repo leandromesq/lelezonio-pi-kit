@@ -13,6 +13,7 @@ const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 /** Tools that headless children must not receive. Everything else stays enabled. */
 export const CHILD_EXCLUDED_TOOL_NAMES = [
   "subagent_spawn",
+  "subagent_send",
   "subagent_wait",
   "subagent_cancel",
   "subagent_check",
@@ -21,7 +22,10 @@ export const CHILD_EXCLUDED_TOOL_NAMES = [
   "ask_user",
 ] as const;
 
-/** Fresh SDK options avoid turning the denylist into an accidental allowlist. */
+/** Fresh SDK options avoid turning the denylist into an accidental allowlist.
+ * Workflow children have no read-only profile, so this stays a denylist; the
+ * subagents profiles that DO narrow their surface are enforced with a real
+ * `tools` allowlist instead (see subagents/src/profile.ts). */
 export function childToolPolicy() {
   return { excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES] };
 }

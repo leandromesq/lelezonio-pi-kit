@@ -62,7 +62,7 @@ import type {
 import { shellQuote } from "../../../shared/herdr-workspace.ts";
 import type { SubagentSession } from "../backend.ts";
 import { codexPolicyCliArgs } from "./codex-policy.ts";
-import { extraExcludedTools } from "../profile.ts";
+import { childToolLoadout } from "../profile.ts";
 import type {
   ReasoningEffort,
   RunOutcome,
@@ -237,17 +237,6 @@ async function resolveCodexCliPath(): Promise<string | undefined> {
 
 // --- Launch commands --------------------------------------------------------------
 
-const CHILD_EXCLUDED_TOOL_NAMES = [
-  "subagent_spawn",
-  "subagent_wait",
-  "subagent_cancel",
-  "subagent_check",
-  "subagent_list",
-  "subagent_send",
-  "workflow",
-  "ask_user",
-] as const;
-
 /** Quote one token of a `pane run` command line for the pane's shell
  * (pwsh on Windows, POSIX sh elsewhere). The launcher minimizes what needs
  * quoting — the pane runs only `node <launcher> <spec.json>` — but those
@@ -401,12 +390,16 @@ function piLaunchArgs(
     task.parent.inheritedThinkingLevel) as ReasoningEffort | undefined;
   if (thinking) argv.push("--thinking", thinking);
   argv.push(trustFlag(task.parent.projectTrusted));
-  const childExcludes = [
-    ...CHILD_EXCLUDED_TOOL_NAMES,
-    ...extraExcludedTools(task.parent.toolPolicy),
-  ];
-  if (childExcludes.length > 0)
-    argv.push("--exclude-tools", [...new Set(childExcludes)].join(","));
+  // A narrowed profile (read-only or explicit `tools`) launches with a real
+  // `--tools` allowlist that the CLI applies to built-in, extension, and
+  // custom tools, so PowerShell and extension-backed execution tools cannot
+  // survive an incomplete exclusion universe. Herdr workers are never
+  // nesting-capable (nested children are always headless), so no spawn
+  // bridge is granted. The same policy feeds fresh launches and resumes.
+  const loadout = childToolLoadout(task.parent.toolPolicy);
+  if (loadout.tools) argv.push("--tools", [...loadout.tools].join(","));
+  if (loadout.exclude.length > 0)
+    argv.push("--exclude-tools", [...loadout.exclude].join(","));
   return argv;
 }
 
