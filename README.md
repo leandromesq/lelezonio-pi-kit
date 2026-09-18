@@ -96,7 +96,7 @@ node extensions/browser/node_modules/playwright-core/cli.js install chromium
 cp settings.example.json settings.json
 ```
 
-Restore any private state you want to keep from the backup, especially `auth.json`, `trust.json`, `sessions/`, and local memory directories. Merge rather than blindly replacing `settings.json`; keep `"packages": []` unless you deliberately install an optional package such as Hound.
+Restore any private state you want to keep from the backup, especially `auth.json`, `trust.json`, `sessions/`, and local memory directories. Merge rather than blindly replacing `settings.json`; keep `"packages": []` unless you deliberately install an optional package such as DonSeTch or `pi-observational-memory`.
 
 Start Pi and use `/login` if authentication was not restored. See [SETUP.md](SETUP.md) for migration instructions, Windows commands, prerequisites, updates, and configuration.
 
@@ -104,15 +104,15 @@ Start Pi and use `/login` if authentication was not restored. See [SETUP.md](SET
 
 Profiles live in [`subagents.json`](subagents.json):
 
-| Profile    | Harness | Model                           | Thinking | Intended use                        |
-| ---------- | ------- | ------------------------------- | -------- | ----------------------------------- |
-| `planner`  | Pi      | `openai-codex/gpt-5.6-luna`     | `high`   | Difficult planning and architecture |
-| `coder`    | Pi      | `opencode-go/deepseek-v4-flash` | `high`   | Implementation                      |
-| `reviewer` | Pi      | `opencode-go/gpt-5.6-luna`      | `high`   | Review and research                 |
+| Profile    | Harness | Model                             | Thinking | Intended use                        |
+| ---------- | ------- | --------------------------------- | -------- | ----------------------------------- |
+| `planner`  | Pi      | `opencode-go/deepseek-v4.1-flash` | `high`   | Difficult planning and architecture |
+| `coder`    | Pi      | `opencode-go/deepseek-v4.1-flash` | `high`   | Implementation                      |
+| `reviewer` | Pi      | `opencode-go/deepseek-v4.1-flash` | `high`   | Review and research                 |
 
 Explicit spawn fields override profile values. Profile values override per-harness defaults. The concurrency cap is also configured in this file.
 
-The main agent executes small tasks directly and delegates only independent, complex, long, or parallelizable work to subagents. All named profiles run on the Pi harness: `planner` uses `openai-codex/gpt-5.6-luna`, `coder` uses `opencode-go/deepseek-v4-flash`, and `reviewer` uses `opencode-go/gpt-5.6-luna`. Profile-less spawns also default to the Pi harness. The Codex harness is reserved for tasks that require tooling unavailable in Pi, such as an MCP integration exposed by Codex CLI. See AGENTS.md for the full delegation policy.
+The main agent executes small tasks directly and delegates only independent, complex, long, or parallelizable work to subagents. All named profiles run on the Pi harness with `opencode-go/deepseek-v4.1-flash`, and profile-less spawns default to the Pi harness and the same model. The Codex harness keeps `gpt-5.6-luna` and is the only exception, reserved for subagents that call Codex CLI or that require tooling unavailable in Pi, such as an MCP integration exposed by Codex CLI. See AGENTS.md for the full delegation policy.
 
 These model names reflect my accounts and preferences. Replace them with models and providers available from `pi --list-models`; Codex-harness profiles additionally require a compatible Codex CLI installation.
 

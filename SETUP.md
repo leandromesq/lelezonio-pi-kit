@@ -17,7 +17,7 @@ Optional:
 - [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login` for `/git`
 - An SSH-accessible host running [Herdr](https://github.com/epilande/herdr) for persistent remote agents
 - System `fd` and `rg` binaries; the file-search extension can provision supported builds when they are missing
-- Python 3.11+ if you want the optional Hound web-research tools
+- A Chromium build (system, Playwright-cached, or Edge on Windows) for the optional DonSeTch tier-2 browser bypasses; tier-1 fetch and keyless search work without one
 
 ## Clean installation
 
@@ -103,19 +103,38 @@ Copy any memory directories you intentionally use. Keep the backup until the new
 
 Merge any model, provider, retry, or keybinding preferences from your previous settings. Keep `packages` empty unless you deliberately want additional Pi packages alongside this repository.
 
-## Hound web research
+## DonSeTch web research
 
-Hound is an optional local MCP service that adds `web_search`, `web_fetch`, `web_crawl`, and `web_screenshot` to Pi. It has two parts: the Pi extension and the Python engine. Its maintained upstream is [dondai44423/master-fetch](https://github.com/dondai44423/master-fetch), which supersedes the old `dondai1234` repository. Install both; the commands below keep the engine isolated from system Python and record the extension only in the user's private `settings.json`, not in this repository's tracked setup.
-
-### Install on Linux or macOS
+[DonSeTch](https://github.com/dondai44423/donsetch) is an optional local research service that adds `web_search`, `web_fetch`, `web_crawl`, and `web_screenshot` to Pi. It is the successor to Hound (`dondai44423/master-fetch`): one self-contained Rust binary instead of a Python engine plus Playwright, with keyless search and no API keys required. It is recorded only in the user's private `settings.json`, not in this repository's tracked setup:
 
 ```sh
-python3 -m venv ~/.local/share/hound-venv
-~/.local/share/hound-venv/bin/python -m pip install --upgrade "hound-mcp[all]==13.2.0"
-~/.local/share/hound-venv/bin/python -m playwright install chromium
+pi install npm:donsetch
+```
 
+The package ships a Pi extension that spawns the `donsetch mcp` binary and registers its tools natively, so there is no separate MCP client block to write. The install is deliberately unpinned: DonSeTch is actively released and `pi update --extensions` self-updates both the extension and the binary.
+
+### Binary download
+
+npm 12 blocks `postinstall` scripts for packages not covered by `allowScripts`. Pi's npm directory is approved once so package installs and updates fetch the matching binary automatically:
+
+```sh
+cd ~/.pi/agent/npm
+npm install-scripts approve donsetch --no-allow-scripts-pin
+```
+
+If the binary is ever missing, the extension downloads it at session start. To repair it without restarting Pi:
+
+```sh
+node ~/.pi/agent/npm/node_modules/donsetch/install.js
+```
+
+### CLI (optional)
+
+The extension resolves the binary through the package; a `PATH` shim makes the CLI (`donsetch doctor`, `donsetch fetch`, `donsetch keys`) available in a terminal:
+
+```sh
 mkdir -p ~/.local/bin
-ln -sfn ~/.local/share/hound-venv/bin/hound ~/.local/bin/hound
+ln -sfn ~/.pi/agent/npm/node_modules/donsetch/bin/donsetch.js ~/.local/bin/donsetch
 ```
 
 Make sure `~/.local/bin` is on `PATH` before starting Pi:
@@ -124,63 +143,47 @@ Make sure `~/.local/bin` is on `PATH` before starting Pi:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### Install on Windows without administrator access
+On Windows no shim is needed: `npm install -g donsetch` puts `donsetch` on `PATH` without administrator access.
 
-```powershell
-$venv = Join-Path $HOME ".local\share\hound-venv"
-python -m venv $venv
-& "$venv\Scripts\python.exe" -m pip install --upgrade "hound-mcp[all]==13.2.0"
-& "$venv\Scripts\python.exe" -m playwright install chromium
-
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-$scripts = "$venv\Scripts"
-if (($userPath -split ";") -notcontains $scripts) {
-  [Environment]::SetEnvironmentVariable("Path", "$scripts;$userPath", "User")
-}
-```
-
-Restart the terminal after changing the user `PATH`.
-
-Install the Pi extension globally from the maintained repository. `v13.2.0` includes the earlier SSRF fixes and is the matching current release:
+### Verify
 
 ```sh
-pi install git:github.com/dondai44423/master-fetch@v13.2.0
+donsetch doctor          # fast local sweep, ~1 second
+donsetch doctor --deep   # adds live browser and egress probes
 ```
 
-Do not install the legacy `npm:@houndmcp/hound-mcp-pi` package; its published release still points at the old repository.
+DonSeTch reuses a Chromium build for tier-2 bot-wall bypasses. It auto-discovers system Chromium, Playwright's cached builds, or Edge on Windows. On Linux, `xvfb` keeps that browser headful/off-screen; without it tier 2 falls back to headless, which is less stealthy but still functional. Keyless search needs no API key; optional BYOK providers are added with `donsetch keys add <provider> <key>`.
 
-Verify the engine and browser dependencies:
+### Migrate from Hound
+
+Hound is superseded. Remove the Pi extension, then the Python engine if you no longer want it:
 
 ```sh
-hound --version
-hound --doctor
+pi remove git:github.com/dondai44423/master-fetch@v13.2.0
+pi remove npm:@houndmcp/hound-mcp-pi
 ```
 
-Restart Pi after installing or updating the extension. Hound's keyless search needs no API key.
-
-### Migrate the legacy npm extension
-
-If Hound was installed through the old npm package, replace it with the maintained Git source:
+Optional cleanup of the Hound engine itself (the Playwright Chromium it installed keeps working as DonSeTch's tier-2 browser):
 
 ```sh
-pi uninstall npm:@houndmcp/hound-mcp-pi
-pi install git:github.com/dondai44423/master-fetch@v13.2.0
+rm -rf ~/.local/share/hound-venv ~/.local/bin/hound
 ```
+
+The four tool names are unchanged, so nothing else in this setup depends on which engine serves them.
 
 ### Update
 
-Update the engine with its built-in updater. To update the Pi extension, replace its pinned tag with the matching release from [Hound's releases](https://github.com/dondai44423/master-fetch/releases):
-
 ```sh
-hound -u
-pi install git:github.com/dondai44423/master-fetch@v<version>
+pi update --extensions   # latest package plus its matching binary
+donsetch update          # binary self-update only
+donsetch rollback        # revert the binary to the previous release
 ```
 
 ## Subagents
 
 Configure named roles, per-harness defaults, and the concurrency cap in [`subagents.json`](subagents.json). A spawn can select a `profile`; explicit `harness`, `model`, and `reasoning_effort` values override it. Profile values override the selected harness defaults.
 
-The included configuration runs all named profiles on the Pi harness: `planner` uses `openai-codex/gpt-5.6-luna`, `coder` uses `opencode-go/deepseek-v4-flash`, and `reviewer` uses `opencode-go/gpt-5.6-luna`. The Codex harness remains available for tasks that require Codex-only tooling or when the Pi worker transport is unavailable. Replace unavailable models with entries from:
+The included configuration runs every named profile on the Pi harness with `opencode-go/deepseek-v4.1-flash`: `planner`, `coder`, and `reviewer`. Profile-less spawns also default to the Pi harness and that model. The Codex harness keeps `gpt-5.6-luna` and is the only exception, reserved for subagents that call Codex CLI or when the Pi worker transport is unavailable. Replace unavailable models with entries from:
 
 ```sh
 pi --list-models

@@ -48,7 +48,7 @@ Example (this setup):
 {
   "planner": {
     "harness": "pi",
-    "model": "openai-codex/gpt-5.6-luna",
+    "model": "opencode-go/deepseek-v4.1-flash",
     "thinking": "high",
     "readOnly": true
   },
