@@ -10,22 +10,20 @@ import {
   getAgentDir,
   getMarkdownTheme,
   keyHint,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadNamingConfig } from "../auto-naming/src/config.ts";
 import { generateTaskTitle } from "../auto-naming/src/title-generator.ts";
+import { formatElapsed } from "../shared/format.ts";
 import { loadRemoteAgentsConfig } from "./src/config.ts";
 import {
   buildRemotePrompt,
   deriveTitle,
   redactSensitiveText,
 } from "./src/context.ts";
-import {
-  formatElapsed,
-  isRemoteAgentActive,
-  type RemoteAgentSnapshot,
-} from "./src/domain.ts";
+import { isRemoteAgentActive, type RemoteAgentSnapshot } from "./src/domain.ts";
 import { HerdrClient } from "./src/herdr-client.ts";
 import { RemoteAgentManager } from "./src/manager.ts";
 import { RemoteJobStore } from "./src/persistence.ts";
@@ -33,6 +31,7 @@ import { detectLocalGitProject, remoteProjectLocation } from "./src/project.ts";
 import { openRemoteUi } from "./src/remote-ui.ts";
 import { SshTransport } from "./src/transport.ts";
 import { openRemotePicker } from "./src/ui/dashboard.ts";
+import { remoteActivityStatus } from "./src/ui/status.ts";
 
 const RESULT_TRANSCRIPT_CHARS = 24 * 1024;
 
@@ -47,7 +46,7 @@ class RemoteProjectMissingError extends Error {
 }
 
 function describe(snapshot: RemoteAgentSnapshot) {
-  return `${snapshot.id} [${snapshot.status}] "${snapshot.title}" (${snapshot.host}:${snapshot.remoteCwd}, ${formatElapsed(snapshot)})`;
+  return `${snapshot.id} [${snapshot.status}] "${snapshot.title}" (${snapshot.host}:${snapshot.remoteCwd}, ${formatElapsed(snapshot.createdAt, snapshot.settledAt)})`;
 }
 
 function snapshotDetails(snapshot: RemoteAgentSnapshot) {
@@ -69,13 +68,61 @@ function completionMessage(snapshot: RemoteAgentSnapshot) {
     snapshot.transcript.trim().slice(-RESULT_TRANSCRIPT_CHARS) ||
     "(no result captured)";
   const heading = structured ? "Remote result" : "Remote transcript tail";
-  return `Remote agent ${snapshot.id} "${snapshot.title}" ${snapshot.status} after ${formatElapsed(snapshot)}.\nWorkspace: ${snapshot.host}:${snapshot.remoteCwd}${snapshot.workspaceId ? ` (${snapshot.workspaceId})` : ""}\n\n## ${heading}\n\n${output}`;
+  return `Remote agent ${snapshot.id} "${snapshot.title}" ${snapshot.status} after ${formatElapsed(snapshot.createdAt, snapshot.settledAt)}.\nWorkspace: ${snapshot.host}:${snapshot.remoteCwd}${snapshot.workspaceId ? ` (${snapshot.workspaceId})` : ""}\n\n## ${heading}\n\n${output}`;
+}
+
+/**
+ * Custom-message envelope shared by the remote result messages: the recap
+ * card of `/summary` (section 10 of `docs/ui-conventions.md`) with the label
+ * on the `customMessageLabel` role and the body in `customMessageText`.
+ */
+function remoteMessageCard(options: {
+  theme: Theme;
+  expanded: boolean;
+  icon: string;
+  label: string;
+  meta: string;
+  content: string;
+}) {
+  const { theme } = options;
+  const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+  box.addChild(
+    new Text(
+      options.icon +
+        " " +
+        theme.fg("customMessageLabel", theme.bold(options.label)) +
+        theme.fg("muted", ` · ${options.meta}`),
+      0,
+      0,
+    ),
+  );
+  if (options.expanded) {
+    box.addChild(
+      new Markdown(options.content, 0, 1, getMarkdownTheme(), {
+        color: (text) => theme.fg("customMessageText", text),
+      }),
+    );
+  } else {
+    box.addChild(
+      new Text(
+        theme.fg("muted", `(${keyHint("app.tools.expand", "to expand")})`),
+        0,
+        0,
+      ),
+    );
+  }
+  return box;
 }
 
 export default function (pi: ExtensionAPI) {
   const agentDir = getAgentDir();
   const config = loadRemoteAgentsConfig(
     path.join(agentDir, "remote-agents.json"),
+  );
+  // The store is created up front (it performs no I/O until it is used) so a
+  // session can tell, without SSH, whether any remote job is tracked.
+  const store = new RemoteJobStore(
+    path.join(agentDir, "remote-agents", "jobs.json"),
   );
   let managerPromise: Promise<RemoteAgentManager> | undefined;
   let manager: RemoteAgentManager | undefined;
@@ -89,31 +136,9 @@ export default function (pi: ExtensionAPI) {
 
   const updateStatus = () => {
     if (!ui || !manager) return;
-    const jobs = manager.list();
-    if (jobs.length === 0) {
-      ui.setStatus("remote-agents", undefined);
-      return;
-    }
-    const running = jobs.filter(
-      (job) => job.status === "working" || job.status === "starting",
-    ).length;
-    const blocked = jobs.filter((job) => job.status === "blocked").length;
-    const unreachable = jobs.filter(
-      (job) => job.status === "unreachable",
-    ).length;
-    const done = jobs.length - running - blocked - unreachable;
-    const parts = [
-      running ? `${running} running` : "",
-      blocked ? `${blocked} blocked` : "",
-      unreachable ? `${unreachable} offline` : "",
-      done ? `${done} done` : "",
-    ].filter(Boolean);
     ui.setStatus(
       "remote-agents",
-      ui.theme.fg(
-        unreachable ? "warning" : running ? "accent" : "muted",
-        `remote: ${parts.join(" · ")}`,
-      ),
+      remoteActivityStatus(ui.theme, manager.list()),
     );
   };
 
@@ -213,9 +238,6 @@ export default function (pi: ExtensionAPI) {
     const promise = (async () => {
       const transport = new SshTransport(config);
       const client = new HerdrClient(transport);
-      const store = new RemoteJobStore(
-        path.join(agentDir, "remote-agents", "jobs.json"),
-      );
       const next = new RemoteAgentManager(config, client, store);
       next.setOnSettled((snapshot) => void deliverCompletion(snapshot));
       next.setOnBlocked((snapshot) => void deliverBlocked(snapshot));
@@ -249,6 +271,13 @@ export default function (pi: ExtensionAPI) {
     const startedGeneration = ++sessionGeneration;
     if (ctx.hasUI) ui = ctx.ui;
     if (ctx.mode !== "tui") return;
+    // Every child Herdr agent is a full Pi process that loads this extension.
+    // Initializing the manager with nothing to reconcile would still upload the
+    // remote helper and ping it over SSH, per process, for no benefit. Real
+    // work (commands, tools, completion delivery) still creates it on demand.
+    // A registry that cannot be read reports tracked jobs and keeps the old
+    // behavior instead of silently dropping them.
+    if (!store.hasTrackedJobs()) return;
     void getManager().catch((error) => {
       // Initialization was still in flight when the session was shut down or
       // replaced: this captured ctx is stale (the runner was invalidated) and
@@ -282,20 +311,20 @@ export default function (pi: ExtensionAPI) {
         details?.status === "done"
           ? theme.fg("success", "✓")
           : theme.fg("warning", "■");
-      if (!expanded)
-        return new Text(
-          `${icon} ${theme.fg("accent", details?.id ?? "remote")} ${theme.fg("muted", details?.title ?? "remote task")}\n${theme.fg("dim", keyHint("app.tools.expand", "to expand"))}`,
-          0,
-          0,
-        );
-      return new Markdown(
-        typeof message.content === "string"
-          ? message.content
-          : "Remote agent completed",
-        0,
-        0,
-        getMarkdownTheme(),
-      );
+      const meta = [details?.id ?? "remote", details?.title, details?.status]
+        .filter(Boolean)
+        .join(" · ");
+      return remoteMessageCard({
+        theme,
+        expanded,
+        icon,
+        label: "Remote result",
+        meta,
+        content:
+          typeof message.content === "string"
+            ? message.content
+            : "Remote agent completed",
+      });
     },
   );
 
@@ -304,20 +333,20 @@ export default function (pi: ExtensionAPI) {
     (message, { expanded }, theme) => {
       const details = message.details as
         { id?: string; title?: string } | undefined;
-      if (!expanded)
-        return new Text(
-          `${theme.fg("warning", "?")} ${theme.fg("accent", details?.id ?? "remote")} ${theme.fg("muted", "needs input")}\n${theme.fg("dim", keyHint("app.tools.expand", "to expand"))}`,
-          0,
-          0,
-        );
-      return new Markdown(
-        typeof message.content === "string"
-          ? message.content
-          : "Remote agent needs input",
-        0,
-        0,
-        getMarkdownTheme(),
-      );
+      const meta = [details?.id ?? "remote", details?.title, "needs input"]
+        .filter(Boolean)
+        .join(" · ");
+      return remoteMessageCard({
+        theme,
+        expanded,
+        icon: theme.fg("warning", "?"),
+        label: "Remote input",
+        meta,
+        content:
+          typeof message.content === "string"
+            ? message.content
+            : "Remote agent needs input",
+      });
     },
   );
 

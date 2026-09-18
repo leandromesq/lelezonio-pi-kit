@@ -1,5 +1,7 @@
 /** Compact, defensive context-window utilization formatting for child agents. */
 
+import { formatTokens } from "./format.ts";
+
 export interface ContextUtilization {
   /** Current conversation context occupancy; null while it is unknown after compaction. */
   tokens?: number | null;
@@ -27,10 +29,7 @@ export function contextPercent(usage: ContextUtilization) {
 }
 
 export function formatCompactTokens(count: number) {
-  if (count < 1000) return Math.round(count).toString();
-  if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-  if (count < 1000000) return `${Math.round(count / 1000)}k`;
-  return `${(count / 1000000).toFixed(1)}M`;
+  return formatTokens(count);
 }
 
 /**
@@ -43,5 +42,5 @@ export function formatContextUtilization(usage: ContextUtilization) {
   const capacity = usableCapacity(usage.contextWindow);
   if (capacity === undefined) return "";
   const percent = contextPercent(usage);
-  return `${percent === undefined ? "?" : percent}%/${formatCompactTokens(capacity)}`;
+  return `${percent === undefined ? "?" : percent}%/${formatTokens(capacity)}`;
 }

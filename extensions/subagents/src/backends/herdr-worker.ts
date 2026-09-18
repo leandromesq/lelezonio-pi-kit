@@ -1427,10 +1427,23 @@ interface WorkerState {
   initialTurnObserved: boolean;
   initialWatchdogActive: boolean;
   initialWatchdogGeneration: number;
+  /** The EXACT text handed to the pane for the initial prompt (for Codex that
+   * text carries the run marker, hence not the raw task prompt). The first
+   * observed user turn is compared against it: a truncated or fragmented
+   * submission must fail the run instead of letting the worker proceed. */
+  initialSentText?: string;
 }
 
 const boundedError = (error: unknown) =>
   (error instanceof Error ? error.message : String(error)).slice(0, 4096);
+
+/** Compare the prompt the child actually submitted with the text we typed.
+ * Line-ending translation (CRLF vs LF) and surrounding whitespace are not
+ * mismatches; anything else is a truncated or fragmented submission. */
+function samePromptText(sent: string, submitted: string): boolean {
+  const normalize = (text: string) => text.replace(/\r\n?/g, "\n").trim();
+  return normalize(sent) === normalize(submitted);
+}
 
 function clearInterruptFallback(state: WorkerState) {
   if (state.interruptedFallback) clearTimeout(state.interruptedFallback);
@@ -1462,11 +1475,40 @@ export function trySpawnHerdrWorker(
   kind: WorkerKind,
   task: SpawnTask,
 ): Effect.Effect<SubagentSession | undefined, SpawnError, Scope.Scope> {
+  return trySpawnHerdrWorkerOutcome(kind, task).pipe(
+    Eff.map((outcome) => outcome.session),
+  );
+}
+
+/** Result of one Herdr worker spawn attempt, carrying the reason on failure. */
+export interface HerdrWorkerSpawnOutcome {
+  readonly session: SubagentSession | undefined;
+  /** Why no worker was created; absent when `session` is set. */
+  readonly error?: string;
+}
+
+/**
+ * Diagnostic variant of {@link trySpawnHerdrWorker}: it resolves the same
+ * session (or undefined) but ALSO reports WHY the worker was not created, so a
+ * caller falling back to its in-process backend can surface the reason
+ * instead of degrading silently.
+ */
+export function trySpawnHerdrWorkerOutcome(
+  kind: WorkerKind,
+  task: SpawnTask,
+): Effect.Effect<HerdrWorkerSpawnOutcome, never, Scope.Scope> {
   return Eff.suspend(() => {
     const deps = herdrWorkerDeps();
-    if (!deps.workspace()?.available()) return Eff.succeed(undefined);
+    if (!deps.workspace()?.available())
+      return Eff.succeed({
+        session: undefined,
+        error: "Herdr workspace is unavailable",
+      });
     return makeHerdrWorkerSession(kind, task, deps).pipe(
-      Eff.orElseSucceed(() => undefined),
+      Eff.map((session) => ({ session, error: undefined })),
+      Eff.catch((error: unknown) =>
+        Eff.succeed({ session: undefined, error: boundedError(error) }),
+      ),
     );
   });
 }
@@ -1490,6 +1532,9 @@ export function makeHerdrWorkerSession(
       1,
       deps.initialSubmissionWatchdogMs ?? 10_000,
     );
+    // Phase 2 only needs to press Enter on likely-typed text, so it gets a
+    // short window instead of the full startup one.
+    const enterRetryWindowMs = Math.min(4_000, initialSubmissionWatchdogMs);
     const agentName = technicalAgentName(
       task.parent.parentSessionId ?? "session",
       task.logicalId ?? "sa",
@@ -1554,6 +1599,15 @@ export function makeHerdrWorkerSession(
     const specDir = deps.specDirRoot();
     let launchSeq = 0;
     const writtenSpecs = new Set<string>();
+    /**
+     * Env for one worker pane. `PI_SUBAGENT=1` (inside `writeWorkerLaunchSpec`)
+     * already marks the process as a child; the observational-memory
+     * extension also reads `PI_OBSERVATIONAL_MEMORY_PASSIVE` and would
+     * otherwise run observer/reflector/dropper model calls and proactive
+     * compaction inside every worker session. A worker is an execution unit,
+     * not a long-lived session someone resumes, so memory work there is cost
+     * without benefit.
+     */
     const launchSpec = (argv: ReadonlyArray<string>) => {
       const { specPath, paneLaunch } = writeWorkerLaunchSpec(
         specDir,
@@ -1562,7 +1616,10 @@ export function makeHerdrWorkerSession(
         nodePath,
         argv,
         task.cwd,
-        askFilePath ? { PI_SUBAGENT_ASK_FILE: askFilePath } : {},
+        {
+          PI_OBSERVATIONAL_MEMORY_PASSIVE: "1",
+          ...(askFilePath ? { PI_SUBAGENT_ASK_FILE: askFilePath } : {}),
+        },
       );
       writtenSpecs.add(specPath);
       return { specPath, paneLaunch };
@@ -1882,8 +1939,8 @@ export function makeHerdrWorkerSession(
         ?.getAgentState()
         .catch(() => undefined);
       const message =
-        `Pi worker initial prompt made no observable first turn after an ` +
-        `Enter-only retry (Herdr state: ${reportedState ?? "unknown"}); ` +
+        `Pi worker initial prompt produced no observable first turn after ` +
+        `bounded submission retries (Herdr state: ${reportedState ?? "unknown"}); ` +
         `the worker remained at zero turns`;
       emit({ _tag: "BackendError", message });
       await report("blocked", message);
@@ -1894,22 +1951,44 @@ export function makeHerdrWorkerSession(
       });
     };
 
-    /** Watch the initial Pi submission in two bounded phases. The first phase
-     * gives the TUI time to consume the text and Enter. If no first user entry
-     * is observed, the second phase sends Enter only — never the text again —
-     * to recover the startup race seen with Pi workers. */
-    const startInitialSubmissionWatchdog = () => {
+    /** Fail a run whose first user turn is not the prompt we typed. The Herdr
+     * transport can truncate or fragment the text, and a worker acting on a
+     * fragment silently does the wrong task; the diagnostic names both sizes
+     * so the cause is obvious from the parent's side. */
+    const failInitialPromptMismatch = (submitted: string, sent: string) => {
+      const message =
+        `Pi worker submitted a different initial prompt than the one sent: ` +
+        `${submitted.length} characters submitted instead of ${sent.length}; ` +
+        `the prompt was truncated or fragmented in transit, so the run was ` +
+        `failed instead of letting the worker act on the wrong task`;
+      emit({ _tag: "BackendError", message });
+      void report("blocked", message);
+      settleRun({
+        _tag: "Failed",
+        errorText: message,
+        partialText: state.lastAssistantText || undefined,
+      });
+    };
+
+    /** Watch the initial Pi submission in three bounded phases. Phase 1 gives
+     * the TUI the full window to turn the already-delivered text + Enter into a
+     * first user entry. If nothing appears, phase 2 presses Enter only — the
+     * text most likely sits in the editor with its Enter lost, and retyping
+     * here would concatenate a second copy — with a shorter window because
+     * submitting typed text is fast. Only if BOTH produced nothing (so nothing
+     * was submitted and retyping cannot duplicate anything) does phase 3 retype
+     * the WHOLE prompt, because the transport may have dropped or truncated it
+     * during TUI startup. A final full window then settles as a failure. */
+    const startInitialSubmissionWatchdog = (promptText: string) => {
       if (kind !== "pi" || state.initialWatchdogActive) return;
       state.initialWatchdogActive = true;
       const generation = ++state.initialWatchdogGeneration;
-      const waitForProgress = async () => {
-        const deadline = clock() + initialSubmissionWatchdogMs;
+      const waitForProgress = async (windowMs: number) => {
+        const deadline = clock() + windowMs;
         // The attempt cap keeps a badly behaved fake clock/sleep from turning
         // this bounded watchdog into an infinite loop. Production clocks also
         // satisfy the deadline check on every poll.
-        const maxPolls =
-          Math.ceil(initialSubmissionWatchdogMs / Math.max(1, pollIntervalMs)) +
-          1;
+        const maxPolls = Math.ceil(windowMs / Math.max(1, pollIntervalMs)) + 1;
         for (let poll = 0; poll < maxPolls; poll += 1) {
           if (
             state.closed ||
@@ -1927,7 +2006,7 @@ export function makeHerdrWorkerSession(
       };
 
       void (async () => {
-        if (await waitForProgress()) return;
+        if (await waitForProgress(initialSubmissionWatchdogMs)) return;
         if (
           state.closed ||
           !state.runActive ||
@@ -1935,13 +2014,35 @@ export function makeHerdrWorkerSession(
           state.initialTurnObserved
         )
           return;
-        const pane = state.pane;
+        let pane = state.pane;
         if (!pane) {
           await failInitialSubmission();
           return;
         }
+        // Phase 2: Enter only. The text was already typed in phase 1, so a lost
+        // Enter is the most likely cause of the missing first turn and a
+        // retype would concatenate a duplicate prompt.
         await pane.sendEnter();
-        if (await waitForProgress()) return;
+        if (await waitForProgress(enterRetryWindowMs)) return;
+        if (
+          state.closed ||
+          !state.runActive ||
+          !state.initialWatchdogActive ||
+          state.initialTurnObserved
+        )
+          return;
+        pane = state.pane;
+        if (!pane) {
+          await failInitialSubmission();
+          return;
+        }
+        // Phase 3: nothing was submitted by either phase, so the transport can
+        // only have dropped or truncated the text during TUI startup; retyping
+        // the whole prompt cannot duplicate anything now, and an Enter-only
+        // retry would just submit an empty editor.
+        await pane.sendText(promptText);
+        await pane.sendEnter();
+        if (await waitForProgress(initialSubmissionWatchdogMs)) return;
         await failInitialSubmission();
       })().catch((error) => {
         if (
@@ -1967,8 +2068,14 @@ export function makeHerdrWorkerSession(
         if (!pane) throw new Error("subagent pane is closed");
         await pane.sendText(promptText);
         // Mark the text as delivered before any Enter call. If Enter races
-        // TUI startup, the watchdog may safely press Enter without retyping.
-        if (initial && kind === "pi") startInitialSubmissionWatchdog();
+        // TUI startup, the watchdog retries Enter only (phase 2) and only
+        // retypes the whole prompt once no submission exists at all (phase 3);
+        // the sent text is also the reference for verifying what the child
+        // actually submitted.
+        if (initial && kind === "pi") {
+          state.initialSentText = promptText;
+          startInitialSubmissionWatchdog(promptText);
+        }
         await pane.sendEnter();
         await report("working");
       })().catch((error) => {
@@ -2098,12 +2205,24 @@ export function makeHerdrWorkerSession(
         // session metadata in sync without duplicating it in the transcript.
         state.meta = { ...state.meta, modelLabel: parsed.state.modelLabel };
       }
-      if (
-        state.initialWatchdogActive &&
-        parsed.events.some((event) => event._tag === "UserMessage")
-      ) {
-        state.initialTurnObserved = true;
-        state.initialWatchdogActive = false;
+      if (state.initialWatchdogActive) {
+        const submitted = parsed.events.find(
+          (event) => event._tag === "UserMessage",
+        );
+        if (submitted?._tag === "UserMessage") {
+          state.initialTurnObserved = true;
+          state.initialWatchdogActive = false;
+          const sent = state.initialSentText;
+          // The child's first user turn MUST be the prompt we typed: a
+          // truncated or fragmented submission used to look like a healthy
+          // start. Emit what actually landed first (evidence for the parent),
+          // then fail the run before the worker acts on it.
+          if (sent !== undefined && !samePromptText(sent, submitted.text)) {
+            for (const event of parsed.events) emit(event);
+            failInitialPromptMismatch(submitted.text, sent);
+            return;
+          }
+        }
       }
       if (!state.runActive) return;
       if (!state.runStarted && parsed.events.length > 0) {

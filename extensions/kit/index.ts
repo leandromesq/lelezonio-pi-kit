@@ -194,7 +194,7 @@ function renderDetail(
   ];
   return body
     .flatMap((line) => line.split("\n"))
-    .map((line) => truncateToWidth(`  ${line}`, width));
+    .map((line) => truncateToWidth(`  ${line}`, width, "…"));
 }
 
 export default function kitExtension(pi: ExtensionAPI) {
@@ -233,7 +233,7 @@ export default function kitExtension(pi: ExtensionAPI) {
 
           return {
             render(width: number) {
-              const line = (text: string) => truncateToWidth(text, width);
+              const line = (text: string) => truncateToWidth(text, width, "…");
               return [
                 theme.fg("borderAccent", "─".repeat(Math.max(1, width))),
                 line(
@@ -258,14 +258,18 @@ export default function kitExtension(pi: ExtensionAPI) {
                 line(
                   theme.fg(
                     "dim",
-                    `${keybindings.getKeys("tui.select.up").join("/")}/${keybindings.getKeys("tui.select.down").join("/")} navigate · Enter choose · Esc close`,
+                    `${keybindings.getKeys("tui.select.up").join("/") || "up"}/${keybindings.getKeys("tui.select.down").join("/") || "down"} navigate · ${keybindings.getKeys("tui.select.confirm").join("/") || "enter"} choose · ${keybindings.getKeys("tui.select.cancel").join("/") || "esc"} close`,
                   ),
                 ),
                 theme.fg("borderAccent", "─".repeat(Math.max(1, width))),
               ];
             },
             handleInput(data: string) {
-              if (matchesKey(data, Key.escape)) return done(null);
+              if (
+                matchesKey(data, Key.escape) ||
+                keybindings.matches(data, "tui.select.cancel")
+              )
+                return done(null);
               list.handleInput(data);
               tui.requestRender();
             },

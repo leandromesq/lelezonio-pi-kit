@@ -7,3 +7,7 @@ test("repository text cannot inject terminal control sequences", () => {
     "before\u001b]52;c;Y2xpcGJvYXJk\u0007after\u001b[31mred\u001b[0m\u0001";
   assert.equal(sanitizeTerminalText(input), "beforeafterred");
 });
+
+test("diff text keeps tabs for the renderer's own column expansion", () => {
+  assert.equal(sanitizeTerminalText("a\tb"), "a\tb");
+});

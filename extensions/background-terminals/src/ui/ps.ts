@@ -18,6 +18,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { TerminalObserverCoordinator } from "../observer.ts";
 import { formatElapsed, formatExit, type TerminalSnapshot } from "../domain.ts";
 import type { TerminalReadModel } from "../manager.ts";
+import { viewportRows } from "../../../shared/ui/viewport.ts";
 import { createOutputLineCache, sanitizeText } from "./output-view.ts";
 
 /** One-line-safe rendering of model-provided text (titles, commands): a
@@ -31,6 +32,25 @@ function configuredKeys(
   binding: Parameters<KeybindingsManager["getKeys"]>[0],
 ) {
   return keybindings.getKeys(binding).join("/") || "unbound";
+}
+
+/** Pad to `width` cells (or truncate with `…`) so a bordered row stays square. */
+function pad(text: string, width: number): string {
+  const truncated = truncateToWidth(text, width, "…");
+  return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
+}
+
+/** Top/bottom border segment of a `border` panel, carrying its title. */
+function borderSegment(theme: Theme, width: number, title: string): string {
+  const label = title
+    ? ` ${truncateToWidth(title, Math.max(0, width - 3), "…")} `
+    : "";
+  const labelWidth = visibleWidth(label);
+  return (
+    theme.fg("border", "─") +
+    (label ? theme.fg("text", label) : "") +
+    theme.fg("border", "─".repeat(Math.max(0, width - 1 - labelWidth)))
+  );
 }
 
 function statusGlyph(snap: TerminalSnapshot, theme: Theme) {
@@ -231,34 +251,15 @@ class TerminalDashboard implements Component {
     }
   }
 
-  private pad(text: string, width: number): string {
-    const truncated = truncateToWidth(text, width);
-    return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
-  }
-
-  private borderSegment(width: number, title: string): string {
-    const theme = this.theme;
-    const label = title
-      ? ` ${truncateToWidth(title, Math.max(0, width - 3))} `
-      : "";
-    const labelWidth = visibleWidth(label);
-    return (
-      theme.fg("border", "─") +
-      (label ? theme.fg("text", label) : "") +
-      theme.fg("border", "─".repeat(Math.max(0, width - 1 - labelWidth)))
-    );
-  }
-
   render(width: number): string[] {
     const theme = this.theme;
     const terminals = this.terminals();
     reconcileDashboardSelection(this.selection, terminals);
 
-    const rows = this.tui.terminal.rows || 30;
     // Render exactly terminal rows - 1 so the overlay covers the header,
     // chat, editor, and extra footer lines while leaving pi's final footer
     // row visible.
-    const bodyHeight = Math.max(6, rows - 5);
+    const bodyHeight = viewportRows(this.tui.terminal.rows, 5, 6);
     const innerWidth = width - 2;
 
     const lines: string[] = [];
@@ -277,6 +278,7 @@ class TerminalDashboard implements Component {
       truncateToWidth(
         `  ${headerLeft}${" ".repeat(headerPad)}${headerRight}  `,
         width,
+        "…",
       ),
     );
 
@@ -284,7 +286,8 @@ class TerminalDashboard implements Component {
     const running = terminals.filter((s) => s.status === "running").length;
     lines.push(
       theme.fg("border", "╭") +
-        this.borderSegment(
+        borderSegment(
+          theme,
           innerWidth,
           `terminals · ${running} running / ${terminals.length}`,
         ) +
@@ -295,7 +298,7 @@ class TerminalDashboard implements Component {
     const divider = theme.fg("border", "│");
     const rowLines = this.renderRows(terminals, innerWidth, bodyHeight);
     for (let i = 0; i < bodyHeight; i++) {
-      lines.push(divider + this.pad(rowLines[i] ?? "", innerWidth) + divider);
+      lines.push(divider + pad(rowLines[i] ?? "", innerWidth) + divider);
     }
 
     // Bottom border
@@ -313,6 +316,7 @@ class TerminalDashboard implements Component {
           `  ${configuredKeys(this.keybindings, "tui.select.up")}/${configuredKeys(this.keybindings, "tui.select.down")}/jk select · ${configuredKeys(this.keybindings, "tui.select.confirm")} inspect · x kill · ${configuredKeys(this.keybindings, "tui.select.cancel")} close`,
         ),
         width,
+        "…",
       ),
     );
 
@@ -362,18 +366,25 @@ class TerminalDashboard implements Component {
 
       const rightWidth = visibleWidth(right);
       const leftMax = Math.max(0, width - rightWidth - 2);
-      const leftTruncated = truncateToWidth(left, leftMax);
+      const leftTruncated = truncateToWidth(left, leftMax, "…");
       const gap = Math.max(2, width - visibleWidth(leftTruncated) - rightWidth);
-      out.push(truncateToWidth(leftTruncated + " ".repeat(gap) + right, width));
+      out.push(
+        truncateToWidth(leftTruncated + " ".repeat(gap) + right, width, "…"),
+      );
     }
 
     if (start > 0) {
-      out[0] = truncateToWidth(theme.fg("dim", `   ... ${start} more`), width);
+      out[0] = truncateToWidth(
+        theme.fg("dim", `   … ${start} more`),
+        width,
+        "…",
+      );
     }
     if (start + height < terminals.length) {
       out[out.length - 1] = truncateToWidth(
-        theme.fg("dim", `   ... ${terminals.length - start - height} more`),
+        theme.fg("dim", `   … ${terminals.length - start - height} more`),
         width,
+        "…",
       );
     }
     return out;
@@ -514,26 +525,38 @@ class TerminalDetailView implements Component {
   }
 
   private viewportHeight(): number {
-    const rows = this.tui.terminal.rows || 30;
-    // The complete view renders viewport + 8 chrome rows (borders, header,
-    // command, tab, hints). rows - 9 makes the overlay ~terminal rows - 1.
-    return Math.max(6, rows - 9);
+    // The complete view renders viewport + 6 chrome rows (header, top border,
+    // command, tab, bottom border, hints), leaving pi's final footer row
+    // visible.
+    return viewportRows(this.tui.terminal.rows, 7, 6);
   }
 
   render(width: number): string[] {
     const theme = this.theme;
-    const border = theme.fg("borderAccent", "─".repeat(Math.max(1, width)));
+    const innerWidth = Math.max(1, width - 2);
+    const divider = theme.fg("border", "│");
     const lines: string[] = [];
     const snap = this.snap();
 
+    // Panel frame of `docs/ui-conventions.md` section 1: `border` box with
+    // the title on the top border, like the dashboard above it.
+    const topBorder = (label: string) =>
+      theme.fg("border", "╭") +
+      borderSegment(theme, innerWidth, label) +
+      theme.fg("border", "╮");
+    const bottomBorder =
+      theme.fg("border", "╰") +
+      theme.fg("border", "─".repeat(innerWidth)) +
+      theme.fg("border", "╯");
+    const row = (text: string) => divider + pad(text, innerWidth) + divider;
+
     if (!snap) {
-      lines.push(border);
-      lines.push(theme.fg("dim", `${this.id} is no longer tracked`));
-      lines.push(border);
+      lines.push(topBorder(`terminal · ${oneLine(this.id)}`));
+      lines.push(row(theme.fg("dim", `${this.id} is no longer tracked`)));
+      lines.push(bottomBorder);
       return lines;
     }
 
-    lines.push(border);
     const header =
       `${statusGlyph(snap, theme)} ` +
       theme.fg("accent", theme.bold(`${snap.id} · ${oneLine(snap.title)}`)) +
@@ -545,14 +568,11 @@ class TerminalDetailView implements Component {
         ? theme.fg("muted", ` · ${formatExit(snap)}`)
         : "") +
       theme.fg("dim", ` · ${snap.cwd}`);
-    lines.push(truncateToWidth(header, width));
+    lines.push(truncateToWidth(header, width, "…"));
+    lines.push(topBorder(`terminal · ${oneLine(snap.id)}`));
     lines.push(
-      truncateToWidth(
-        theme.fg("dim", "$ ") + theme.fg("text", oneLine(snap.command)),
-        width,
-      ),
+      row(theme.fg("dim", "$ ") + theme.fg("text", oneLine(snap.command))),
     );
-    lines.push(border);
 
     // Stream tab line: which stream is active, both sizes.
     const active = this.stream;
@@ -562,9 +582,8 @@ class TerminalDetailView implements Component {
         ? theme.fg("accent", theme.bold(`${name} (${formatSize(size)})`))
         : theme.fg("dim", `${name} (${formatSize(size)})`);
     lines.push(
-      truncateToWidth(
-        `  ${tab("stdout", snap.stdout.totalBytes)}${theme.fg("dim", " | ")}${tab("stderr", snap.stderr.totalBytes)}${theme.fg("dim", "  — t to switch")}`,
-        width,
+      row(
+        `  ${tab("stdout", snap.stdout.totalBytes)}${theme.fg("dim", " | ")}${tab("stderr", snap.stderr.totalBytes)}${theme.fg("dim", " · t to switch")}`,
       ),
     );
 
@@ -575,26 +594,23 @@ class TerminalDetailView implements Component {
       // The cached view text identity changes with the buffer; totalBytes is a
       // monotonically increasing proxy for a version counter.
       buffer.totalBytes;
-    const output = this.lineCache.get(buffer.text, version, width - 2);
+    const output = this.lineCache.get(
+      buffer.text,
+      version,
+      width - 2,
+      buffer.truncatedChars,
+    );
     const viewport = this.viewportHeight();
 
     const noteRows: string[] = [];
     if (snap.errorText) {
-      noteRows.push(
-        truncateToWidth(
-          theme.fg("error", `error: ${oneLine(snap.errorText)}`),
-          width,
-        ),
-      );
+      noteRows.push(theme.fg("error", `error: ${oneLine(snap.errorText)}`));
     }
     if (buffer.truncatedBytes > 0) {
       noteRows.push(
-        truncateToWidth(
-          theme.fg(
-            "dim",
-            `first ${formatSize(buffer.truncatedBytes)} dropped from view — full log: ${buffer.spillPath ?? "(unavailable)"}`,
-          ),
-          width,
+        theme.fg(
+          "dim",
+          `first ${formatSize(buffer.truncatedBytes)} dropped from view — full log: ${buffer.spillPath ?? "(unavailable)"}`,
         ),
       );
     }
@@ -611,22 +627,22 @@ class TerminalDetailView implements Component {
       body.push(theme.fg("dim", `(no ${active} yet)`));
     } else {
       for (const line of visible) {
-        body.push(truncateToWidth(`  ${line}`, width));
+        body.push(`  ${line}`);
       }
     }
 
     if (this.scrollOffset > 0) {
       body.push(
-        truncateToWidth(
-          theme.fg("dim", `... ${this.scrollOffset} lines below · ↓/pgdn`),
-          width,
+        theme.fg(
+          "dim",
+          `… ${this.scrollOffset} lines below · ${configuredKeys(this.keybindings, "tui.editor.cursorDown")}`,
         ),
       );
     }
     while (body.length < viewport) body.push("");
-    lines.push(...body.slice(0, viewport));
+    for (const line of body.slice(0, viewport)) lines.push(row(line));
 
-    lines.push(border);
+    lines.push(bottomBorder);
     lines.push(
       truncateToWidth(
         theme.fg(
@@ -634,9 +650,9 @@ class TerminalDetailView implements Component {
           `${configuredKeys(this.keybindings, "tui.select.cancel")} back · t stdout/stderr · x kill · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")}/jk scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page · g/G top/bottom`,
         ),
         width,
+        "…",
       ),
     );
-    lines.push(border);
     return lines;
   }
 

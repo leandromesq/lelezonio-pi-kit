@@ -20,6 +20,7 @@ import {
   createChildResources,
   resolveStandaloneChildProjectTrust,
   shutdownAndDisposeChildSession,
+  withoutChildExcludedExtensions,
   type DisposableChildSession,
 } from "./child-session.ts";
 
@@ -268,4 +269,38 @@ test("shutdown helper bounds a stuck hook before disposal", async () => {
 
   await shutdownAndDisposeChildSession(session, { timeoutMs: 10 });
   assert.equal(disposals, 1);
+});
+
+/** Minimal shape the override needs: the resolved path is what identifies a
+ * package-installed extension inside a child's loader result. */
+function extensionResult(resolvedPaths: readonly string[]) {
+  return {
+    extensions: resolvedPaths.map((resolvedPath) => ({
+      path: resolvedPath,
+      resolvedPath,
+    })),
+    errors: [],
+    runtime: {},
+  } as unknown as Parameters<typeof withoutChildExcludedExtensions>[0];
+}
+
+test("a child keeps ordinary extensions and drops parent-only ones", () => {
+  const filtered = withoutChildExcludedExtensions(
+    extensionResult([
+      "C:/Users/x/.pi/agent/extensions/subagents/index.ts",
+      "C:/Users/x/.pi/agent/npm/node_modules/pi-observational-memory/src/index.ts",
+      "C:/Users/x/.pi/agent/npm/node_modules/pi-observational-memory-extra/src/index.ts",
+    ]),
+  );
+  assert.deepEqual(
+    filtered.extensions.map((extension) => extension.resolvedPath),
+    [
+      "C:/Users/x/.pi/agent/extensions/subagents/index.ts",
+      // A package whose name only starts with the excluded one is not the
+      // excluded package: the match is on the real path segment.
+      "C:/Users/x/.pi/agent/npm/node_modules/pi-observational-memory-extra/src/index.ts",
+    ],
+  );
+  // Errors and runtime are carried over untouched.
+  assert.equal(filtered.errors.length, 0);
 });

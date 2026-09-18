@@ -107,3 +107,25 @@ test("view text is cached between pushes and version increments per push", () =>
   assert.equal(buf.version, versionBefore + 1);
   assert.equal(buf.view().text, "ab");
 });
+
+test("truncatedChars mirrors truncatedBytes so the line cache can prune", () => {
+  const buf = new OutputBuffer(8);
+  buf.push("aaaa"); // 4 bytes / 4 chars
+  buf.push("bbbb"); // 8 bytes / 8 chars
+  buf.push("cccc"); // 12 bytes -> evicts "aaaa"
+  assert.equal(buf.view().truncatedBytes, 4);
+  assert.equal(buf.view().truncatedChars, 4);
+
+  buf.push("d"); // 9 bytes -> evicts "bbbb"
+  assert.equal(buf.view().truncatedBytes, 8);
+  assert.equal(buf.view().truncatedChars, 8);
+  assert.equal(buf.view().text, "ccccd");
+});
+
+test("truncatedChars counts whole code points after an oversized tail trim", () => {
+  const buf = new OutputBuffer(5);
+  buf.push("ééééé"); // 10 bytes / 5 chars; 5-byte tail keeps 2 chars
+  assert.equal(buf.view().text, "éé");
+  assert.equal(buf.view().truncatedBytes, 6);
+  assert.equal(buf.view().truncatedChars, 3);
+});

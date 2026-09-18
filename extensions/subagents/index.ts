@@ -37,10 +37,11 @@ import {
   formatSize,
   getAgentDir,
   getMarkdownTheme,
+  keyHint,
   ProjectTrustStore,
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadNamingConfig } from "../auto-naming/src/config.ts";
 import { generateTaskTitle } from "../auto-naming/src/title-generator.ts";
@@ -69,6 +70,7 @@ import {
   formatActivityStatus,
   formatCompactTokens,
   formatContextUtilization,
+  isEmptyActivity,
   isStalled,
 } from "./src/format.ts";
 import {
@@ -83,6 +85,7 @@ import {
   nestingAllowed,
   toolPolicyFor,
 } from "./src/profile.ts";
+import { readWorkerSummary } from "./src/restore.ts";
 import {
   buildSubagentResultMessage,
   buildSubagentSendResult,
@@ -347,89 +350,18 @@ export default function (pi: ExtensionAPI) {
   const updateStatus = (manager: SubagentManagerShape) => {
     if (!ui) return;
     const subs = manager.view.list();
-    if (subs.length === 0) {
-      ui.setStatus("subagents", undefined);
-      return;
-    }
     const running = subs.filter((snap) => snap.status === "running").length;
     const failed = subs.filter((snap) => snap.status === "error").length;
     const done = subs.length - running - failed;
     const questions = subs.filter((snap) => snap.question !== undefined).length;
     const stalled = subs.filter((snap) => isStalled(snap)).length;
+    const counts = { running, done, failed, questions, stalled };
     ui.setStatus(
       "subagents",
-      formatActivityStatus(ui.theme, {
-        running,
-        done,
-        failed,
-        questions,
-        stalled,
-      }),
+      isEmptyActivity(counts)
+        ? undefined
+        : formatActivityStatus(ui.theme, "subagents", counts),
     );
-  };
-
-  /** Read only the tail of a session JSONL so restoring many (possibly
-   * multi-MB) workers at startup reads bounded I/O. */
-  const readFileTail = (filePath: string, maxBytes: number): string => {
-    const fd = fs.openSync(filePath, "r");
-    try {
-      const size = fs.fstatSync(fd).size;
-      const start = Math.max(0, size - maxBytes);
-      const length = size - start;
-      const buffer = Buffer.alloc(length);
-      fs.readSync(fd, buffer, 0, length, start);
-      const tail = buffer.toString("utf8");
-      // Drop a partial first line (truncated mid-entry) — the rest is intact.
-      const newline = tail.indexOf("\n");
-      return newline >= 0 ? tail.slice(newline + 1) : tail;
-    } finally {
-      fs.closeSync(fd);
-    }
-  };
-
-  /** Parse the final assistant text/error from a persisted worker session
-   * JSONL (best-effort, tail-bounded). */
-  const summaryFromSessionFile = (filePath: string) => {
-    let finalText = "";
-    let errorText: string | undefined;
-    let settledAt = 0;
-    try {
-      for (const line of readFileTail(filePath, 256 * 1024).split("\n")) {
-        if (!line.trim()) continue;
-        let entry: unknown;
-        try {
-          entry = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        const record = entry as {
-          type?: string;
-          timestamp?: number;
-          message?: {
-            role?: string;
-            content?: Array<{ type?: string; text?: string }>;
-            stopReason?: string;
-            errorMessage?: string;
-            timestamp?: number;
-          };
-        };
-        if (record.type !== "message" || record.message?.role !== "assistant")
-          continue;
-        const text = (record.message.content ?? [])
-          .filter((block) => block.type === "text")
-          .map((block) => block.text ?? "")
-          .join("\n");
-        if (text) finalText = text;
-        if (record.message.stopReason === "error") {
-          errorText = record.message.errorMessage ?? "Restored run failed";
-        }
-        const ts = record.timestamp ?? record.message.timestamp ?? 0;
-        if (ts) settledAt = ts;
-      }
-    } catch {
-      // unreadable session → skip adoption
-    }
-    return { finalText, errorText, settledAt };
   };
 
   /** Re-surface persisted children of a previous pi session as inspect-only
@@ -463,8 +395,9 @@ export default function (pi: ExtensionAPI) {
         ? path.join(dir, files[files.length - 1])
         : undefined;
       if (!filePath) continue;
-      const { finalText, errorText, settledAt } =
-        summaryFromSessionFile(filePath);
+      // Tail-first: a normal final message lives in the last ~8 KiB, so most
+      // restored children never pay the 256 KiB read.
+      const { finalText, errorText, settledAt } = readWorkerSummary(filePath);
       try {
         await runTool(
           getRuntime(),
@@ -788,6 +721,7 @@ export default function (pi: ExtensionAPI) {
               harness,
               modelLabel: snap.meta.modelLabel ?? "?",
               cwd,
+              fallbackReason: snap.meta.fallbackReason,
             }),
           },
         ],
@@ -1149,10 +1083,16 @@ export default function (pi: ExtensionAPI) {
         status?: string;
       };
       const failed = details.status === "error";
-      const icon = failed ? theme.fg("error", "x") : theme.fg("success", "■");
+      // Result-message glyph pair per docs/ui-conventions.md §3: `✗` in
+      // `error` for a failed action, `■` in `success` otherwise. Never the
+      // literal `x` the old renderer used.
+      const icon = failed ? theme.fg("error", "✗") : theme.fg("success", "■");
       const header =
         `${icon} ` +
-        theme.fg("accent", theme.bold(`subagent ${details.id ?? "?"}`)) +
+        theme.fg(
+          "customMessageLabel",
+          theme.bold(`subagent ${details.id ?? "?"}`),
+        ) +
         theme.fg(
           "muted",
           ` · ${details.title ?? ""} · ${failed ? "failed" : "finished"}`,
@@ -1164,28 +1104,31 @@ export default function (pi: ExtensionAPI) {
       // is part of the actual result and must remain visible.
       const body = content.split("\n").slice(1).join("\n").trim();
 
+      // Envelope shared with the /summary recap: background box + label
+      // (docs/ui-conventions.md §10).
+      const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+      box.addChild(new Text(header, 0, 0));
+
       if (expanded) {
-        const md = new Markdown(`${body}`, 0, 0, getMarkdownTheme());
-        const container = new Text(header, 0, 0);
-        return {
-          render: (width: number) => [
-            ...container.render(width),
-            ...md.render(width),
-          ],
-          invalidate: () => {
-            container.invalidate();
-            md.invalidate();
-          },
-        };
+        box.addChild(
+          new Markdown(body, 0, 0, getMarkdownTheme(), {
+            color: (text) => theme.fg("customMessageText", text),
+          }),
+        );
+      } else {
+        const lines = body.split("\n");
+        const preview = lines
+          .slice(0, 8)
+          .map((line) => theme.fg("customMessageText", line))
+          .join("\n");
+        const more =
+          lines.length > 8
+            ? `\n${keyHint("app.tools.expand", "to expand")}`
+            : "";
+        box.addChild(new Text(preview + more, 0, 0));
       }
 
-      const previewLines = body.split("\n").slice(0, 8);
-      let text = header;
-      for (const line of previewLines)
-        text += `\n${theme.fg("toolOutput", line)}`;
-      if (body.split("\n").length > 8)
-        text += `\n${theme.fg("dim", "... (ctrl+o to expand)")}`;
-      return new Text(text, 0, 0);
+      return box;
     },
   );
 

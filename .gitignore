@@ -21,6 +21,10 @@ extensions/summaries/config.private.json
 extensions/summaries/config.private.json.*.tmp
 extensions/auto-naming/config.private.json
 extensions/auto-naming/config.private.json.*.tmp
+extensions/cache-retention/config.private.json
+extensions/cache-retention/config.private.json.*.tmp
+extensions/cache-retention/learned.private.json
+extensions/cache-retention/learned.private.json.*.tmp
 
 # Environment variables and secrets
 .env
@@ -35,6 +39,7 @@ extensions/auto-naming/config.private.json.*.tmp
 *.pyc
 __pycache__/
 .DS_Store
+tmp/
 
 # Third-party skills — only the owned skills are tracked
 skills/*

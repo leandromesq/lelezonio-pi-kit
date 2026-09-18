@@ -1,6 +1,6 @@
+import { formatElapsed } from "../shared/format.ts";
 import {
   countStates,
-  formatElapsed,
   resultJson,
   shortenHome,
   type WorkflowDetails,

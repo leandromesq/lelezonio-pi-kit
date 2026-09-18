@@ -276,15 +276,14 @@ export function buildFallbackRecap(entries: readonly SessionEntry[]) {
   const tools = [...new Set(toolNames)];
   const activity =
     tools.length > 0
-      ? ` A execução usou ${toolNames.length} chamada${toolNames.length === 1 ? "" : "s"} de ferramenta em ${tools.join(", ")}.`
+      ? ` It used ${toolNames.length} tool call${toolNames.length === 1 ? "" : "s"} (${tools.join(", ")}).`
       : "";
   const result = finalAssistantText
-    ? ` ${capped(finalAssistantText.replace(/\s+/g, " "), 700, "resposta final truncada")}`
+    ? ` ${capped(finalAssistantText.replace(/\s+/g, " "), 700, "final answer truncated")}`
     : "";
 
   return {
-    recap:
-      `A execução do agente principal foi concluída.${activity}${result}`.trim(),
-    next: "Revise o trabalho concluído acima e continue se ainda houver algo pendente.",
+    recap: `The main agent run finished.${activity}${result}`.trim(),
+    next: "Review the completed work above and continue if anything is still pending.",
   };
 }

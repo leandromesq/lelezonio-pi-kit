@@ -35,9 +35,10 @@ import {
   getAgentDir,
   getMarkdownTheme,
   getShellConfig,
+  keyHint,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { TerminalSnapshot } from "./src/domain.ts";
 import {
@@ -138,16 +139,14 @@ export default function (pi: ExtensionAPI) {
 
   /** One-line widget directly above the editor, only while ≥1 is running.
    * Called on every manager notification (including per-output-chunk), so it
-   * only touches setWidget when the running count actually changes —
-   * replacing the widget factory hundreds of times a second would churn
-   * component creation for no visible difference. */
+   * reads an allocation-free count and only touches setWidget when the running
+   * count actually changes — replacing the widget factory hundreds of times a
+   * second would churn component creation for no visible difference. */
   let widgetRunning = 0;
   const updateWidget = (manager: TerminalManagerShape) => {
     if (!ui) return;
     try {
-      const running = manager.view
-        .list()
-        .filter((snap) => snap.status === "running").length;
+      const { running } = manager.view.counts();
       if (running === widgetRunning) return;
       widgetRunning = running;
       if (running === 0) {
@@ -161,7 +160,7 @@ export default function (pi: ExtensionAPI) {
             "text",
             `${running} background terminal${running === 1 ? "" : "s"} running`,
           ) +
-          theme.fg("dim", " • ") +
+          theme.fg("dim", " · ") +
           theme.fg("accent", "/ps") +
           theme.fg("dim", " to view");
         return { render: () => [line], invalidate: () => {} };
@@ -460,17 +459,16 @@ export default function (pi: ExtensionAPI) {
       const failed = details.status === "failed";
       const killed = details.status === "killed";
       const icon = failed
-        ? theme.fg("error", "x")
+        ? theme.fg("error", "✗")
         : killed
           ? theme.fg("muted", "■")
-          : theme.fg("success", "■");
+          : theme.fg("success", "✓");
       const how = killed
         ? "killed"
         : (details.signal ?? `exit ${details.exitCode ?? "?"}`);
-      const header =
-        `${icon} ` +
-        theme.fg("accent", theme.bold(`terminal ${details.id ?? "?"}`)) +
-        theme.fg("muted", ` · ${details.title ?? ""} · ${how}`);
+      const meta = [details.id ?? "?", details.title, how]
+        .filter(Boolean)
+        .join(" · ");
 
       const content =
         typeof message.content === "string" ? message.content : "";
@@ -479,28 +477,41 @@ export default function (pi: ExtensionAPI) {
       // process output — sanitize ANSI/control chars or the transcript smears.
       const body = sanitizeText(content.split("\n").slice(1).join("\n").trim());
 
+      // Custom-message envelope of `docs/ui-conventions.md` section 10, the
+      // same card `/summary` uses for its recap.
+      const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+      box.addChild(
+        new Text(
+          icon +
+            " " +
+            theme.fg("customMessageLabel", theme.bold("Background terminal")) +
+            theme.fg("muted", ` · ${meta}`),
+          0,
+          0,
+        ),
+      );
+
       if (expanded) {
-        const md = new Markdown(`${body}`, 0, 0, getMarkdownTheme());
-        const container = new Text(header, 0, 0);
-        return {
-          render: (width: number) => [
-            ...container.render(width),
-            ...md.render(width),
-          ],
-          invalidate: () => {
-            container.invalidate();
-            md.invalidate();
-          },
-        };
+        box.addChild(
+          new Markdown(body, 0, 1, getMarkdownTheme(), {
+            color: (text) => theme.fg("customMessageText", text),
+          }),
+        );
+        return box;
       }
 
       const previewLines = body.split("\n").slice(0, 8);
-      let text = header;
       for (const line of previewLines)
-        text += `\n${theme.fg("toolOutput", line)}`;
+        box.addChild(new Text(theme.fg("toolOutput", line), 0, 0));
       if (body.split("\n").length > 8)
-        text += `\n${theme.fg("dim", "... (ctrl+o to expand)")}`;
-      return new Text(text, 0, 0);
+        box.addChild(
+          new Text(
+            theme.fg("muted", `(${keyHint("app.tools.expand", "to expand")})`),
+            0,
+            0,
+          ),
+        );
+      return box;
     },
   );
 

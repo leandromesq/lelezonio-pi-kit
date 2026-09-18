@@ -22,11 +22,13 @@ import {
 } from "./src/runtime.ts";
 
 import {
+  isSubagentProcess,
+  pollIntervalMs,
   shouldRefreshAfterTool,
+  shouldRefreshOnInput,
   shouldTrackGit,
 } from "./src/refresh-policy.ts";
 
-const POLL_INTERVAL_MS = 15_000;
 const REFRESH_DEBOUNCE_MS = 500;
 const GIT_TIMEOUT_MS = 3_000;
 const GH_TIMEOUT_MS = 10_000;
@@ -58,6 +60,8 @@ function parsePullRequestJson(value: string) {
 }
 
 export default function gitInfo(pi: ExtensionAPI) {
+  // Read once at load: a child's whole lifetime runs under the same env.
+  const isSubagent = isSubagentProcess(process.env);
   let state = emptyGitInfoState();
   let runtime: GitInfoRuntime | undefined;
   let pollingFiber: Fiber.Fiber<void> | undefined;
@@ -171,13 +175,17 @@ export default function gitInfo(pi: ExtensionAPI) {
   const reportBackgroundDefect = (defect: unknown) =>
     Effect.logError("git-info background task defect", defect);
 
-  const poll = () =>
+  /**
+   * Refresh the footer on a fixed cadence, first tick immediately. The caller
+   * prepends a delay when an eager refresh already ran at session start (see
+   * `session_start`).
+   */
+  const poll = (intervalMs: number) =>
     Effect.suspend(() =>
       currentContext ? refreshIfIdle(currentContext) : Effect.void,
     ).pipe(
       Effect.catchDefect(reportBackgroundDefect),
-      Effect.repeat(Schedule.fixed(POLL_INTERVAL_MS)),
-      Effect.delay(POLL_INTERVAL_MS),
+      Effect.repeat(Schedule.fixed(intervalMs)),
       Effect.asVoid,
     );
 
@@ -211,22 +219,36 @@ export default function gitInfo(pi: ExtensionAPI) {
       await getRuntime().runPromise(Fiber.interrupt(previousPollingFiber));
     }
 
+    if (!shouldTrackGit(ctx.mode)) return;
+    currentContext = ctx;
+    const intervalMs = pollIntervalMs(isSubagent);
+
+    if (isSubagent) {
+      // A child has a visible footer pane (the user can open the worker), so it
+      // keeps refreshing — but only from the poll, never from mutations or
+      // input. The first tick runs immediately, so the pane is coherent as soon
+      // as it is opened without paying for per-mutation `git` spawns.
+      pollingFiber = forkBackground(poll(intervalMs));
+      return;
+    }
+
     // Do not block Pi startup on GitHub/network I/O. The initial refresh publishes
     // state when it completes; polling continues to keep it current afterwards.
-    if (shouldTrackGit(ctx.mode)) {
-      currentContext = ctx;
-      refreshInBackground(ctx);
-      pollingFiber = forkBackground(poll());
-    }
+    refreshInBackground(ctx);
+    pollingFiber = forkBackground(
+      poll(intervalMs).pipe(Effect.delay(intervalMs)),
+    );
   });
 
   pi.on("input", (_event, ctx) => {
-    refreshInBackground(ctx);
+    // A child's keystrokes must not re-run git status; its footer is on the poll.
+    if (shouldRefreshOnInput(isSubagent)) refreshInBackground(ctx);
     return { action: "continue" };
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
-    if (shouldRefreshAfterTool(event.toolName)) refreshInBackground(ctx);
+    if (shouldRefreshAfterTool(event.toolName, isSubagent))
+      refreshInBackground(ctx);
   });
 
   pi.on("session_shutdown", async () => {

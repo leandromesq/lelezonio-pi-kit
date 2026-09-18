@@ -10,8 +10,9 @@ import {
   isRemoteAgentActive,
   type RemoteAgentSnapshot,
 } from "../domain.ts";
+import { viewportRows } from "../../../shared/ui/viewport.ts";
 import type { RemoteAgentReadModel } from "../manager.ts";
-import { buildTranscriptLines, sanitizeText } from "./transcript.ts";
+import { createTranscriptCache, sanitizeText } from "./transcript.ts";
 
 function configuredKeys(
   keybindings: KeybindingsManager,
@@ -169,11 +170,12 @@ class RemoteDashboard implements Component {
   render(width: number) {
     const jobs = this.view.list();
     this.reconcile(jobs);
-    const height = Math.max(6, (this.tui.terminal.rows || 30) - 5);
+    const height = viewportRows(this.tui.terminal.rows, 5, 6);
     const lines = [
       truncateToWidth(
         `  ${this.theme.fg("accent", this.theme.bold("Remote agents"))} ${this.theme.fg("dim", `· ${jobs.length} on macmini`)}`,
         width,
+        "…",
       ),
     ];
     lines.push(this.theme.fg("border", "─".repeat(width)));
@@ -195,7 +197,7 @@ class RemoteDashboard implements Component {
         `${job.status} · ${formatElapsed(job)} `,
       );
       const leftWidth = Math.max(1, width - visibleWidth(right) - 2);
-      const clipped = truncateToWidth(left, leftWidth);
+      const clipped = truncateToWidth(left, leftWidth, "…");
       lines.push(
         truncateToWidth(
           clipped +
@@ -204,6 +206,7 @@ class RemoteDashboard implements Component {
             ) +
             right,
           width,
+          "…",
         ),
       );
     }
@@ -215,6 +218,7 @@ class RemoteDashboard implements Component {
           `${configuredKeys(this.keybindings, "tui.select.confirm")} open Herdr · x cancel · d delete · r refresh · ${configuredKeys(this.keybindings, "tui.select.cancel")} close`,
         ),
         width,
+        "…",
       ),
     );
     return lines;
@@ -232,6 +236,8 @@ class RemoteTakeover implements Component, Focusable {
   private readonly unsubscribe: () => void;
   private readonly ticker: ReturnType<typeof setInterval>;
   private refreshTimer?: ReturnType<typeof setInterval>;
+  private renderTimer?: ReturnType<typeof setTimeout>;
+  private readonly transcriptCache = createTranscriptCache();
   private _focused = false;
 
   get focused() {
@@ -250,7 +256,7 @@ class RemoteTakeover implements Component, Focusable {
     private readonly view: RemoteAgentReadModel,
     private readonly done: (value: null) => void,
   ) {
-    this.unsubscribe = view.subscribeTo(id, () => tui.requestRender());
+    this.unsubscribe = view.subscribeTo(id, () => this.scheduleRender());
     this.ticker = setInterval(() => tui.requestRender(), 1_000);
     this.refreshTimer = setInterval(() => view.requestRefresh(id), 2_000);
     this.input.onSubmit = (value) => {
@@ -263,11 +269,23 @@ class RemoteTakeover implements Component, Focusable {
     };
   }
 
+  private scheduleRender() {
+    if (this.renderTimer) return;
+    // The 2s poll and the transcript subscription can fire per chunk. Limit
+    // terminal repaints so this view cannot starve input handling.
+    this.renderTimer = setTimeout(() => {
+      this.renderTimer = undefined;
+      if (!this.closed) this.tui.requestRender();
+    }, 50);
+  }
+
   private close() {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.ticker);
     if (this.refreshTimer) clearInterval(this.refreshTimer);
+    if (this.renderTimer) clearTimeout(this.renderTimer);
+    this.renderTimer = undefined;
     this.unsubscribe();
     this.done(null);
   }
@@ -304,7 +322,7 @@ class RemoteTakeover implements Component, Focusable {
   }
 
   private viewportHeight() {
-    return Math.max(6, (this.tui.terminal.rows || 30) - 9);
+    return viewportRows(this.tui.terminal.rows, 9, 6);
   }
 
   render(width: number) {
@@ -321,6 +339,7 @@ class RemoteTakeover implements Component, Focusable {
       truncateToWidth(
         `${glyph(job, this.theme)} ${this.theme.fg("accent", this.theme.bold(`${job.id} · ${oneLine(job.title)}`))}${this.theme.fg("muted", ` · ${job.status} · ${formatElapsed(job)}`)}`,
         width,
+        "…",
       ),
     );
     lines.push(
@@ -330,10 +349,16 @@ class RemoteTakeover implements Component, Focusable {
           `${job.host}:${job.remoteCwd}${job.workspaceId ? ` · ${job.workspaceId}` : ""}`,
         ),
         width,
+        "…",
       ),
     );
     lines.push(border);
-    const transcript = buildTranscriptLines(job.transcript, width);
+    const transcript = this.transcriptCache.get(
+      job.transcript,
+      job.transcriptVersion,
+      width,
+      this.theme,
+    );
     const viewport = this.viewportHeight();
     const reserved = job.errorText ? 1 : 0;
     const capacity = Math.max(
@@ -350,6 +375,7 @@ class RemoteTakeover implements Component, Focusable {
           truncateToWidth(
             this.theme.fg("error", `error: ${oneLine(job.errorText)}`),
             width,
+            "…",
           ),
         ]
       : [];
@@ -360,16 +386,17 @@ class RemoteTakeover implements Component, Focusable {
         : [this.theme.fg("dim", "(no remote output yet)")]),
     );
     if (this.scrollOffset > 0)
-      body.push(this.theme.fg("dim", `... ${this.scrollOffset} lines below`));
+      body.push(this.theme.fg("dim", `… ${this.scrollOffset} lines below`));
     while (body.length < viewport) body.push("");
     lines.push(...body.slice(0, viewport), border, ...this.input.render(width));
     lines.push(
       truncateToWidth(
         this.theme.fg(
           "dim",
-          `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} cancel · ↑/↓ scroll`,
+          `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} cancel · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll`,
         ),
         width,
+        "…",
       ),
     );
     lines.push(border);
@@ -377,6 +404,7 @@ class RemoteTakeover implements Component, Focusable {
   }
 
   invalidate() {
+    this.transcriptCache.invalidate();
     this.input.invalidate();
   }
 }

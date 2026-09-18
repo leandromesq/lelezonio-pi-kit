@@ -7,26 +7,17 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Effect } from "effect";
+// Shared with the transcript overlays so OSC/CSI handling cannot drift; the
+// diff keeps tabs here and lets `styleDiffLine` expand them to four columns.
+import { sanitizeTerminalText as sanitizeSharedTerminalText } from "../../shared/terminal-text.ts";
 import { runCommand } from "./process.ts";
 
 const DIFF_SCROLL_STEP = 5;
 const MAX_DIFF_LINES = 20_000;
-// Strip terminal control sequences from repository-controlled paths and diff
-// text before applying trusted theme styling.
-// eslint-disable-next-line no-control-regex
-const OSC_PATTERN =
-  /(?:\u001b\]|\u009d)(?:[^\u0007\u001b\u009c]|\u001b(?!\\))*(?:\u0007|\u001b\\|\u009c)/g;
-// eslint-disable-next-line no-control-regex
-const CSI_PATTERN = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g;
-// eslint-disable-next-line no-control-regex
-const ESCAPE_PATTERN = /\u001b(?:[()][0-2A-Z]|[ -/]*[@-~])/g;
 
+/** Strip terminal control sequences from repository-controlled text. */
 export function sanitizeTerminalText(text: string) {
-  return text
-    .replace(OSC_PATTERN, "")
-    .replace(CSI_PATTERN, "")
-    .replace(ESCAPE_PATTERN, "")
-    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+  return sanitizeSharedTerminalText(text);
 }
 
 interface ChangedPath {
@@ -167,7 +158,7 @@ export const loadChangedFiles = Effect.fn("git-info.loadChangedFiles")(
 );
 
 function padToWidth(text: string, width: number) {
-  const truncated = truncateToWidth(text, width, "");
+  const truncated = truncateToWidth(text, width, "…");
   return `${truncated}${" ".repeat(Math.max(0, width - visibleWidth(truncated)))}`;
 }
 
@@ -220,23 +211,26 @@ export async function showChangedFiles(
         ) {
           return theme.fg("accent", theme.bold(expanded));
         }
-        if (expanded.startsWith("@@")) return theme.fg("mdHeading", expanded);
+        if (expanded.startsWith("@@"))
+          return theme.fg("toolDiffContext", expanded);
         if (expanded.startsWith("---") || expanded.startsWith("+++")) {
           return theme.fg("muted", expanded);
         }
-        if (expanded.startsWith("+")) return theme.fg("success", expanded);
-        if (expanded.startsWith("-")) return theme.fg("error", expanded);
+        if (expanded.startsWith("+"))
+          return theme.fg("toolDiffAdded", expanded);
+        if (expanded.startsWith("-"))
+          return theme.fg("toolDiffRemoved", expanded);
         if (expanded.startsWith("…")) return theme.fg("warning", expanded);
         return theme.fg("text", expanded);
       }
 
       function border(width: number, label: string, top: boolean) {
-        const left = top ? "┌" : "└";
-        const right = top ? "┐" : "┘";
+        const left = top ? "╭" : "╰";
+        const right = top ? "╮" : "╯";
         const text = `─ ${label} `;
         const remaining = Math.max(0, width - visibleWidth(text) - 2);
         return theme.fg(
-          "borderAccent",
+          "border",
           truncateToWidth(
             `${left}${text}${"─".repeat(remaining)}${right}`,
             width,
@@ -350,8 +344,8 @@ export async function showChangedFiles(
                 ? "binary"
                 : `+${file.additions} -${file.deletions}`;
               const styledStats = isBinary
-                ? theme.fg("success", stats)
-                : `${theme.fg("success", `+${file.additions}`)} ${theme.fg("error", `-${file.deletions}`)}`;
+                ? theme.fg("muted", stats)
+                : `${theme.fg("toolDiffAdded", `+${file.additions}`)} ${theme.fg("toolDiffRemoved", `-${file.deletions}`)}`;
               const nameWidth = Math.max(
                 1,
                 sidebarWidth - visibleWidth(marker) - visibleWidth(stats) - 1,
@@ -373,10 +367,8 @@ export async function showChangedFiles(
 
             sidebar = padToWidth(sidebar, sidebarWidth);
             if (isSelected) {
-              sidebar = theme.bg(
-                focus === "files" ? "selectedBg" : "customMessageBg",
-                sidebar,
-              );
+              // Selection role per ui-conventions: never customMessageBg.
+              sidebar = theme.bg("selectedBg", sidebar);
             }
           } else {
             sidebar = " ".repeat(sidebarWidth);
@@ -388,11 +380,11 @@ export async function showChangedFiles(
             diffWidth,
           );
           const separator = theme.fg(
-            focus === "diff" ? "borderAccent" : "borderMuted",
+            focus === "diff" ? "borderAccent" : "border",
             "│",
           );
           lines.push(
-            `${theme.fg("borderMuted", "│")}${sidebar}${separator}${diff}${theme.fg("borderMuted", "│")}`,
+            `${theme.fg("border", "│")}${sidebar}${separator}${diff}${theme.fg("border", "│")}`,
           );
         }
 

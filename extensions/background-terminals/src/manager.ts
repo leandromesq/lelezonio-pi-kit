@@ -131,6 +131,12 @@ export interface TerminalReadModel {
   list(): ReadonlyArray<TerminalSnapshot>;
   get(id: string): TerminalSnapshot | undefined;
   size(): number;
+  /**
+   * Cheap running/settled tallies for the status widget. Iterates the registry
+   * without allocating a snapshot array, so a per-output-chunk notification
+   * stays O(tracked) instead of O(tracked) + an array allocation.
+   */
+  counts(): { running: number; settled: number };
   /** Any-change notification (widget, /ps list). */
   subscribe(listener: () => void): () => void;
   /** Per-terminal notification (/ps detail view). */
@@ -961,6 +967,13 @@ const makeManager = Effect.gen(function* () {
     list: () => [...entries.values()].map((entry) => entry.snapshot),
     get: (id) => entries.get(id)?.snapshot,
     size: () => entries.size,
+    counts: () => {
+      let running = 0;
+      for (const entry of entries.values()) {
+        if (entry.snapshot.status === "running") running++;
+      }
+      return { running, settled: entries.size - running };
+    },
     subscribe: (listener) => {
       listeners.add(listener);
       return () => listeners.delete(listener);

@@ -8,6 +8,11 @@ import {
   REFRESH_CHANNEL,
 } from "../shared/dashboard-state.ts";
 
+/**
+ * Full branch scan used to seed/resync the accumulator. This is O(branch) and
+ * is only called on session start and on events that can rewrite the active
+ * branch (compaction, tree navigation/restore) — never on every refresh.
+ */
 function getSessionCost(ctx: ExtensionContext) {
   let cost = 0;
 
@@ -23,6 +28,13 @@ function getSessionCost(ctx: ExtensionContext) {
 export default function modelInfo(pi: ExtensionAPI) {
   let state = emptyModelInfoState();
   let currentContext: ExtensionContext | undefined;
+  /**
+   * Incrementally accumulated session cost. Assistant messages are summed once
+   * as they end, instead of re-walking the whole branch on agent_start,
+   * turn_end, agent_settled, model_select and the refresh channel — which made
+   * a long session O(branch^2) overall.
+   */
+  let sessionCost = 0;
 
   const publish = () => pi.events.emit(MODEL_INFO_CHANNEL, { ...state });
 
@@ -39,10 +51,14 @@ export default function modelInfo(pi: ExtensionAPI) {
       contextTokens: usage?.tokens ?? null,
       contextWindow: usage?.contextWindow ?? model?.contextWindow ?? 0,
       contextPercent: usage?.percent ?? null,
-      cost: getSessionCost(ctx),
+      cost: sessionCost,
     };
     publish();
   }
+
+  const resyncCost = (ctx: ExtensionContext) => {
+    sessionCost = getSessionCost(ctx);
+  };
 
   const stopRefreshListener = pi.events.on(REFRESH_CHANNEL, () => {
     if (currentContext) refresh(currentContext);
@@ -50,6 +66,27 @@ export default function modelInfo(pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     state = emptyModelInfoState();
+    // Startup/new/resume/fork all start here, so the accumulator is seeded
+    // from the branch exactly once per session.
+    resyncCost(ctx);
+    refresh(ctx);
+  });
+
+  // Add each assistant message's usage once, as it ends.
+  pi.on("message_end", (event) => {
+    if (event.message.role === "assistant") {
+      sessionCost += event.message.usage.cost.total;
+    }
+  });
+
+  // Compaction keeps the assistant messages, but tree navigation/restore and
+  // compaction can change the active branch; re-sync from it when they do.
+  pi.on("session_compact", (_event, ctx) => {
+    resyncCost(ctx);
+    refresh(ctx);
+  });
+  pi.on("session_tree", (_event, ctx) => {
+    resyncCost(ctx);
     refresh(ctx);
   });
 

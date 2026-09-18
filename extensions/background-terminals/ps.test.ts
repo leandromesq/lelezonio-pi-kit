@@ -9,6 +9,7 @@ import {
   createOutputLineCache,
   sanitizeText,
 } from "./src/ui/output-view.ts";
+import { OutputBuffer } from "./src/output.ts";
 
 test("dashboard selection follows its terminal id and falls back by row", () => {
   const selection: DashboardSelection = { id: "bt-7", index: 6 };
@@ -79,4 +80,87 @@ test("buildOutputLines wraps long lines and keeps only the final CR segment", ()
 test("buildOutputLines drops one trailing empty line from a trailing newline", () => {
   assert.deepEqual(buildOutputLines("a\nb\n", 80), ["a", "b"]);
   assert.deepEqual(buildOutputLines("a\n\n", 80), ["a", ""]);
+});
+
+test("incremental line cache only wraps the suffix of a small chunk", () => {
+  const cache = createOutputLineCache();
+  const big =
+    Array.from({ length: 2000 }, (_, index) => `line ${index}`).join("\n") +
+    "\n";
+  const first = cache.get(big, 1, 80, 0);
+  assert.deepEqual(first, buildOutputLines(big, 80));
+
+  const before = cache.stats.segments;
+  const grown = big + "one more line\n";
+  const second = cache.get(grown, 2, 80, 0);
+  assert.deepEqual(second, buildOutputLines(grown, 80));
+  // A 2k-line buffer must not be re-wrapped; only the new segment (committed
+  // plus the re-wrapped live tail) is processed.
+  assert.ok(
+    cache.stats.segments - before <= 3,
+    `wrapped ${cache.stats.segments - before} segments for one appended chunk`,
+  );
+});
+
+test("incremental line cache prunes whole segments evicted from the head", () => {
+  const cache = createOutputLineCache();
+  const first = "alpha\nbeta\ngamma\ndelta\n";
+  assert.deepEqual(cache.get(first, 1, 80, 0), [
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+  ]);
+
+  const removed = "alpha\nbeta\n";
+  const second = first.slice(removed.length);
+  assert.deepEqual(cache.get(second, 2, 80, removed.length), [
+    "gamma",
+    "delta",
+  ]);
+});
+
+test("incremental line cache re-wraps the one segment a head cut straddles", () => {
+  const cache = createOutputLineCache();
+  const first = "hello world\nbye\n";
+  assert.deepEqual(cache.get(first, 1, 80, 0), ["hello world", "bye"]);
+
+  const removed = "hello ".length; // cuts inside the first line
+  const second = first.slice(removed);
+  assert.deepEqual(cache.get(second, 2, 80, removed), ["world", "bye"]);
+});
+
+test("incremental line cache tracks a real buffer through pushes and eviction", () => {
+  const buf = new OutputBuffer(96);
+  const cache = createOutputLineCache();
+  let version = 0;
+  const render = () => {
+    version++;
+    const view = buf.view();
+    const lines = cache.get(view.text, version, 40, view.truncatedChars);
+    assert.deepEqual(
+      lines,
+      buildOutputLines(view.text, 40),
+      `mismatch after ${version} pushes`,
+    );
+    return lines;
+  };
+
+  const chunks = [
+    "one\n",
+    "two is a longer line that wraps around the narrow viewport\n",
+    "three\rprogress\rfour\n",
+    "ééé multibyte \n",
+    "five\n",
+    "six\n",
+    "seven\n",
+    "eight\n",
+    "nine\n",
+    "ten\n",
+  ];
+  for (const chunk of chunks) {
+    buf.push(chunk);
+    render();
+  }
+  assert.ok(buf.view().truncatedBytes > 0, "the buffer evicted its head");
 });

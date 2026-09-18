@@ -23,6 +23,29 @@ function harness() {
   return { handlers, unsubscribed: () => unsubscribed };
 }
 
+test("a subagent child schedules no refresh from mutations or input", async (t) => {
+  // A child still polls its own footer, so only the debounced refresh path is
+  // forbidden here: any setTimeout would be a per-mutation/per-input refresh.
+  const timer = t.mock.method(globalThis, "setTimeout", () => {
+    throw new Error("a subagent must not refresh per mutation or input");
+  });
+  const previous = process.env.PI_SUBAGENT;
+  process.env.PI_SUBAGENT = "1";
+  try {
+    const { handlers, unsubscribed } = harness();
+    const ctx = { mode: "tui", cwd: process.cwd() } as ExtensionContext;
+    handlers.get("input")!({}, ctx);
+    for (const toolName of ["write", "edit", "bash", "custom_mutation"])
+      handlers.get("tool_execution_end")!({ toolName }, ctx);
+    assert.equal(timer.mock.callCount(), 0);
+    await handlers.get("session_shutdown")!({}, ctx);
+    assert.equal(unsubscribed(), true);
+  } finally {
+    if (previous === undefined) delete process.env.PI_SUBAGENT;
+    else process.env.PI_SUBAGENT = previous;
+  }
+});
+
 test("headless lifecycle and tools never schedule display refresh timers", async (t) => {
   const timer = t.mock.method(globalThis, "setTimeout", () => {
     throw new Error("headless Git refresh must not schedule timers");

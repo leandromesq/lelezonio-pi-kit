@@ -39,9 +39,16 @@ export function buildSubagentSpawnResult(options: {
   harness: string;
   modelLabel: string;
   cwd: string;
+  /** Reason a Herdr worker pane was not used (in-process fallback). */
+  fallbackReason?: string;
 }) {
+  // Keep the note one readable line even if the underlying error is long.
+  const fallback = options.fallbackReason?.trim().slice(0, 300);
   return (
     `Spawned subagent ${options.id} "${options.title}" (${options.harness}: ${options.modelLabel}, ${options.cwd}).\n` +
+    (fallback
+      ? `Note: it has no Herdr worker pane and runs in-process — ${fallback}.\n`
+      : "") +
     `It runs in the background. Its result will be delivered to you when it finishes, ` +
     `or use subagent_wait(ids: ["${options.id}"]) to block for it, subagent_cancel to stop it, subagent_check to peek, subagent_list to see all.`
   );

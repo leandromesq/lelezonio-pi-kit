@@ -11,24 +11,24 @@
  * the overlay stays for outside-Herdr / in-process fallback sessions.
  */
 
-import type {
-  ExtensionCommandContext,
-  KeybindingsManager,
-  Theme,
+import {
+  keyHint,
+  keyText,
+  rawKeyHint,
+  type ExtensionCommandContext,
+  type KeybindingsManager,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { sliceViewport, viewportRows } from "../../../shared/ui/viewport.ts";
 import { formatElapsed, type SubagentSnapshot } from "../domain.ts";
 import { formatContextUtilization, isStalled } from "../format.ts";
 import type { SubagentReadModel } from "../manager.ts";
-import { buildTranscriptLines } from "./transcript.ts";
+import { createTranscriptLineCache } from "./transcript.ts";
 
-function configuredKeys(
-  keybindings: KeybindingsManager,
-  binding: Parameters<KeybindingsManager["getKeys"]>[0],
-) {
-  return keybindings.getKeys(binding).join("/") || "unbound";
-}
+/** Explicit ellipsis: the pi-tui default `...` must not appear in overlays. */
+const ELLIPSIS = "…";
 
 function statusGlyph(snap: SubagentSnapshot, theme: Theme): string {
   switch (snap.status) {
@@ -247,14 +247,14 @@ class SubagentDashboard implements Component {
   }
 
   private pad(text: string, width: number): string {
-    const truncated = truncateToWidth(text, width);
+    const truncated = truncateToWidth(text, width, ELLIPSIS);
     return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
   }
 
   private borderSegment(width: number, title: string): string {
     const theme = this.theme;
     const label = title
-      ? ` ${truncateToWidth(title, Math.max(0, width - 3))} `
+      ? ` ${truncateToWidth(title, Math.max(0, width - 3), ELLIPSIS)} `
       : "";
     const labelWidth = visibleWidth(label);
     return (
@@ -273,7 +273,7 @@ class SubagentDashboard implements Component {
     // Render exactly terminal rows - 1 so the overlay covers the header,
     // chat, editor, and extra footer lines while leaving pi's final footer
     // row visible.
-    const bodyHeight = Math.max(6, rows - 5);
+    const bodyHeight = viewportRows(rows, 5, 6);
     const innerWidth = width - 2;
 
     const lines: string[] = [];
@@ -292,6 +292,7 @@ class SubagentDashboard implements Component {
       truncateToWidth(
         `  ${headerLeft}${" ".repeat(headerPad)}${headerRight}  `,
         width,
+        ELLIPSIS,
       ),
     );
 
@@ -320,11 +321,17 @@ class SubagentDashboard implements Component {
     // Hints
     lines.push(
       truncateToWidth(
-        theme.fg(
-          "dim",
-          `  ${configuredKeys(this.keybindings, "tui.select.up")}/${configuredKeys(this.keybindings, "tui.select.down")}/jk select · ${configuredKeys(this.keybindings, "tui.select.confirm")} take over · x abort · ${configuredKeys(this.keybindings, "tui.select.cancel")} close`,
-        ),
+        [
+          theme.fg(
+            "dim",
+            `  ${keyText("tui.select.up")}/${keyText("tui.select.down")}/jk`,
+          ) + theme.fg("muted", " select"),
+          keyHint("tui.select.confirm", "take over"),
+          rawKeyHint("x", "abort"),
+          keyHint("tui.select.cancel", "close"),
+        ].join(theme.fg("dim", " · ")),
         width,
+        ELLIPSIS,
       ),
     );
 
@@ -339,19 +346,15 @@ class SubagentDashboard implements Component {
     const theme = this.theme;
     const out: string[] = [];
 
-    // Scroll window around selection
-    let start = 0;
-    if (subs.length > height) {
-      start = Math.min(
-        Math.max(0, this.selection.index - Math.floor(height / 2)),
-        subs.length - height,
-      );
-    }
-    const visible = subs.slice(start, start + height);
+    // Scroll window centered on the selection; sliceViewport clamps the
+    // offset to the maximum window so the ". . . more" markers stay truthful.
+    const centered = Math.max(0, this.selection.index - Math.floor(height / 2));
+    const window = sliceViewport(subs, centered, height);
+    const visible = window.items;
 
     for (let i = 0; i < visible.length; i++) {
       const snap = visible[i];
-      const index = start + i;
+      const index = window.offset + i;
       const isSelected = index === this.selection.index;
 
       // Left: marker, question badge, status square, title, dim id
@@ -376,18 +379,29 @@ class SubagentDashboard implements Component {
 
       const rightWidth = visibleWidth(right);
       const leftMax = Math.max(0, width - rightWidth - 2);
-      const leftTruncated = truncateToWidth(left, leftMax);
+      const leftTruncated = truncateToWidth(left, leftMax, ELLIPSIS);
       const gap = Math.max(2, width - visibleWidth(leftTruncated) - rightWidth);
-      out.push(truncateToWidth(leftTruncated + " ".repeat(gap) + right, width));
+      out.push(
+        truncateToWidth(
+          leftTruncated + " ".repeat(gap) + right,
+          width,
+          ELLIPSIS,
+        ),
+      );
     }
 
-    if (start > 0) {
-      out[0] = truncateToWidth(theme.fg("dim", `   ... ${start} more`), width);
-    }
-    if (start + height < subs.length) {
-      out[out.length - 1] = truncateToWidth(
-        theme.fg("dim", `   ... ${subs.length - start - height} more`),
+    if (window.above > 0) {
+      out[0] = truncateToWidth(
+        theme.fg("dim", `   ${ELLIPSIS} ${window.above} more`),
         width,
+        ELLIPSIS,
+      );
+    }
+    if (window.below > 0) {
+      out[out.length - 1] = truncateToWidth(
+        theme.fg("dim", `   ${ELLIPSIS} ${window.below} more`),
+        width,
+        ELLIPSIS,
       );
     }
     return out;
@@ -412,6 +426,7 @@ class TakeoverView implements Component, Focusable {
   private input = new Input();
   /** Scroll offset in lines from the bottom of the transcript. 0 = pinned to bottom. */
   private scrollOffset = 0;
+  private transcriptCache = createTranscriptLineCache();
   private unsubscribe: () => void;
   private renderTimer?: ReturnType<typeof setTimeout>;
   private ticker: ReturnType<typeof setInterval>;
@@ -531,10 +546,9 @@ class TakeoverView implements Component, Focusable {
   }
 
   private viewportHeight(): number {
-    const rows = this.tui.terminal.rows || 30;
-    // The complete view renders viewport + 7 chrome rows. Using rows - 8
-    // makes the overlay exactly terminal rows - 1.
-    return Math.max(6, rows - 8);
+    // The complete view renders viewport + 7 chrome rows; reserving terminal
+    // rows - 8 makes the overlay exactly terminal rows - 1.
+    return viewportRows(this.tui.terminal.rows || 30, 8, 6);
   }
 
   render(width: number): string[] {
@@ -561,12 +575,15 @@ class TakeoverView implements Component, Focusable {
         : "") +
       theme.fg("dim", ` · ${snap.backend}: ${snap.meta.modelLabel ?? "?"}`) +
       (utilization ? theme.fg("dim", ` · ${utilization}`) : "");
-    lines.push(truncateToWidth(header, width));
+    lines.push(truncateToWidth(header, width, ELLIPSIS));
     lines.push(border);
 
     // Fixed-height transcript viewport. Error and scroll status consume rows
     // inside the viewport so streaming/scrolling never changes overlay height.
-    const transcript = buildTranscriptLines(snap, width, theme);
+    // The lines are memoized by (revision, width, theme): the 1 Hz clock,
+    // scrolling and keystrokes reuse the previous frame instead of re-wrapping
+    // the whole history.
+    const transcript = this.transcriptCache.get(snap, width, theme);
     const viewport = this.viewportHeight();
     const errorRows = snap.errorText ? 1 : 0;
     const scrollRows = this.scrollOffset > 0 ? 1 : 0;
@@ -577,7 +594,11 @@ class TakeoverView implements Component, Focusable {
     const body: string[] = [];
     if (snap.errorText) {
       body.push(
-        truncateToWidth(theme.fg("error", `error: ${snap.errorText}`), width),
+        truncateToWidth(
+          theme.fg("error", `error: ${snap.errorText}`),
+          width,
+          ELLIPSIS,
+        ),
       );
     }
 
@@ -585,16 +606,26 @@ class TakeoverView implements Component, Focusable {
       1,
       viewport - body.length - (this.scrollOffset > 0 ? 1 : 0),
     );
-    const end = transcript.length - this.scrollOffset;
-    const visible = transcript.slice(Math.max(0, end - capacity), end);
-    if (visible.length === 0) body.push(theme.fg("dim", "(no output yet)"));
-    else body.push(...visible);
+    const window = sliceViewport(
+      transcript,
+      transcript.length - capacity - this.scrollOffset,
+      capacity,
+    );
+    if (window.items.length === 0) {
+      body.push(theme.fg("dim", "(no output yet)"));
+    } else {
+      body.push(...window.items);
+    }
 
-    if (this.scrollOffset > 0) {
+    if (window.below > 0) {
       body.push(
         truncateToWidth(
-          theme.fg("dim", `... ${this.scrollOffset} lines below · ↓/pgdn`),
+          theme.fg(
+            "dim",
+            `${ELLIPSIS} ${window.below} lines below · ${keyText("tui.editor.pageDown")}`,
+          ),
           width,
+          ELLIPSIS,
         ),
       );
     }
@@ -605,11 +636,21 @@ class TakeoverView implements Component, Focusable {
     lines.push(...this.input.render(width));
     lines.push(
       truncateToWidth(
-        theme.fg(
-          "dim",
-          `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`,
-        ),
+        [
+          keyHint("tui.input.submit", "send"),
+          keyHint("app.interrupt", "back"),
+          keyHint("app.clear", "abort run"),
+          theme.fg(
+            "dim",
+            `${keyText("tui.editor.cursorUp")}/${keyText("tui.editor.cursorDown")}`,
+          ) + theme.fg("muted", " scroll"),
+          theme.fg(
+            "dim",
+            `${keyText("tui.editor.pageUp")}/${keyText("tui.editor.pageDown")}`,
+          ) + theme.fg("muted", " page"),
+        ].join(theme.fg("dim", " · ")),
         width,
+        ELLIPSIS,
       ),
     );
     lines.push(border);
@@ -618,5 +659,6 @@ class TakeoverView implements Component, Focusable {
 
   invalidate(): void {
     this.input.invalidate();
+    this.transcriptCache.invalidate();
   }
 }

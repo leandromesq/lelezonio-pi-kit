@@ -1,20 +1,11 @@
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { sanitizeTerminalText } from "../../../shared/terminal-text.ts";
+import { createTranscriptLineCache } from "../../../shared/ui/transcript-cache.ts";
 
-// eslint-disable-next-line no-control-regex
-const OSC_PATTERN =
-  /(?:\u001b\]|\u009d)(?:[^\u0007\u001b\u009c]|\u001b(?!\\))*(?:\u0007|\u001b\\|\u009c)/g;
-// eslint-disable-next-line no-control-regex
-const CSI_PATTERN = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g;
-// eslint-disable-next-line no-control-regex
-const ESCAPE_PATTERN = /\u001b(?:[()][0-2A-Z]|[ -/]*[@-~])/g;
-
+/** Transcript policy on the shared stripping: expand tabs, drop controls. */
 export function sanitizeText(text: string) {
-  return text
-    .replace(OSC_PATTERN, "")
-    .replace(CSI_PATTERN, "")
-    .replace(ESCAPE_PATTERN, "")
-    .replaceAll("\t", "  ")
-    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+  return sanitizeTerminalText(text, { tabWidth: 2 });
 }
 
 export function buildTranscriptLines(text: string, width: number) {
@@ -26,4 +17,43 @@ export function buildTranscriptLines(text: string, width: number) {
   }
   if (lines.at(-1) === "") lines.pop();
   return lines;
+}
+
+/** The per-frame input the shared cache keys on: the text plus its revision. */
+interface TranscriptInput {
+  text: string;
+  revision: number;
+}
+
+/**
+ * Render-cache contract of `docs/ui-conventions.md` section 8 for the remote
+ * takeover transcript: re-wrapping the whole transcript is the expensive part
+ * of a frame, so the lines are memoized by (transcript revision, width, theme)
+ * and only rebuilt when one of those actually changes. The caller bumps the
+ * revision from `RemoteAgentSnapshot.transcriptVersion`.
+ */
+export function createTranscriptCache() {
+  const cache = createTranscriptLineCache<TranscriptInput, string>({
+    revision: (input) => input.revision,
+    // The whole transcript is one committed chunk: a flat text blob has no
+    // item identity to reuse, so any change rebuilds it as before.
+    items: (input) => [input.text],
+    renderItem: (_theme, text, width, out) => {
+      out.push(...buildTranscriptLines(text, width));
+    },
+    assemble: (committed) => committed,
+  });
+  return {
+    get(
+      text: string,
+      nextRevision: number,
+      nextWidth: number,
+      nextTheme: Theme,
+    ) {
+      return cache.get({ text, revision: nextRevision }, nextWidth, nextTheme);
+    },
+    invalidate() {
+      cache.invalidate();
+    },
+  };
 }

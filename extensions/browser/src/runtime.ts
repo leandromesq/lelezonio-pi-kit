@@ -15,22 +15,49 @@
  * calls so cookies/localStorage survive between turns. `teardown()` closes
  * it; a later `ensurePage()` simply relaunches on the same profile dir, so
  * `/browser off` followed by `/browser on` works.
+ *
+ * Cost: playwright-core is imported lazily as well (see `loadPlaywright`), so
+ * processes that never open a browser (including every subagent child) never
+ * load the package.
  */
 
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  chromium,
-  type BrowserContext,
-  type ConsoleMessage,
-  type Page,
-  type Request,
-  type Response,
+// Types only: playwright-core is loaded on demand (see `loadPlaywright`), so
+// every pi process — parent and each subagent child — does not pay for it
+// unless a browser tool actually opens the browser.
+import type {
+  BrowserContext,
+  ConsoleMessage,
+  Page,
+  Request,
+  Response,
 } from "playwright-core";
 import { boundConsoleText, boundPush, boundUrl } from "./buffer.ts";
 import { boundHeaders } from "./headers.ts";
 import type { ConsoleEntry, NetEntry } from "./types.ts";
+
+type Playwright = typeof import("playwright-core");
+
+let playwrightPromise: Promise<Playwright> | undefined;
+
+/**
+ * Import playwright-core on first use. Cached for the runtime's lifetime, so
+ * repeated launches and relaunches share one module instance. A missing
+ * package surfaces here as a clear, actionable error instead of failing
+ * extension loading — the extension keeps working (and its gate/close tools
+ * stay usable) even when the dependency is absent.
+ */
+function loadPlaywright(): Promise<Playwright> {
+  playwrightPromise ??= import("playwright-core").catch((cause: unknown) => {
+    throw new Error(
+      "playwright-core is not installed: run `npm install` in extensions/browser, then `/reload` in pi.",
+      { cause },
+    );
+  });
+  return playwrightPromise;
+}
 
 export interface BrowserRuntimeOptions {
   /** Persistent user-data dir (cookies, localStorage, IndexedDB). */
@@ -117,6 +144,8 @@ export class BrowserRuntime {
     if (this.page && !this.page.isClosed()) return this.page;
 
     if (!this.context) {
+      // Last possible moment: only a launch needs playwright-core.
+      const { chromium } = await loadPlaywright();
       this.context = await chromium.launchPersistentContext(
         this.options.profileDir,
         {

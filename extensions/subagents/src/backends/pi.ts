@@ -39,7 +39,7 @@ import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
 import { childToolLoadout } from "../profile.ts";
-import { trySpawnHerdrWorker } from "./herdr-worker.ts";
+import { trySpawnHerdrWorkerOutcome } from "./herdr-worker.ts";
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 
@@ -255,6 +255,9 @@ function boundedError(error: unknown) {
 
 const makePiSession = (
   task: SpawnTask,
+  /** Why a Herdr worker pane was not used for this subagent (when one was
+   * attempted). Carried in the session meta so a silent fallback is visible. */
+  fallbackReason?: string,
 ): Effect.Effect<SubagentSession, SpawnError, Scope.Scope> =>
   Effect.gen(function* () {
     const registry = task.parent.modelRegistry;
@@ -468,6 +471,7 @@ const makePiSession = (
         modelLabel: m ? `${m.provider}/${m.id}` : undefined,
         contextWindow: m?.contextWindow,
         sessionFilePath: session.sessionFile,
+        ...(fallbackReason ? { fallbackReason } : {}),
       };
     };
 
@@ -691,14 +695,15 @@ export const piBackend: SubagentBackend = {
     Effect.gen(function* () {
       // Inside Herdr, spawn the subagent as a native interactive pi TUI in
       // the shared workspace's Subagents tab; any pre-launch failure falls
-      // back to the in-process SDK session below (unchanged behavior).
+      // back to the in-process SDK session below (unchanged behavior). The
+      // reason is threaded into the session meta so the fallback is announced
+      // instead of silently looking like a normal spawn.
       // Nesting-capable children are always headless: their subagent_spawn
       // tool is an in-process callback a Herdr TUI child cannot host.
       if (!task.parent.nest) {
-        const worker = yield* trySpawnHerdrWorker("pi", task).pipe(
-          Effect.orElseSucceed(() => undefined),
-        );
-        if (worker) return worker;
+        const outcome = yield* trySpawnHerdrWorkerOutcome("pi", task);
+        if (outcome.session) return outcome.session;
+        return yield* makePiSession(task, outcome.error);
       }
       return yield* makePiSession(task);
     }),

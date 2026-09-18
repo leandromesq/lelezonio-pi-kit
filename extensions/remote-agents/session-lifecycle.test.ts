@@ -28,6 +28,10 @@ import {
  * The test drives the REAL extension through the REAL pi loader and
  * ExtensionRunner, with an agent dir pointing at a fake delayed ssh
  * executable, so it is deterministic, seconds-long, and needs no network.
+ *
+ * A tracked job is seeded because session_start only initializes the manager
+ * (and therefore only starts ssh) when the registry holds something to
+ * reconcile; an empty registry must stay completely offline.
  */
 
 const SSH_DELAY_MS = 800;
@@ -44,7 +48,43 @@ interface TestEnv {
   sshLog: string;
 }
 
-async function createEnv(): Promise<TestEnv> {
+/** Seed a tracked job so session_start initializes the manager (and runs ssh). */
+function seedTrackedJob(agentDir: string) {
+  const registryDir = path.join(agentDir, "remote-agents");
+  fs.mkdirSync(registryDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(registryDir, "jobs.json"),
+    JSON.stringify(
+      {
+        version: 1,
+        jobs: [
+          {
+            id: "ra-seeded",
+            name: "pi-remote-ra-seeded",
+            title: "seeded",
+            host: "fake-host",
+            localCwd: agentDir,
+            remoteCwd: "/fake/Worktrees",
+            status: "working",
+            createdAt: 1,
+            updatedAt: 2,
+            transcript: "",
+            transcriptVersion: 0,
+            generation: 1,
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+async function createEnv(options: {
+  trackedJobs: boolean;
+  /** Overrides the fake ssh, e.g. with a command that fails fast everywhere. */
+  sshExecutable?: string;
+}): Promise<TestEnv> {
   const directory = fs.mkdtempSync(
     path.join(os.tmpdir(), "remote-agents-session-"),
   );
@@ -71,7 +111,7 @@ async function createEnv(): Promise<TestEnv> {
     path.join(agentDir, "remote-agents.json"),
     JSON.stringify({
       host: "fake-host",
-      sshExecutable: sshScript,
+      sshExecutable: options.sshExecutable ?? sshScript,
       remoteHelper: path.join(directory, "helper.py"),
       projectsRoot: "/fake/Projects",
       worktreesRoot: "/fake/Worktrees",
@@ -82,6 +122,7 @@ async function createEnv(): Promise<TestEnv> {
   setEnv("PI_CODING_AGENT_DIR", agentDir);
   setEnv("FAKE_SSH_LOG", sshLog);
   setEnv("FAKE_SSH_DELAY_S", String(SSH_DELAY_MS / 1000));
+  if (options.trackedJobs) seedTrackedJob(agentDir);
   return { directory, agentDir, sshLog };
 }
 
@@ -214,7 +255,7 @@ for (const reason of ["new", "reload"] as const) {
       rejections.push(value);
     };
     process.on("unhandledRejection", onRejection);
-    const env = await createEnv();
+    const env = await createEnv({ trackedJobs: true });
     try {
       const { runner, ui, errors } = await createHarness(env);
       await runner.emit({ type: "session_start", reason: "startup" });
@@ -259,7 +300,7 @@ test("initialization failure while current is contained and graceful shutdown st
     rejections.push(value);
   };
   process.on("unhandledRejection", onRejection);
-  const env = await createEnv();
+  const env = await createEnv({ trackedJobs: true });
   try {
     const { runner, ui, errors } = await createHarness(env);
     await runner.emit({ type: "session_start", reason: "startup" });
@@ -280,10 +321,10 @@ test("initialization failure while current is contained and graceful shutdown st
       "expected ssh failure during reconcile not to notify",
     );
     // updateStatus() ran after initialization completed: the status line was
-    // cleared because the registry is empty.
+    // refreshed for the seeded job.
     assert.ok(
       ui.statusCalls.some(
-        (call) => call.key === "remote-agents" && call.text === undefined,
+        (call) => call.key === "remote-agents" && call.text !== undefined,
       ),
       "expected initialization to complete and update the status line",
     );
@@ -298,6 +339,102 @@ test("initialization failure while current is contained and graceful shutdown st
       [],
       "expected zero unhandled rejections after graceful shutdown",
     );
+  } finally {
+    process.removeListener("unhandledRejection", onRejection);
+    restoreEnv(previousEnv);
+    fs.rmSync(env.directory, { recursive: true, force: true });
+  }
+});
+
+test("session_start still initializes the manager when the registry tracks a job", async () => {
+  const previousEnv: Record<string, string | undefined> = {};
+  for (const name of ENV_VARS) previousEnv[name] = process.env[name];
+  // Node is used as a portable ssh stand-in: it fails the request fast on every
+  // platform, so the manager still comes up degraded and reports the job.
+  const env = await createEnv({
+    trackedJobs: true,
+    sshExecutable: process.execPath,
+  });
+  try {
+    const { runner, ui, errors } = await createHarness(env);
+    await runner.emit({ type: "session_start", reason: "startup" });
+    await waitFor(
+      () =>
+        ui.statusCalls.some(
+          (call) => call.key === "remote-agents" && call.text !== undefined,
+        ),
+      "the tracked job to appear in the status line",
+    );
+    assert.deepEqual(
+      ui.statusCalls.map((call) => call.text),
+      ["remote: ■ 1 running · /remotes to view"],
+    );
+    assert.equal(ui.notifyCalls.length, 0);
+    assert.deepEqual(errors, []);
+
+    await runner.emit({ type: "session_shutdown", reason: "quit" });
+    runner.invalidate();
+    await sleep(200);
+    assert.deepEqual(errors, []);
+  } finally {
+    restoreEnv(previousEnv);
+    fs.rmSync(env.directory, { recursive: true, force: true });
+  }
+});
+
+test("an empty registry starts no ssh and initializes the manager on demand", async () => {
+  const previousEnv: Record<string, string | undefined> = {};
+  for (const name of ENV_VARS) previousEnv[name] = process.env[name];
+  const rejections: unknown[] = [];
+  const onRejection = (value: unknown) => {
+    rejections.push(value);
+  };
+  process.on("unhandledRejection", onRejection);
+  const env = await createEnv({ trackedJobs: false });
+  try {
+    const { runner, ui, errors } = await createHarness(env);
+    await runner.emit({ type: "session_start", reason: "startup" });
+    // Every child Herdr agent is a full Pi process that loads this extension.
+    // With nothing to reconcile, startup must not upload/ping the remote helper
+    // over SSH, and must not create the manager at all.
+    await settleDelay();
+    await sleep(200);
+    assert.equal(
+      fs.existsSync(env.sshLog),
+      false,
+      "expected no ssh during startup with an empty registry",
+    );
+    assert.deepEqual(
+      ui.statusCalls,
+      [],
+      "expected no manager status at startup",
+    );
+    assert.equal(
+      ui.notifyCalls.length,
+      0,
+      "expected no notifications at startup",
+    );
+    assert.deepEqual(rejections, []);
+    assert.deepEqual(errors, []);
+
+    // The first real use still creates the manager on demand.
+    const command = runner.getCommand("remote-clean");
+    assert.ok(command, "expected the remote-clean command to be registered");
+    await command!.handler("", runner.createCommandContext());
+    await waitFor(
+      () => ui.notifyCalls.length > 0,
+      "remote-clean to report an empty registry",
+    );
+    assert.deepEqual(
+      ui.notifyCalls.map((call) => call.message),
+      ["No stale remote workspaces"],
+    );
+
+    await runner.emit({ type: "session_shutdown", reason: "quit" });
+    runner.invalidate();
+    await sleep(200);
+    assert.deepEqual(rejections, []);
+    assert.deepEqual(errors, []);
   } finally {
     process.removeListener("unhandledRejection", onRejection);
     restoreEnv(previousEnv);

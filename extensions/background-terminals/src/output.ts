@@ -18,12 +18,20 @@ export class OutputBuffer {
   private chunks: string[] = [];
   /** Bytes currently retained across `chunks`. */
   private retainedBytes = 0;
+  /** Characters currently retained across `chunks` (mirrors `retainedBytes`). */
+  private retainedChars = 0;
   /** Cached join of `chunks`; invalidated on push so 1Hz UI ticks are cheap. */
   private cachedText: string | undefined = "";
   /** Bumped on every push; lets the UI cache derived line layouts. */
   version = 0;
   totalBytes = 0;
   truncatedBytes = 0;
+  /**
+   * Characters dropped from the head of the retained view. The incremental
+   * line cache uses this to know exactly how much of its built lines were
+   * evicted, without re-scanning the whole buffer.
+   */
+  truncatedChars = 0;
   spillPath?: string;
 
   private readonly maxRetainedBytes: number;
@@ -46,17 +54,24 @@ export class OutputBuffer {
       // Retention stays strictly bounded even for one giant write, and the
       // retained view stays contiguous (no hole in the middle).
       this.truncatedBytes += this.retainedBytes;
+      this.truncatedChars += this.retainedChars;
       this.chunks = [];
       this.retainedBytes = 0;
+      this.retainedChars = 0;
       const raw = Buffer.from(chunk, "utf8");
       let start = raw.length - this.maxRetainedBytes;
       while (start < raw.length && (raw[start] & 0xc0) === 0x80) start++;
       this.truncatedBytes += start;
-      chunk = raw.subarray(start).toString("utf8");
+      const trimmed = raw.subarray(start).toString("utf8");
+      // `start` is on a UTF-8 code point boundary, so the dropped prefix has
+      // exactly this many decoded characters.
+      this.truncatedChars += chunk.length - trimmed.length;
+      chunk = trimmed;
       bytes = raw.length - start;
     }
     this.chunks.push(chunk);
     this.retainedBytes += bytes;
+    this.retainedChars += chunk.length;
     while (
       this.retainedBytes > this.maxRetainedBytes &&
       this.chunks.length > 1
@@ -65,7 +80,9 @@ export class OutputBuffer {
       if (evicted === undefined) break;
       const evictedBytes = Buffer.byteLength(evicted, "utf8");
       this.retainedBytes -= evictedBytes;
+      this.retainedChars -= evicted.length;
       this.truncatedBytes += evictedBytes;
+      this.truncatedChars += evicted.length;
     }
     this.cachedText = undefined;
     this.version++;
@@ -78,6 +95,7 @@ export class OutputBuffer {
       text: this.cachedText,
       totalBytes: this.totalBytes,
       truncatedBytes: this.truncatedBytes,
+      truncatedChars: this.truncatedChars,
       spillPath: this.spillPath,
     };
   }

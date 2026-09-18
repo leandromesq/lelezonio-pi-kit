@@ -28,6 +28,7 @@ import {
   truncateToWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { viewportRows } from "../shared/ui/viewport.ts";
 import { loadSnippets, type Snippet } from "./snippets.ts";
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
@@ -85,7 +86,7 @@ export default function (pi: ExtensionAPI) {
     );
 
     if (snippets.length === 0) {
-      ctx.ui.notify(`No snippets found in ${snippetsDir}`, "warning");
+      ctx.ui.notify(`(no snippets found in ${snippetsDir})`, "warning");
       updateWidget(ctx);
       return;
     }
@@ -94,10 +95,29 @@ export default function (pi: ExtensionAPI) {
     const working = new Set(enabled);
 
     const confirmed = await ctx.ui.custom<boolean>(
-      (tui, theme, _keybindings, done) => {
+      (tui, theme, keybindings, done) => {
         const prepends = snippets.filter((s) => s.placement === "prepend");
         const appends = snippets.filter((s) => s.placement === "append");
         const items = [...prepends, ...appends];
+        const keys = {
+          up: keybindings.getKeys("tui.select.up").join("/") || "up",
+          down: keybindings.getKeys("tui.select.down").join("/") || "down",
+          confirm:
+            keybindings.getKeys("tui.select.confirm").join("/") || "enter",
+          cancel: keybindings.getKeys("tui.select.cancel").join("/") || "esc",
+        };
+        const up = (data: string) =>
+          matchesKey(data, Key.up) ||
+          keybindings.matches(data, "tui.select.up");
+        const down = (data: string) =>
+          matchesKey(data, Key.down) ||
+          keybindings.matches(data, "tui.select.down");
+        const confirm = (data: string) =>
+          matchesKey(data, Key.enter) ||
+          keybindings.matches(data, "tui.select.confirm");
+        const cancel = (data: string) =>
+          matchesKey(data, Key.escape) ||
+          keybindings.matches(data, "tui.select.cancel");
 
         let mode: "list" | "preview" = "list";
         let cursor = 0;
@@ -109,7 +129,7 @@ export default function (pi: ExtensionAPI) {
           idx: number,
           width: number,
         ): string => {
-          const pointer = idx === cursor ? theme.fg("accent", "> ") : "  ";
+          const pointer = idx === cursor ? theme.fg("accent", "❯ ") : "  ";
           const checkbox = working.has(snippet.id)
             ? theme.fg("success", "[x]")
             : theme.fg("dim", "[ ]");
@@ -119,6 +139,7 @@ export default function (pi: ExtensionAPI) {
           return truncateToWidth(
             `${pointer}${checkbox} ${theme.bold(snippet.name)}${desc}`,
             width,
+            "…",
           );
         };
 
@@ -153,7 +174,7 @@ export default function (pi: ExtensionAPI) {
           width: number,
         ): string[] => {
           const rows: string[] = [];
-          rows.push(truncateToWidth(theme.bold(snippet.name), width));
+          rows.push(truncateToWidth(theme.bold(snippet.name), width, "…"));
           rows.push(
             truncateToWidth(
               theme.fg(
@@ -161,12 +182,13 @@ export default function (pi: ExtensionAPI) {
                 `${snippet.placement} · order ${snippet.order} · ${snippet.id}`,
               ),
               width,
+              "…",
             ),
           );
           rows.push(theme.fg("dim", "─".repeat(Math.min(width, 40))));
           for (const line of snippet.body.split("\n")) {
             for (const wrapped of wrapTextWithAnsi(line, width)) {
-              rows.push(truncateToWidth(wrapped, width));
+              rows.push(truncateToWidth(wrapped, width, "…"));
             }
           }
           return rows;
@@ -213,8 +235,8 @@ export default function (pi: ExtensionAPI) {
 
         return {
           render(width: number): string[] {
-            // Reserve lines for: top border, title, blank, blank, hints, bottom border.
-            const maxView = Math.max(5, tui.terminal.rows - 10);
+            // Reserve lines for: top rule, title, blank, blank, hints, bottom rule.
+            const maxView = viewportRows(tui.terminal.rows, 10, 5);
 
             let content: string[];
             let title: string;
@@ -231,8 +253,7 @@ export default function (pi: ExtensionAPI) {
               content = v.out;
               listScroll = v.scroll;
               title = "Prompt snippets";
-              hints =
-                "↑↓ navigate • Space toggle • Tab preview • Enter apply • Esc cancel";
+              hints = `${keys.up}/${keys.down} navigate · Space toggle · Tab preview · ${keys.confirm} apply · ${keys.cancel} cancel`;
             } else {
               const snippet = items[cursor];
               const rows = buildPreviewRows(snippet, width);
@@ -240,29 +261,30 @@ export default function (pi: ExtensionAPI) {
               content = v.out;
               previewScroll = v.scroll;
               title = `Preview: ${snippet.name}`;
-              hints = "↑↓ scroll • Tab/Esc back";
+              hints = `${keys.up}/${keys.down} scroll · Tab/${keys.cancel} back`;
             }
 
             return [
-              theme.fg("accent", "─".repeat(width)),
+              theme.fg("borderAccent", "─".repeat(width)),
               truncateToWidth(
                 ` ${theme.fg("accent", theme.bold(title))}`,
                 width,
+                "…",
               ),
               "",
               ...content,
               "",
-              truncateToWidth(theme.fg("dim", ` ${hints}`), width),
-              theme.fg("accent", "─".repeat(width)),
+              truncateToWidth(theme.fg("dim", ` ${hints}`), width, "…"),
+              theme.fg("borderAccent", "─".repeat(width)),
             ];
           },
           invalidate() {},
           handleInput(data: string) {
             if (mode === "list") {
-              if (matchesKey(data, Key.up)) {
+              if (up(data)) {
                 cursor = (cursor - 1 + items.length) % items.length;
                 tui.requestRender();
-              } else if (matchesKey(data, Key.down)) {
+              } else if (down(data)) {
                 cursor = (cursor + 1) % items.length;
                 tui.requestRender();
               } else if (matchesKey(data, Key.space)) {
@@ -274,22 +296,19 @@ export default function (pi: ExtensionAPI) {
                 mode = "preview";
                 previewScroll = 0;
                 tui.requestRender();
-              } else if (matchesKey(data, Key.enter)) {
+              } else if (confirm(data)) {
                 done(true);
-              } else if (matchesKey(data, Key.escape)) {
+              } else if (cancel(data)) {
                 done(false);
               }
             } else {
-              if (matchesKey(data, Key.up)) {
+              if (up(data)) {
                 previewScroll--;
                 tui.requestRender();
-              } else if (matchesKey(data, Key.down)) {
+              } else if (down(data)) {
                 previewScroll++;
                 tui.requestRender();
-              } else if (
-                matchesKey(data, Key.tab) ||
-                matchesKey(data, Key.escape)
-              ) {
+              } else if (matchesKey(data, Key.tab) || cancel(data)) {
                 mode = "list";
                 tui.requestRender();
               }

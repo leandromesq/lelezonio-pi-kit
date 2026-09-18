@@ -22,6 +22,7 @@ import {
   resetHerdrWorkerDepsForTests,
   setHerdrWorkerDepsForTests,
   trySpawnHerdrWorker,
+  trySpawnHerdrWorkerOutcome,
   type HerdrWorkerDeps,
 } from "./src/backends/herdr-worker.ts";
 import { toolPolicyFor } from "./src/profile.ts";
@@ -342,6 +343,20 @@ test("trySpawnHerdrWorker resolves undefined when the pane cannot open", async (
   assert.equal((exit as Exit.Success<unknown>).value, undefined);
 });
 
+test("trySpawnHerdrWorkerOutcome reports WHY the worker pane was not created", async () => {
+  const ws = stubWorkspace();
+  ws.failOpen = true;
+  setHerdrWorkerDepsForTests(testDeps(ws));
+  const exit = await Effect.runPromiseExit(
+    Effect.scoped(trySpawnHerdrWorkerOutcome("pi", task("x"))),
+  );
+  assert.ok(Exit.isSuccess(exit));
+  const outcome = (exit as Exit.Success<{ session?: unknown; error?: string }>)
+    .value;
+  assert.equal(outcome.session, undefined);
+  assert.match(outcome.error ?? "", /herdr worker pane unavailable/);
+});
+
 test("pi worker: pane runs only node <launcher> <spec>; spec carries raw argv + PI_SUBAGENT=1 and is cleaned", async () => {
   const ws = stubWorkspace();
   const root = freshSessionRoot();
@@ -385,6 +400,9 @@ test("pi worker: pane runs only node <launcher> <spec>; spec carries raw argv + 
       assert.ok(spec.args.includes("--approve"));
       assert.equal(spec.cwd, "C:\\work\\proj");
       assert.equal(spec.env.PI_SUBAGENT, "1");
+      // Observational memory would otherwise run model workers and proactive
+      // compaction inside every worker session; workers are execution units.
+      assert.equal(spec.env.PI_OBSERVATIONAL_MEMORY_PASSIVE, "1");
       // Children ask the orchestrator via a sidecar next to their session;
       // the spec must teach the child where to write it.
       const askPath = spec.env.PI_SUBAGENT_ASK_FILE;
@@ -485,7 +503,7 @@ test("worker startup exit before a session file settles as failed", async () => 
   );
 });
 
-test("pi initial submission watchdog retries Enter once without retyping and settles zero-turn idle", async () => {
+test("pi initial submission retypes the whole prompt once and settles zero-turn idle", async () => {
   const ws = stubWorkspace(() => "idle");
   const root = freshSessionRoot();
   let now = 0;
@@ -507,9 +525,21 @@ test("pi initial submission watchdog retries Enter once without retyping and set
         () => events.some((event) => event._tag === "RunSettled"),
         "zero-turn startup watchdog",
       );
-      assert.equal(ws.prompts.length, 1, "initial text is delivered once");
-      assert.equal(ws.prompts[0], "never submits");
-      assert.equal(ws.enters, 2, "initial Enter plus one Enter-only retry");
+      assert.equal(
+        ws.prompts.length,
+        2,
+        "the full prompt is retyped only after the Enter-only window expired",
+      );
+      assert.deepEqual(ws.prompts, ["never submits", "never submits"]);
+      assert.equal(
+        ws.enters,
+        3,
+        "initial Enter + Enter-only retry + retype Enter",
+      );
+      assert.ok(
+        now >= 30,
+        `the run only fails after ALL THREE bounded windows (now=${now})`,
+      );
       assert.equal(
         events.filter((event) => event._tag === "RunStarted").length,
         1,
@@ -518,7 +548,7 @@ test("pi initial submission watchdog retries Enter once without retyping and set
       assert.equal(diagnostic?._tag, "BackendError");
       if (diagnostic?._tag === "BackendError") {
         assert.match(diagnostic.message, /zero turns/);
-        assert.match(diagnostic.message, /Enter-only retry/);
+        assert.match(diagnostic.message, /bounded submission retries/);
       }
       const settledEvent = events.find((event) => event._tag === "RunSettled");
       assert.equal(settledEvent?._tag, "RunSettled");
@@ -533,7 +563,7 @@ test("pi initial submission watchdog retries Enter once without retyping and set
   );
 });
 
-test("pi initial Enter-only retry recovers a startup-raced submission", async () => {
+test("pi initial Enter-only retry recovers a submission whose Enter was lost", async () => {
   const ws = stubWorkspace();
   const root = freshSessionRoot();
   const sessionDir = path.join(root, "sessions", "sa-3");
@@ -571,8 +601,13 @@ test("pi initial Enter-only retry recovers a startup-raced submission", async ()
         () => events.some((event) => event._tag === "RunSettled"),
         "recovered startup-raced run",
       );
-      assert.equal(ws.prompts.length, 1);
-      assert.equal(ws.enters, 2, "only the Enter key was retried");
+      assert.equal(
+        ws.prompts.length,
+        1,
+        "the text was already in the editor; it is NOT retyped",
+      );
+      assert.deepEqual(ws.prompts, ["raced prompt"]);
+      assert.equal(ws.enters, 2, "the Enter-only retry is what submitted it");
       assert.equal(
         events.some((event) => event._tag === "BackendError"),
         false,
@@ -584,6 +619,191 @@ test("pi initial Enter-only retry recovers a startup-raced submission", async ()
           _tag: "Completed",
           finalText: "recovered",
         });
+    },
+  );
+});
+
+test("pi full-prompt retype recovers a submission whose text was dropped", async () => {
+  const ws = stubWorkspace();
+  const root = freshSessionRoot();
+  const sessionDir = path.join(root, "sessions", "sa-3");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  // The production failure: the transport never delivered the text, so BOTH
+  // earlier phases see nothing; the retyped prompt is what finally lands.
+  ws.onEnter = (count) => {
+    if (count !== 3) return;
+    const id = piNativeSessionId(ws);
+    const file = path.join(sessionDir, `2026-01-01T00-00-00_${id}.jsonl`);
+    fs.writeFileSync(
+      file,
+      [
+        ...piSessionLines("C:\\work\\proj", id),
+        piUserLine("u1", "dropped prompt"),
+        piAssistantLine("a1", "recovered after retype"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+  };
+  let now = 0;
+  const fakeSleep = async (ms: number) => {
+    now += ms;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+  await withSession(
+    "pi",
+    testDeps(ws, root, {
+      clock: () => now,
+      sleep: fakeSleep,
+      pollIntervalMs: 5,
+      initialSubmissionWatchdogMs: 10,
+    }),
+    task("dropped prompt"),
+    async (_session, events) => {
+      await waitFor(
+        () => events.some((event) => event._tag === "RunSettled"),
+        "phase-3 recovery",
+      );
+      assert.deepEqual(ws.prompts, ["dropped prompt", "dropped prompt"]);
+      assert.equal(ws.enters, 3, "two Enters, then the retype's Enter");
+      assert.equal(
+        events.some((event) => event._tag === "BackendError"),
+        false,
+      );
+      const settledEvent = events.find((event) => event._tag === "RunSettled");
+      assert.deepEqual(settledEvent, {
+        _tag: "RunSettled",
+        outcome: { _tag: "Completed", finalText: "recovered after retype" },
+      });
+    },
+  );
+});
+
+test("pi initial submission truncated in transit fails the run with a divergence diagnostic", async () => {
+  const ws = stubWorkspace();
+  const root = freshSessionRoot();
+  const sessionDir = path.join(root, "sessions", "sa-3");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const prompt = "IMMEDIATE-MARKER alpha beta gamma";
+  const fragment = "ta gamma";
+  // The child's first user turn lands after the very first Enter (the
+  // startup-race case seen in production): the file is there, but its text is
+  // a fragment of the sent prompt.
+  ws.onEnter = (count) => {
+    if (count !== 1) return;
+    const id = piNativeSessionId(ws);
+    const file = path.join(sessionDir, `2026-01-01T00-00-00_${id}.jsonl`);
+    fs.writeFileSync(
+      file,
+      [
+        ...piSessionLines("C:\\work\\proj", id),
+        piUserLine("u1", fragment),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+  };
+  let now = 0;
+  const fakeSleep = async (ms: number) => {
+    now += ms;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+  await withSession(
+    "pi",
+    testDeps(ws, root, {
+      clock: () => now,
+      sleep: fakeSleep,
+      pollIntervalMs: 5,
+      initialSubmissionWatchdogMs: 10,
+    }),
+    task(prompt),
+    async (_session, events) => {
+      await waitFor(
+        () => events.some((event) => event._tag === "RunSettled"),
+        "divergence failure",
+      );
+      assert.equal(
+        ws.prompts.length,
+        1,
+        "a submitted (if wrong) prompt is never retyped",
+      );
+      assert.equal(ws.enters, 1, "no retry Enter after the child submitted");
+      // The mismatched turn is still surfaced as transcript evidence.
+      const user = events.filter((event) => event._tag === "UserMessage");
+      assert.equal(user.length, 1);
+      assert.equal(
+        user[0]?._tag === "UserMessage" ? user[0].text : "",
+        fragment,
+      );
+      const diagnostic = events.find((event) => event._tag === "BackendError");
+      assert.equal(diagnostic?._tag, "BackendError");
+      if (diagnostic?._tag === "BackendError") {
+        assert.ok(
+          diagnostic.message.includes(
+            `${fragment.length} characters submitted instead of ${prompt.length}`,
+          ),
+          `diagnostic names both sizes: ${diagnostic.message}`,
+        );
+      }
+      const settledEvent = events.find((event) => event._tag === "RunSettled");
+      assert.equal(settledEvent?._tag, "RunSettled");
+      if (settledEvent?._tag === "RunSettled") {
+        assert.equal(settledEvent.outcome._tag, "Failed");
+        if (settledEvent.outcome._tag === "Failed")
+          assert.match(settledEvent.outcome.errorText, /instead of/);
+      }
+    },
+  );
+});
+
+test("pi intact initial submission is not retyped and the run carries on", async () => {
+  const ws = stubWorkspace();
+  const root = freshSessionRoot();
+  const sessionDir = path.join(root, "sessions", "sa-3");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  ws.onEnter = (count) => {
+    if (count !== 1) return;
+    const id = piNativeSessionId(ws);
+    const file = path.join(sessionDir, `2026-01-01T00-00-00_${id}.jsonl`);
+    fs.writeFileSync(
+      file,
+      [
+        ...piSessionLines("C:\\work\\proj", id),
+        piUserLine("u1", "do it"),
+        piAssistantLine("a1", "done"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+  };
+  let now = 0;
+  const fakeSleep = async (ms: number) => {
+    now += ms;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+  await withSession(
+    "pi",
+    testDeps(ws, root, {
+      clock: () => now,
+      sleep: fakeSleep,
+      pollIntervalMs: 5,
+      initialSubmissionWatchdogMs: 10,
+    }),
+    task("do it"),
+    async (_session, events) => {
+      await waitFor(
+        () => events.some((event) => event._tag === "RunSettled"),
+        "intact run settle",
+      );
+      assert.equal(ws.prompts.length, 1, "nothing is retyped");
+      assert.equal(ws.prompts[0], "do it");
+      assert.equal(ws.enters, 1, "no retry Enter");
+      assert.equal(
+        events.some((event) => event._tag === "BackendError"),
+        false,
+      );
+      const settledEvent = events.find((event) => event._tag === "RunSettled");
+      assert.deepEqual(settledEvent, {
+        _tag: "RunSettled",
+        outcome: { _tag: "Completed", finalText: "done" },
+      });
     },
   );
 });

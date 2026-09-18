@@ -29,6 +29,8 @@ import {
   type GitInfoState,
   type ModelInfoState,
 } from "../shared/dashboard-state.ts";
+import { formatTokens } from "../shared/format.ts";
+import { sanitizeTerminalText } from "../shared/terminal-text.ts";
 const TITLE_LINES = [
   "▀████████████▀",
   " ╘███    ███  ",
@@ -38,26 +40,9 @@ const TITLE_LINES = [
 ];
 const ANSI_PATTERN =
   /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
-// eslint-disable-next-line no-control-regex
-const OSC_PATTERN =
-  /(?:\u001b\]|\u009d)(?:[^\u0007\u001b\u009c]|\u001b(?!\\))*(?:\u0007|\u001b\\|\u009c)/g;
-// eslint-disable-next-line no-control-regex
-const CSI_PATTERN = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g;
-// eslint-disable-next-line no-control-regex
-const ESCAPE_PATTERN = /\u001b(?:[()][0-2A-Z]|[ -/]*[@-~])/g;
 
 function sanitizeTerminalLabel(text: string) {
-  return text
-    .replace(OSC_PATTERN, "")
-    .replace(CSI_PATTERN, "")
-    .replace(ESCAPE_PATTERN, "")
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
-}
-
-function formatTokens(tokens: number) {
-  if (tokens < 1_000) return `${tokens}`;
-  if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`;
-  return `${(tokens / 1_000_000).toFixed(1)}m`;
+  return sanitizeTerminalText(text, { singleLine: true });
 }
 
 function formatDirectory(cwd: string) {
@@ -491,7 +476,7 @@ export function appendStatusLines(
     .sort(([a], [b]) => a.localeCompare(b))
     .flatMap(([, text]) => text.split("\n"));
   for (const statusLine of statusLines) {
-    lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+    lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "…")));
   }
   return lines;
 }

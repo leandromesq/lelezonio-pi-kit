@@ -26,6 +26,7 @@ import {
   buildAskUserResultMessage,
 } from "./prompt.ts";
 import { pageQuestionScroll, renderAskUserLayout } from "./src/layout.ts";
+import { createWidthKeyedLineCache } from "./src/line-cache.ts";
 
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 5;
@@ -131,7 +132,7 @@ export default function askUser(pi: ExtensionAPI) {
             let questionScroll = 0;
             let questionLineCount = 1;
             let questionVisibleLines = 1;
-            let cachedLines: string[] | undefined;
+            const lineCache = createWidthKeyedLineCache();
 
             let settled = false;
 
@@ -173,7 +174,7 @@ export default function askUser(pi: ExtensionAPI) {
             };
 
             function refresh() {
-              cachedLines = undefined;
+              lineCache.invalidate();
               tui.requestRender();
             }
 
@@ -289,42 +290,43 @@ export default function askUser(pi: ExtensionAPI) {
             }
 
             function render(width: number): string[] {
-              if (cachedLines) return cachedLines;
-
-              const rendered = renderAskUserLayout(
-                {
-                  width,
-                  terminalRows: tui.terminal.rows,
-                  question: params.question,
-                  options: allOptions,
-                  optionIndex,
-                  questionScroll,
-                  detailsExpanded,
-                  editMode,
-                  editorLines: editMode
-                    ? editor.render(Math.max(1, width - 2))
-                    : undefined,
-                },
-                {
-                  accent: (text) => theme.fg("accent", text),
-                  bold: (text) => theme.bold(text),
-                  border: (text) => theme.fg("accent", text),
-                  dim: (text) => theme.fg("dim", text),
-                  muted: (text) => theme.fg("muted", text),
-                  text: (text) => theme.fg("text", text),
-                },
-              );
-              questionScroll = rendered.questionScroll;
-              questionLineCount = rendered.questionLineCount;
-              questionVisibleLines = rendered.questionVisibleLines;
-              cachedLines = rendered.lines;
-              return rendered.lines;
+              // Keyed by width so a terminal resize rebuilds instead of
+              // replaying the previous width's layout.
+              return lineCache.get(width, () => {
+                const rendered = renderAskUserLayout(
+                  {
+                    width,
+                    terminalRows: tui.terminal.rows,
+                    question: params.question,
+                    options: allOptions,
+                    optionIndex,
+                    questionScroll,
+                    detailsExpanded,
+                    editMode,
+                    editorLines: editMode
+                      ? editor.render(Math.max(1, width - 2))
+                      : undefined,
+                  },
+                  {
+                    accent: (text) => theme.fg("accent", text),
+                    bold: (text) => theme.bold(text),
+                    border: (text) => theme.fg("borderAccent", text),
+                    dim: (text) => theme.fg("dim", text),
+                    muted: (text) => theme.fg("muted", text),
+                    text: (text) => theme.fg("text", text),
+                  },
+                );
+                questionScroll = rendered.questionScroll;
+                questionLineCount = rendered.questionLineCount;
+                questionVisibleLines = rendered.questionVisibleLines;
+                return rendered.lines;
+              });
             }
 
             return {
               render,
               invalidate: () => {
-                cachedLines = undefined;
+                lineCache.invalidate();
               },
               handleInput,
               dispose: () => {

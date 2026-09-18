@@ -256,6 +256,57 @@ The setup enables Pi's native fullscreen TUI through `"tuiMode": "fullscreen"` i
 
 Change `tuiMode` to `"regular"` if you prefer the terminal's native scrollback, or disable `quietStartup` if you want the complete loaded-resource listing on every launch.
 
+## Observational memory (optional)
+
+[`pi-observational-memory`](https://github.com/elpapi42/pi-observational-memory) keeps long
+sessions coherent across compactions: it records observations and reflections in the background
+and renders that memory deterministically when Pi compacts, instead of asking a model to
+re-summarize the session at that moment. It is a third-party package, installed into the private
+`settings.json` (not tracked here):
+
+```sh
+pi install npm:pi-observational-memory@3.1.3
+```
+
+Recommended private settings: use a cheap dedicated worker model instead of the session model,
+bound the observer chunk (the derived default is 20% of the worker's context window, which is
+200k tokens on a 1M model), and scale the proactive compaction trigger with the active model
+window instead of the calibrated ~81k default:
+
+```json
+{
+  "observational-memory": {
+    "model": {
+      "provider": "opencode-go",
+      "id": "deepseek-v4.1-flash",
+      "thinking": "low"
+    },
+    "observerChunkMaxTokens": 30000,
+    "compactAfterTokensMode": "ratio",
+    "compactAfterTokensRatio": 0.5,
+    "showWorkerNotifications": false
+  }
+}
+```
+
+Tuning notes:
+
+- `compactAfterTokensRatio` is a policy decision, not a bug: 0.5 compacts a 1M-token model around
+  500k source tokens, well before Pi's own window-pressure threshold (`contextWindow -
+reserveTokens`). Raise it to keep more raw context, lower it if latency matters more than range.
+- `/om:status` shows memory counts and the resolved compaction threshold; `/om:view` copies the
+  rendered memory. Set `debugLog: true` to write `~/.pi/agent/observational-memory/debug/<session>.ndjson`
+  while diagnosing.
+
+This repository keeps the extension out of child sessions, where background memory work is cost
+without benefit:
+
+- Herdr workers receive `PI_OBSERVATIONAL_MEMORY_PASSIVE=1` in the launcher spec
+  (`extensions/subagents/src/backends/herdr-worker.ts`, `writeWorkerLaunchSpec`).
+- In-process children filter the package out of their resource loader
+  (`CHILD_EXCLUDED_EXTENSION_PATHS` in `extensions/shared/child-session.ts`).
+- Removing it: `pi remove npm:pi-observational-memory` and drop the `observational-memory` block.
+
 ## Updating
 
 ```sh

@@ -1,5 +1,5 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { wrapViewportText } from "../../shared/ui/viewport.ts";
+import { viewportRows, wrapViewportText } from "../../shared/ui/viewport.ts";
 
 export interface AskUserLayoutOption {
   label: string;
@@ -46,9 +46,14 @@ const COLLAPSED_DETAIL_LINES = 2;
 const EXPANDED_DETAIL_LINES = 8;
 
 function layoutHeight(terminalRows: number): number {
-  // The overlay is capped at 90% too. Keep a small usable floor so that the
-  // compact layout can still show every option and its controls on short TTYs.
-  return Math.max(8, Math.floor(Math.max(1, terminalRows) * 0.9));
+  // The overlay is capped at 90% too: reserve that band through the shared
+  // viewport helper, with a small usable floor so that the compact layout can
+  // still show every option and its controls on short TTYs.
+  return viewportRows(
+    terminalRows,
+    Math.ceil(Math.max(1, terminalRows) * 0.1),
+    8,
+  );
 }
 
 function visibleQuestionLines(maxLines: number): number {
@@ -161,15 +166,15 @@ function optionLine(
   const styled = selected
     ? theme.accent(label)
     : theme.text(option.isOther ? theme.muted(label) : label);
-  return truncateToWidth(`${prefix}${styled}`, width);
+  return truncateToWidth(`${prefix}${styled}`, width, "…");
 }
 
 function detailLine(line: string, width: number, theme: AskUserLayoutTheme) {
-  return truncateToWidth(`      ${theme.muted(line)}`, width);
+  return truncateToWidth(`      ${theme.muted(line)}`, width, "…");
 }
 
 function questionLine(line: string, width: number, theme: AskUserLayoutTheme) {
-  return truncateToWidth(` ${theme.text(theme.bold(line))}`, width);
+  return truncateToWidth(` ${theme.text(theme.bold(line))}`, width, "…");
 }
 
 /**
@@ -254,19 +259,22 @@ export function renderAskUserLayout(
           truncateToWidth(
             ` ${theme.muted("Your answer:")} ${editor[0] ?? ""}`,
             width,
+            "…",
           ),
         );
       } else {
-        lines.push(truncateToWidth(` ${theme.muted("Your answer:")}`, width));
+        lines.push(
+          truncateToWidth(` ${theme.muted("Your answer:")}`, width, "…"),
+        );
         lines.push(
           ...editor
             .slice(0, remaining - 1)
-            .map((line) => truncateToWidth(` ${line}`, width)),
+            .map((line) => truncateToWidth(` ${line}`, width, "…")),
         );
       }
     }
 
-    lines.push(truncateToWidth(theme.dim(footer), width));
+    lines.push(truncateToWidth(theme.dim(footer), width, "…"));
     return {
       lines,
       questionLineCount: questionLines.length,
@@ -332,15 +340,15 @@ export function renderAskUserLayout(
   }
 
   if (input.editMode && editorMaxLines > 0) {
-    lines.push(truncateToWidth(` ${theme.muted("Your answer:")}`, width));
+    lines.push(truncateToWidth(` ${theme.muted("Your answer:")}`, width, "…"));
     lines.push(
       ...(input.editorLines ?? [])
         .slice(0, editorMaxLines)
-        .map((line) => truncateToWidth(` ${line}`, width)),
+        .map((line) => truncateToWidth(` ${line}`, width, "…")),
     );
   }
 
-  lines.push(truncateToWidth(theme.dim(footer), width));
+  lines.push(truncateToWidth(theme.dim(footer), width, "…"));
   lines.push(theme.border("─".repeat(width)));
 
   return {

@@ -1,3 +1,5 @@
+import { formatElapsed as formatElapsedRange } from "../../shared/format.ts";
+
 export type RemoteAgentStatus =
   | "starting"
   | "working"
@@ -48,15 +50,7 @@ export function isRemoteAgentActive(status: RemoteAgentStatus) {
   );
 }
 
+/** Snapshot-shaped adapter over the single `shared/format.ts` implementation. */
 export function formatElapsed(snapshot: RemoteAgentSnapshot) {
-  const end = snapshot.settledAt ?? Date.now();
-  const totalSeconds = Math.max(
-    0,
-    Math.round((end - snapshot.createdAt) / 1000),
-  );
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return minutes > 0
-    ? `${minutes}m${seconds.toString().padStart(2, "0")}s`
-    : `${seconds}s`;
+  return formatElapsedRange(snapshot.createdAt, snapshot.settledAt);
 }

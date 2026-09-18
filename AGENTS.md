@@ -37,6 +37,15 @@
 
 ---
 
+# Extension authoring
+
+- Any visible surface follows `docs/ui-conventions.md` (borders, glyphs, color roles, empty/error states, key hints via keybindings, English-only UI).
+- Shared primitives are the single source: `extensions/shared/format.ts` (tokens, elapsed), `extensions/shared/activity-status.ts` (status lines), `extensions/shared/terminal-text.ts` (sanitization), `extensions/shared/ui/viewport.ts` (heights), `extensions/shared/context-utilization.ts`. Do not add a local copy; a drifted copy is a bug.
+- Extensions that only serve an interactive parent (memory workers, dashboards, naming, recaps) must stay out of child sessions: Herdr workers get `PI_SUBAGENT=1` (env-gate there) and in-process children filter via `CHILD_EXCLUDED_EXTENSION_PATHS` in `extensions/shared/child-session.ts`.
+- Never block the event loop on persistence: no `Atomics.wait`/spin-locks on request paths; write with debounce + temp/rename (async), read with an mtime/dirty check. See `extensions/remote-agents/src/persistence.ts`.
+
+---
+
 # Verify after change
 
 - After any change, run the project's check/format/lint/test suite and report results. If none exists, say so and suggest adding one.
@@ -53,3 +62,4 @@
 # Meta
 
 - Keep this file current: when a workflow decision becomes a habit, write it down here.
+- Per-run findings and open items live in `docs/reviews/`; the current one is `2026-09-18-extensions-review.md`.

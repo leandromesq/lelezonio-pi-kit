@@ -5,6 +5,7 @@ import {
   ProjectTrustStore,
   SettingsManager,
   type AgentSession,
+  type LoadExtensionsResult,
   type SessionShutdownEvent,
 } from "@earendil-works/pi-coding-agent";
 
@@ -30,6 +31,38 @@ export function childToolPolicy() {
   return { excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES] };
 }
 
+/**
+ * Extensions that must not run inside a child session, matched against the
+ * extension's resolved path.
+ *
+ * A child is an execution unit: it does not need memory workers, proactive
+ * compaction, dashboards or naming, and those costs multiply by the number of
+ * concurrent children. Herdr workers get the same treatment through the
+ * launcher env (`PI_OBSERVATIONAL_MEMORY_PASSIVE`, see
+ * subagents/src/backends/herdr-worker.ts); in-process children share this
+ * process, so filtering the child's resource loader is the only lever.
+ */
+export const CHILD_EXCLUDED_EXTENSION_PATHS = [
+  "pi-observational-memory",
+] as const;
+
+export function withoutChildExcludedExtensions(
+  base: LoadExtensionsResult,
+): LoadExtensionsResult {
+  return {
+    ...base,
+    extensions: base.extensions.filter((extension) => {
+      const resolved = String(extension.resolvedPath ?? extension.path ?? "");
+      // Match a whole path segment so `pi-observational-memory-extra` is not
+      // caught by the `pi-observational-memory` rule.
+      const segments = resolved.split(/[\\/]/);
+      return !CHILD_EXCLUDED_EXTENSION_PATHS.some((needle) =>
+        segments.includes(needle),
+      );
+    }),
+  };
+}
+
 export interface ChildResourceOptions {
   cwd: string;
   projectTrusted: boolean;
@@ -47,6 +80,9 @@ export async function createChildResources(options: ChildResourceOptions) {
     cwd: options.cwd,
     agentDir,
     settingsManager,
+    // Children keep tools and project instructions, but not extensions that
+    // only exist to serve an interactive parent session.
+    extensionsOverride: withoutChildExcludedExtensions,
     ...(options.appendSystemPrompt
       ? { appendSystemPrompt: options.appendSystemPrompt }
       : {}),

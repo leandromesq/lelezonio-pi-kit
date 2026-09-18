@@ -29,7 +29,6 @@ import {
 import {
   agentContext,
   countStates,
-  formatElapsed,
   formatUsage,
   aggregateUsage,
   phaseGroups,
@@ -45,6 +44,10 @@ import {
   type TranscriptEntry,
   type WorkflowDetails,
 } from "./model.ts";
+import { formatElapsed } from "../shared/format.ts";
+// Shared with the subagent/remote/bg transcripts so OSC/CSI and tabs cannot
+// leak into the workflow transcript in one overlay and vanish in another.
+import { sanitizeTerminalText } from "../shared/terminal-text.ts";
 
 const NOTICE_TTL_MS = 4000;
 const MIN_HEIGHT = 10;
@@ -226,17 +229,86 @@ export function sessionWorkflowRunIds(ctx: ExtensionContext): Set<string> {
   return runIds;
 }
 
+/**
+ * Parsed workflow.json cache keyed by run id. The dashboard used to re-read
+ * and re-parse workflow.json/result.json/transcripts.json for every run on
+ * every tick; settled runs never change, so their parsed details are kept and
+ * only re-read when the on-disk signature changes.
+ */
+interface CachedRun {
+  /** max(workflow.json mtime, run dir mtime) at parse time. */
+  signature: number;
+  details: WorkflowDetails;
+  /** result.json/transcripts.json loaded (lazily, once the run matches). */
+  artifactsLoaded: boolean;
+}
+
+const parsedRunCache = new Map<string, CachedRun>();
+
+function runSignature(
+  workflowPath: string,
+  runDir: string,
+): number | undefined {
+  try {
+    return Math.max(
+      fs.statSync(workflowPath).mtimeMs,
+      fs.statSync(runDir).mtimeMs,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function loadArtifacts(runDir: string, details: WorkflowDetails): void {
+  if (details.resultArtifact) {
+    try {
+      details.result = JSON.parse(
+        fs.readFileSync(
+          path.join(runDir, path.basename(details.resultArtifact)),
+          "utf8",
+        ),
+      );
+    } catch {
+      // Keep the compact compatibility marker from workflow.json.
+    }
+  }
+  if (details.transcriptArtifact) {
+    try {
+      const transcripts = JSON.parse(
+        fs.readFileSync(
+          path.join(runDir, path.basename(details.transcriptArtifact)),
+          "utf8",
+        ),
+      ) as Record<string, unknown>;
+      for (const agent of details.agents) {
+        agent.transcript = normalizeTranscript(
+          transcripts[String(agent.index)],
+        );
+      }
+    } catch {
+      // Older or partially written artifacts simply lack transcripts.
+    }
+  }
+}
+
 export function loadRunEntries(
   active: Map<string, WorkflowDetails>,
   sessionId: string,
   referencedRunIds: ReadonlySet<string>,
 ): RunEntry[] {
+  const dir = runsDir();
   let names: string[] = [];
   try {
-    names = fs.readdirSync(runsDir()).filter((name) => name.startsWith("wf_"));
+    names = fs.readdirSync(dir).filter((name) => name.startsWith("wf_"));
   } catch {
     // No runs yet.
   }
+  // Drop cache entries whose run directory is gone so the map stays bounded.
+  const present = new Set(names);
+  for (const cachedId of parsedRunCache.keys()) {
+    if (!present.has(cachedId)) parsedRunCache.delete(cachedId);
+  }
+
   const entries: RunEntry[] = [];
   for (const runId of names) {
     const live = active.get(runId);
@@ -244,62 +316,44 @@ export function loadRunEntries(
       entries.push({ runId, details: live, live: true });
       continue;
     }
-    try {
-      const raw = JSON.parse(
-        fs.readFileSync(path.join(runsDir(), runId, "workflow.json"), "utf8"),
-      );
-      const details = normalizeDetails(runId, raw);
-      if (
-        details &&
-        (details.sessionId === sessionId || referencedRunIds.has(runId))
-      ) {
-        const runDir = path.join(runsDir(), runId);
-        if (details.resultArtifact) {
-          try {
-            details.result = JSON.parse(
-              fs.readFileSync(
-                path.join(runDir, path.basename(details.resultArtifact)),
-                "utf8",
-              ),
-            );
-          } catch {
-            // Keep the compact compatibility marker from workflow.json.
-          }
-        }
-        if (details.transcriptArtifact) {
-          try {
-            const transcripts = JSON.parse(
-              fs.readFileSync(
-                path.join(runDir, path.basename(details.transcriptArtifact)),
-                "utf8",
-              ),
-            ) as Record<string, unknown>;
-            for (const agent of details.agents) {
-              agent.transcript = normalizeTranscript(
-                transcripts[String(agent.index)],
-              );
-            }
-          } catch {
-            // Older or partially written artifacts simply lack transcripts.
-          }
-        }
-        if (details.status === "running") {
-          details.status = "aborted";
-          details.finishedAt = details.finishedAt ?? Date.now();
-          details.error =
-            details.error ?? "Recovered stale run that was not active";
-          for (const agent of details.agents) {
+    const runDir = path.join(dir, runId);
+    const workflowPath = path.join(runDir, "workflow.json");
+    const signature = runSignature(workflowPath, runDir);
+    if (signature === undefined) continue; // unreadable run
+    let cached = parsedRunCache.get(runId);
+    if (!cached || cached.signature !== signature) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(workflowPath, "utf8"));
+        const normalized = normalizeDetails(runId, raw);
+        if (!normalized) continue;
+        if (normalized.status === "running") {
+          normalized.status = "aborted";
+          normalized.finishedAt = normalized.finishedAt ?? Date.now();
+          normalized.error =
+            normalized.error ?? "Recovered stale run that was not active";
+          for (const agent of normalized.agents) {
             if (agent.state !== "running") continue;
             agent.state = "error";
             agent.error = agent.error ?? "Run ended before this agent settled";
-            agent.finishedAt = details.finishedAt;
+            agent.finishedAt = normalized.finishedAt;
           }
         }
-        entries.push({ runId, details, live: false });
+        cached = { signature, details: normalized, artifactsLoaded: false };
+        parsedRunCache.set(runId, cached);
+      } catch {
+        continue; // Skip unreadable runs.
       }
-    } catch {
-      // Skip unreadable runs.
     }
+    const details = cached.details;
+    if (details.sessionId !== sessionId && !referencedRunIds.has(runId)) {
+      // Unrelated run: parsed details are cached, but its artifacts stay cold.
+      continue;
+    }
+    if (!cached.artifactsLoaded) {
+      loadArtifacts(runDir, details);
+      cached.artifactsLoaded = true;
+    }
+    entries.push({ runId, details, live: false });
   }
   return entries.sort((a, b) => b.details.startedAt - a.details.startedAt);
 }
@@ -414,6 +468,10 @@ export class WorkflowDashboard {
         this.view = "detail";
       }
     }
+    // Live progress (phase/agent state) comes from the in-memory active map;
+    // only elapsed-time labels need a clock, and formatElapsed renders whole
+    // seconds. A 1s tick therefore matches the visible resolution — the old
+    // 500ms tick re-stat'ed every run twice as often with no visible benefit.
     this.timer = setInterval(() => {
       if (
         this.entries.some((e) => e.live) ||
@@ -423,7 +481,7 @@ export class WorkflowDashboard {
         this.refresh();
         this.tui.requestRender();
       }
-    }, 500);
+    }, 1000);
   }
 
   dispose() {
@@ -554,8 +612,10 @@ export class WorkflowDashboard {
             this.clampAgentIndex();
           }
         } else if (cancel) {
+          // Do NOT re-scan the disk inside the key handler: entries are kept
+          // current by the tick (live runs come from the in-memory active
+          // map). A synchronous refresh here made Esc block on large run dirs.
           this.view = "list";
-          this.refresh();
         }
       } else {
         const agents = this.selectedGroup()?.agents ?? [];
@@ -647,8 +707,12 @@ export class WorkflowDashboard {
   ): string[] {
     const theme = this.theme;
     const inner = Math.max(0, width - 2);
-    const border = (s: string) => theme.fg("borderMuted", s);
-    const titleText = truncateToWidth(` ${title} `, Math.max(0, inner - 2));
+    const border = (s: string) => theme.fg("border", s);
+    const titleText = truncateToWidth(
+      ` ${title} `,
+      Math.max(0, inner - 2),
+      "…",
+    );
     const dashes = Math.max(0, inner - visibleWidth(titleText) - 1);
     const lines: string[] = [
       border("╭─") + titleText + border("─".repeat(dashes) + "╮"),
@@ -685,8 +749,8 @@ export class WorkflowDashboard {
   private hintLine(hint: string, width: number): string {
     const theme = this.theme;
     if (this.notice)
-      return truncateToWidth(theme.fg("accent", ` ${this.notice}`), width);
-    return truncateToWidth(theme.fg("dim", ` ${hint}`), width);
+      return truncateToWidth(theme.fg("accent", ` ${this.notice}`), width, "…");
+    return truncateToWidth(theme.fg("dim", ` ${hint}`), width, "…");
   }
 
   private renderList(width: number, height: number): string[] {
@@ -709,7 +773,7 @@ export class WorkflowDashboard {
       lines.push(
         ...this.panel(
           "Runs",
-          [theme.fg("dim", " no workflow runs yet")],
+          [theme.fg("dim", " (no runs yet)")],
           width,
           panelHeight,
         ),
@@ -860,7 +924,7 @@ export class WorkflowDashboard {
         if (agent.error) {
           agentRows.push(
             truncateToWidth(
-              `       ${theme.fg("error", agent.error)}`,
+              `       ${theme.fg("error", `error: ${oneLine(agent.error)}`)}`,
               agentsInner,
               "…",
             ),
@@ -868,14 +932,14 @@ export class WorkflowDashboard {
         }
       }
       if (selectedGroup.agents.length === 0) {
-        agentRows.push(theme.fg("dim", " no agents in this phase yet"));
+        agentRows.push(theme.fg("dim", " (no agents in this phase yet)"));
       }
     }
     if (d.error) {
       agentRows.push("");
       agentRows.push(
         truncateToWidth(
-          ` ${theme.fg("error", `workflow error: ${d.error}`)}`,
+          ` ${theme.fg("error", `error: ${oneLine(d.error)}`)}`,
           agentsInner,
           "…",
         ),
@@ -908,37 +972,6 @@ export class WorkflowDashboard {
         : `j/k select agent · h/${this.keys("tui.editor.cursorLeft")}/${this.keys("tui.select.cancel")} phases · ${this.keys("tui.select.confirm")} transcript · s save report`;
     lines.push(this.hintLine(hint, width));
     return lines;
-  }
-
-  private transcriptRows(agent: AgentRecord, width: number): string[] {
-    const theme = this.theme;
-    const rows: string[] = [];
-    if (agent.transcript.length === 0) {
-      return [
-        theme.fg(
-          "dim",
-          " transcript unavailable (this run predates transcript capture)",
-        ),
-      ];
-    }
-
-    for (const entry of agent.transcript) {
-      const label = transcriptLabel(entry);
-      const color = transcriptColor(entry);
-      rows.push(
-        ` ${theme.fg(color, SQUARE)} ${theme.bold(theme.fg(color, label))}`,
-      );
-      const contentWidth = Math.max(8, width - 4);
-      const styled = theme.fg(
-        entry.role === "thinking" ? "dim" : entry.isError ? "error" : "text",
-        entry.text,
-      );
-      for (const line of wrapTextWithAnsi(styled, contentWidth)) {
-        rows.push(`   ${line}`);
-      }
-      rows.push("");
-    }
-    return rows;
   }
 
   private renderTranscript(
@@ -976,7 +1009,7 @@ export class WorkflowDashboard {
 
     const panelHeight = height - 3;
     const bodyHeight = Math.max(1, panelHeight - 2);
-    const rows = this.transcriptRows(agent, width - 2);
+    const rows = buildTranscriptRows(agent, width - 2, theme);
     this.transcriptRowCount = rows.length;
     this.transcriptViewportSize = bodyHeight;
     const maxScroll = Math.max(0, rows.length - bodyHeight);
@@ -992,7 +1025,7 @@ export class WorkflowDashboard {
     lines.push(...this.panel(position, visible, width, panelHeight));
     lines.push(
       this.hintLine(
-        "j/k scroll · ctrl-u/d page · g/G top/bottom · h/left/esc back",
+        `j/k scroll · ctrl-u/d page · g/G top/bottom · h/${this.keys("tui.editor.cursorLeft")}/${this.keys("tui.select.cancel")} back`,
         width,
       ),
     );
@@ -1021,6 +1054,47 @@ function transcriptColor(
 
 function statusSquareFor(details: WorkflowDetails, theme: Theme): string {
   return theme.fg(statusColor(details.status), SQUARE);
+}
+
+/** One-line-safe untrusted text for a fixed-height row: a newline or control
+ * char inside a row desyncs the renderer. */
+function oneLine(text: string): string {
+  return sanitizeTerminalText(text.replace(/\s+/g, " "), { singleLine: true });
+}
+
+/**
+ * Sanitized transcript rows for one agent: label row plus tab-expanded body
+ * lines, wrapped inside `width`. Shared sanitization keeps a stray escape or
+ * tab in the captured transcript from desyncing the panel.
+ */
+export function buildTranscriptRows(
+  agent: AgentRecord,
+  width: number,
+  theme: Theme,
+): string[] {
+  const rows: string[] = [];
+  if (agent.transcript.length === 0) {
+    return [theme.fg("dim", " (no transcript captured for this run)")];
+  }
+
+  for (const entry of agent.transcript) {
+    const label = oneLine(transcriptLabel(entry));
+    const color = transcriptColor(entry);
+    rows.push(
+      ` ${theme.fg(color, SQUARE)} ${theme.bold(theme.fg(color, label))}`,
+    );
+    const contentWidth = Math.max(8, width - 4);
+    const clean = sanitizeTerminalText(entry.text, { tabWidth: 2 });
+    const styled = theme.fg(
+      entry.role === "thinking" ? "dim" : entry.isError ? "error" : "text",
+      clean,
+    );
+    for (const line of wrapTextWithAnsi(styled, contentWidth)) {
+      rows.push(`   ${line}`);
+    }
+    rows.push("");
+  }
+  return rows;
 }
 
 function groupSquare(group: PhaseGroup, theme: Theme): string {

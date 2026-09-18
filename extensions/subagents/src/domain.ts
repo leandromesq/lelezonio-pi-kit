@@ -9,6 +9,7 @@
 
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { Data } from "effect";
+import { formatElapsed as formatElapsedRange } from "../../shared/format.ts";
 
 export const BACKEND_NAMES = ["pi", "codex"] as const;
 export type BackendName = (typeof BACKEND_NAMES)[number];
@@ -140,6 +141,9 @@ export interface SubagentMeta {
   readonly herdrAgentName?: string;
   /** True once the user took the pane over (pane survives settle/close). */
   readonly takenOver?: boolean;
+  /** Why the requested Herdr worker pane was NOT used (in-process fallback).
+   * Absent for a real pane or when no worker was attempted. */
+  readonly fallbackReason?: string;
 }
 
 // --- Transcript ------------------------------------------------------------
@@ -279,6 +283,13 @@ export interface SubagentSnapshot {
   readonly meta: SubagentMeta;
   readonly usage: { readonly tokens?: number; readonly contextWindow?: number };
   readonly transcript: ReadonlyArray<TranscriptItem>;
+  /**
+   * Bumped whenever anything the transcript renderer reads changes: the
+   * transcript items, the live assistant buffers, live tools, or the queue.
+   * The takeover view memoizes its wrapped lines on it. Display-only: no
+   * tool or persistence path may depend on its value.
+   */
+  readonly transcriptVersion: number;
   /** Streaming assistant buffers, cleared when the finalized message lands. */
   readonly liveAssistant?: { readonly text: string; readonly thinking: string };
   readonly liveTools: ReadonlyArray<LiveToolState>;
@@ -299,13 +310,7 @@ export function latestText(snap: SubagentSnapshot) {
 }
 
 export function formatElapsed(snap: SubagentSnapshot) {
-  const end = snap.settledAt ?? Date.now();
-  const totalSeconds = Math.max(0, Math.round((end - snap.createdAt) / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return minutes > 0
-    ? `${minutes}m${seconds.toString().padStart(2, "0")}s`
-    : `${seconds}s`;
+  return formatElapsedRange(snap.createdAt, snap.settledAt);
 }
 
 // --- Errors -------------------------------------------------------------------

@@ -21,6 +21,8 @@ export interface OutputView {
   readonly totalBytes: number;
   /** Bytes dropped from the head of the in-memory view (0 = complete). */
   readonly truncatedBytes: number;
+  /** Characters dropped from the head; enables the incremental line cache. */
+  readonly truncatedChars?: number;
   /** On-disk full capture; always the complete stream when spilling works. */
   readonly spillPath?: string;
 }

@@ -464,6 +464,8 @@ export class RemoteAgentManager {
   dispose() {
     if (this.disposed) return;
     this.store.save(this.list());
+    // Deterministic teardown flush: the process can exit right after dispose.
+    this.store.flushSync();
     this.disposed = true;
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = undefined;

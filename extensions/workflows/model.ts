@@ -9,6 +9,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { formatContextUtilization } from "../shared/context-utilization.ts";
+import { formatTokens } from "../shared/format.ts";
 import { safeStringify } from "./serialization.ts";
 
 export type Theme = ExtensionContext["ui"]["theme"];
@@ -128,13 +129,6 @@ export function shortenHome(p: string): string {
   return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
 }
 
-export function formatTokens(count: number): string {
-  if (count < 1000) return count.toString();
-  if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-  if (count < 1000000) return `${Math.round(count / 1000)}k`;
-  return `${(count / 1000000).toFixed(1)}M`;
-}
-
 export function formatUsage(usage: AgentUsage, model?: string): string {
   const parts: string[] = [];
   if (usage.turns)
@@ -152,18 +146,6 @@ export function agentContext(agent: AgentRecord): string {
     tokens: agent.usage.contextTokens,
     contextWindow: agent.contextWindow,
   });
-}
-
-export function formatElapsed(startedAt: number, finishedAt?: number): string {
-  const totalSeconds = Math.max(
-    0,
-    Math.round(((finishedAt ?? Date.now()) - startedAt) / 1000),
-  );
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return minutes > 0
-    ? `${minutes}m${seconds.toString().padStart(2, "0")}s`
-    : `${seconds}s`;
 }
 
 export function aggregateUsage(agents: AgentRecord[]): AgentUsage {

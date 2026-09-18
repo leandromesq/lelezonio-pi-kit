@@ -68,39 +68,43 @@ export default function performanceExtension(pi: ExtensionAPI) {
     description: "Show lightweight Pi runtime performance metrics",
     handler: async (_args, ctx) => {
       const memoryMb = process.memoryUsage().rss / 1024 / 1024;
-      const rows = [
-        "Pi runtime performance",
-        "",
+      const metrics = [
         `Extension runtime ready: ${Math.round(sessionReadyMs)}ms`,
         durationLine("Turns", turnDurations),
         durationLine("Tools", toolDurations),
         `Process: ${Math.round(memoryMb)} MiB RSS · uptime ${Math.round(process.uptime())}s`,
-        "",
-        `Samples are bounded to the most recent ${MAX_SAMPLES}; instrumentation has no polling timer.`,
       ];
+      const note = `Samples are bounded to the most recent ${MAX_SAMPLES}; instrumentation has no polling timer.`;
+      const title = "Pi runtime performance";
       if (ctx.mode !== "tui") {
-        ctx.ui.notify(rows.join("\n"), "info");
+        ctx.ui.notify(
+          `${title}\n\n${[...metrics, "", note].join("\n")}`,
+          "info",
+        );
         return;
       }
       await ctx.ui.custom<void>(
-        (tui, theme, keybindings, done) => ({
+        (_tui, theme, keybindings, done) => ({
           render(width: number) {
+            const rule = theme.fg(
+              "borderAccent",
+              "─".repeat(Math.max(1, width)),
+            );
+            const row = (line: string) =>
+              truncateToWidth(` ${line}`, width, "…");
             return [
-              theme.fg("borderAccent", "─".repeat(Math.max(1, width))),
-              ...rows.map((line, index) =>
-                truncateToWidth(
-                  ` ${index === 0 ? theme.fg("accent", theme.bold(line)) : theme.fg(index >= 2 && index <= 5 ? "text" : "dim", line)}`,
-                  width,
-                ),
-              ),
-              truncateToWidth(
+              rule,
+              row(theme.fg("accent", theme.bold(title))),
+              ...metrics.map((line) => row(theme.fg("text", line))),
+              row(""),
+              row(theme.fg("dim", note)),
+              row(
                 theme.fg(
                   "dim",
-                  ` ${keybindings.getKeys("tui.select.cancel").join("/") || "Esc"} close`,
+                  `${keybindings.getKeys("tui.select.cancel").join("/") || "Esc"} close`,
                 ),
-                width,
               ),
-              theme.fg("borderAccent", "─".repeat(Math.max(1, width))),
+              rule,
             ];
           },
           handleInput(data: string) {
@@ -109,7 +113,6 @@ export default function performanceExtension(pi: ExtensionAPI) {
               keybindings.matches(data, "tui.select.cancel")
             )
               done();
-            else tui.requestRender();
           },
           invalidate() {},
         }),

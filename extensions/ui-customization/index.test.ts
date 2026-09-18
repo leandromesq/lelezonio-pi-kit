@@ -649,6 +649,10 @@ describe("context indicator threshold colors", () => {
       "<warning>63% ▓▓▓▓░░</warning>",
     );
   });
+
+  it("formats sub-10k token counts with the shared formatter", () => {
+    assert.match(at(1, 1500).context, /1\.5k\/200k/);
+  });
 });
 
 describe("appendStatusLines", () => {

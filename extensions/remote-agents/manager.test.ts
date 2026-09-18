@@ -255,6 +255,121 @@ test("manager does not settle on the unchanged idle state before a prompt starts
   }
 });
 
+/** A client whose single tracked agent stays active across refreshes. */
+function trackedClient() {
+  let current: HerdrAgent | undefined;
+  return {
+    async start(options: { name: string }) {
+      current = agent(options.name, "working");
+      return {
+        workspaceId: "w7",
+        paneId: "w7:p1",
+        agent: current,
+        prompted: { agent: current },
+      };
+    },
+    async list() {
+      return current ? [current] : [];
+    },
+    async get() {
+      return current!;
+    },
+    async read() {
+      return "working";
+    },
+    async result() {
+      throw new Error("not used");
+    },
+    async pathInfo() {
+      return { exists: true, isGitRepository: true };
+    },
+    async cloneProject() {
+      return { path: "/remote/project", output: "" };
+    },
+    async prompt() {
+      return { agent: current! };
+    },
+    async cancel() {},
+    async close() {},
+  };
+}
+
+test("manager does not rewrite the registry when a refresh changed nothing", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-dirty-test-"),
+  );
+  const filePath = path.join(directory, "jobs.json");
+  try {
+    const store = new RemoteJobStore(filePath);
+    const manager = new RemoteAgentManager(config, trackedClient(), store);
+    await manager.initialize();
+    const snapshot = await manager.spawn({
+      title: "dirty check",
+      prompt: "work",
+      localCwd: "C:/project",
+      remoteCwd: "/remote/project",
+    });
+    await store.flush();
+    const written = fs.readFileSync(filePath, "utf8");
+    const writtenAt = fs.statSync(filePath).mtimeMs;
+
+    // The tracked job is still active, so cleanStale() finds nothing to remove
+    // and the persisted projection is identical to what is already on disk.
+    const cleaned = await manager.cleanStale();
+    assert.deepEqual(cleaned.removed, []);
+    await store.flush();
+
+    assert.equal(fs.readFileSync(filePath, "utf8"), written);
+    assert.equal(fs.statSync(filePath).mtimeMs, writtenAt);
+
+    // Sanity check: a real change does rewrite the file, so the assertion above
+    // proves the skip instead of a filesystem timestamp artifact.
+    manager.markCompletionDelivered(snapshot.id);
+    await store.flush();
+    assert.notEqual(fs.statSync(filePath).mtimeMs, writtenAt);
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("manager dispose flushes pending registry state synchronously", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-flush-test-"),
+  );
+  const filePath = path.join(directory, "jobs.json");
+  try {
+    // The debounce never fires, so only dispose can make the job durable.
+    const store = new RemoteJobStore(filePath, { writeDebounceMs: 60_000 });
+    const manager = new RemoteAgentManager(config, trackedClient(), store);
+    await manager.initialize();
+    const snapshot = await manager.spawn({
+      title: "flush on dispose",
+      prompt: "work",
+      localCwd: "C:/project",
+      remoteCwd: "/remote/project",
+    });
+    assert.equal(fs.existsSync(filePath), false);
+
+    manager.dispose();
+
+    const registry = JSON.parse(fs.readFileSync(filePath, "utf8")) as {
+      jobs: Array<{ id: string; transcript: string }>;
+    };
+    assert.deepEqual(
+      registry.jobs.map((job) => job.id),
+      [snapshot.id],
+    );
+    assert.equal(registry.jobs[0].transcript, "");
+    assert.deepEqual(
+      store.load().map((job) => job.id),
+      [snapshot.id],
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("manager tracks settlement and never cancels remote work on dispose", async () => {
   const directory = fs.mkdtempSync(
     path.join(os.tmpdir(), "remote-manager-test-"),

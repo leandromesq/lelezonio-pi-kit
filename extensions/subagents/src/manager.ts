@@ -42,6 +42,11 @@ import {
   SpawnError,
   subagentDisplayTitle,
 } from "./domain.ts";
+import {
+  createLiveAssistantBuffer,
+  type LiveAssistant,
+  type LiveAssistantBuffer,
+} from "./live-assistant.ts";
 
 export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
@@ -54,9 +59,10 @@ export const SubagentManagerOptions = Context.Reference<{
 const STOP_TIMEOUT_MS = 5_000;
 const ERROR_TEXT_MAX_LENGTH = 4_096;
 const TRANSCRIPT_TEXT_MAX_LENGTH = 64 * 1_024;
-const LIVE_ASSISTANT_MAX_LENGTH = 128 * 1_024;
 const FINAL_TEXT_MAX_LENGTH = 1_024 * 1_024;
 const MAX_TRANSCRIPT_ITEMS = 512;
+/** Streaming repaints are coalesced to this cadence; state transitions are not. */
+const DELTA_NOTIFY_INTERVAL_MS = 50;
 
 function bounded(text: string) {
   return text.slice(0, ERROR_TEXT_MAX_LENGTH);
@@ -68,6 +74,7 @@ function boundedTranscriptText(text: string) {
 
 function appendTranscript(snapshot: MutableSnapshot, item: TranscriptItem) {
   snapshot.transcript.push(item);
+  snapshot.transcriptVersion += 1;
   if (snapshot.transcript.length > MAX_TRANSCRIPT_ITEMS) {
     snapshot.transcript.splice(
       0,
@@ -95,7 +102,9 @@ interface MutableSnapshot {
   meta: SubagentMeta;
   usage: { tokens?: number; contextWindow?: number };
   transcript: TranscriptItem[];
-  liveAssistant?: { text: string; thinking: string };
+  /** Bumped on every transcript/live change; keys the render memo. */
+  transcriptVersion: number;
+  liveAssistant?: LiveAssistant;
   liveTools: LiveToolState[];
   queued: SubagentSnapshot["queued"];
   finalText: string;
@@ -109,6 +118,8 @@ interface Entry {
   scope: Scope.Closeable;
   pump?: Fiber.Fiber<void>;
   liveToolMap: Map<string, LiveToolState>;
+  /** Incremental live-assistant chunks; cleared with `snapshot.liveAssistant`. */
+  liveBuffer?: LiveAssistantBuffer;
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
@@ -239,7 +250,30 @@ const makeManager = Effect.gen(function* () {
   let onSettled:
     ((snap: SubagentSnapshot, consumed: boolean) => void) | undefined;
 
+  /** Ids with an unflushed streaming repaint, and the single pending timer. */
+  const pendingDeltaIds = new Set<string>();
+  let deltaNotifyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const flushDeltaNotifies = () => {
+    deltaNotifyTimer = undefined;
+    const ids = [...pendingDeltaIds];
+    pendingDeltaIds.clear();
+    for (const pending of ids) notify(pending);
+  };
+
+  /**
+   * Coalesce a streaming repaint to at most one per DELTA_NOTIFY_INTERVAL_MS.
+   * A state transition calls `notify` directly, so spawn/settle/error/question
+   * feedback is never delayed by the streaming cadence.
+   */
+  const notifyDelta = (id: string) => {
+    pendingDeltaIds.add(id);
+    if (deltaNotifyTimer !== undefined) return;
+    deltaNotifyTimer = setTimeout(flushDeltaNotifies, DELTA_NOTIFY_INTERVAL_MS);
+  };
+
   const notify = (id?: string) => {
+    if (id) pendingDeltaIds.delete(id);
     const waiters = changeWaiters;
     changeWaiters = [];
     for (const waiter of waiters) waiter();
@@ -345,9 +379,11 @@ const makeManager = Effect.gen(function* () {
         break;
     }
     s.liveAssistant = undefined;
+    entry.liveBuffer = undefined;
     entry.liveToolMap.clear();
     s.liveTools = [];
     s.queued = [];
+    s.transcriptVersion += 1;
     const consumed = (waitInterest.get(s.id) ?? 0) > 0;
     notify(s.id);
     try {
@@ -381,21 +417,14 @@ const makeManager = Effect.gen(function* () {
         });
         break;
       case "AssistantDelta": {
-        const live = s.liveAssistant ?? { text: "", thinking: "" };
-        s.liveAssistant =
-          event.kind === "text"
-            ? {
-                ...live,
-                text: (live.text + event.delta).slice(
-                  -LIVE_ASSISTANT_MAX_LENGTH,
-                ),
-              }
-            : {
-                ...live,
-                thinking: (live.thinking + event.delta).slice(
-                  -LIVE_ASSISTANT_MAX_LENGTH,
-                ),
-              };
+        let buffer = entry.liveBuffer;
+        if (!buffer) {
+          buffer = createLiveAssistantBuffer();
+          entry.liveBuffer = buffer;
+          s.liveAssistant = buffer.view;
+        }
+        buffer.append(event.kind, event.delta);
+        s.transcriptVersion += 1;
         break;
       }
       case "AssistantMessage":
@@ -413,6 +442,8 @@ const makeManager = Effect.gen(function* () {
           ),
         });
         s.liveAssistant = undefined;
+        entry.liveBuffer = undefined;
+        s.transcriptVersion += 1;
         s.turns++;
         break;
       case "ToolStart":
@@ -424,6 +455,7 @@ const makeManager = Effect.gen(function* () {
             : undefined,
         });
         s.liveTools = [...entry.liveToolMap.values()];
+        s.transcriptVersion += 1;
         break;
       case "ToolUpdate": {
         const current = entry.liveToolMap.get(event.toolId);
@@ -435,12 +467,14 @@ const makeManager = Effect.gen(function* () {
               : current.outputPreview,
           });
           s.liveTools = [...entry.liveToolMap.values()];
+          s.transcriptVersion += 1;
         }
         break;
       }
       case "ToolEnd":
         entry.liveToolMap.delete(event.toolId);
         s.liveTools = [...entry.liveToolMap.values()];
+        s.transcriptVersion += 1;
         appendTranscript(s, {
           kind: "toolResult",
           toolId: event.toolId,
@@ -453,6 +487,7 @@ const makeManager = Effect.gen(function* () {
         break;
       case "QueueChanged":
         s.queued = event.queued;
+        s.transcriptVersion += 1;
         break;
       case "QuestionAsked":
         s.question = {
@@ -477,7 +512,8 @@ const makeManager = Effect.gen(function* () {
           : bounded(event.message);
         break;
     }
-    notify(s.id);
+    if (event._tag === "AssistantDelta") notifyDelta(s.id);
+    else notify(s.id);
   };
 
   const spawn = (backendName: BackendName, task: SpawnTask) =>
@@ -555,6 +591,7 @@ const makeManager = Effect.gen(function* () {
             meta,
             usage: { contextWindow: meta.contextWindow },
             transcript: [],
+            transcriptVersion: 0,
             liveTools: [],
             queued: [],
             finalText: "",
@@ -790,6 +827,7 @@ const makeManager = Effect.gen(function* () {
           meta,
           usage: {},
           transcript: [],
+          transcriptVersion: 0,
           liveTools: [],
           queued: [],
           finalText: input.finalText ?? "",
@@ -831,6 +869,11 @@ const makeManager = Effect.gen(function* () {
 
   const disposeAll = Effect.gen(function* () {
     disposed = true;
+    if (deltaNotifyTimer !== undefined) {
+      clearTimeout(deltaNotifyTimer);
+      deltaNotifyTimer = undefined;
+    }
+    pendingDeltaIds.clear();
     const all = [...entries.values()];
     entries.clear();
     yield* Effect.forEach(
