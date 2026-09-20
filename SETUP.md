@@ -115,11 +115,12 @@ The package ships a Pi extension that spawns the `donsetch mcp` binary and regis
 
 ### Binary download
 
-npm 12 blocks `postinstall` scripts for packages not covered by `allowScripts`. Pi's npm directory is approved once so package installs and updates fetch the matching binary automatically:
+npm blocks `postinstall` scripts for packages that are not covered by `allowScripts`, so the binary a fresh install needs is not fetched automatically. The command differs by npm version: `npm install-scripts approve` on npm 12, `npm approve-scripts` on npm 11.17+. Pi's npm directory is approved once — unpinned, so the approval survives a version bump — and installs and updates then fetch the matching binary themselves:
 
 ```sh
 cd ~/.pi/agent/npm
-npm install-scripts approve donsetch --no-allow-scripts-pin
+npm install-scripts approve donsetch --no-allow-scripts-pin   # npm 12
+npm approve-scripts donsetch --no-allow-scripts-pin           # npm 11.17+
 ```
 
 If the binary is ever missing, the extension downloads it at session start. To repair it without restarting Pi:
