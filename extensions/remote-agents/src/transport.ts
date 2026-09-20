@@ -93,6 +93,31 @@ export class SshTransport {
     });
   }
 
+  /**
+   * Run a POSIX script on the host whatever its login shell is.
+   *
+   * `ssh host <command>` hands the command to the account's login shell, and
+   * that shell is not necessarily POSIX: fish (a common nix/home-manager
+   * default) rejects `VAR=value cmd`, has no `export` and no `$$`, so the
+   * scripts below failed there with "Unsupported use of '='" before they ever
+   * reached a shell that could run them. Handing the script to `sh` keeps the
+   * POSIX assumptions local to the script instead of the login shell.
+   */
+  private posix(script: string) {
+    return `sh -c ${shellQuote(script)}`;
+  }
+
+  /**
+   * The command that runs the remote helper with the homelab `herdr` on PATH.
+   * Shared by the install handshake and every follow-up request: both go
+   * through the login shell, so both must be routed through `sh`.
+   */
+  private helperCommand() {
+    return this.posix(
+      `export PATH="$HOME/.local/bin:$PATH"; exec python3 ${shellQuote(this.config.remoteHelper)}`,
+    );
+  }
+
   ensureHelper() {
     this.helperReady ??= this.installHelper().catch((error) => {
       this.helperReady = undefined;
@@ -112,13 +137,15 @@ export class SshTransport {
     const helperPath = this.config.remoteHelper;
     const helperDir = path.posix.dirname(helperPath);
     await this.execute(
-      `umask 077 && mkdir -p ${shellQuote(helperDir)} && temporary=${shellQuote(`${helperPath}.upload`)}.$$ && cat > "$temporary" && chmod 700 "$temporary" && mv -f "$temporary" ${shellQuote(helperPath)}`,
+      this.posix(
+        `umask 077 && mkdir -p ${shellQuote(helperDir)} && temporary=${shellQuote(`${helperPath}.upload`)}.$$ && cat > "$temporary" && chmod 700 "$temporary" && mv -f "$temporary" ${shellQuote(helperPath)}`,
+      ),
       { input: helper, timeoutMs: 20_000 },
     );
-    const pingOutput = await this.execute(
-      `export PATH="$HOME/.local/bin:$PATH"; exec python3 ${shellQuote(helperPath)}`,
-      { input: JSON.stringify({ action: "ping" }), timeoutMs: 20_000 },
-    );
+    const pingOutput = await this.execute(this.helperCommand(), {
+      input: JSON.stringify({ action: "ping" }),
+      timeoutMs: 20_000,
+    });
     const ping = JSON.parse(pingOutput.trim().split(/\r?\n/).at(-1) ?? "") as {
       ok?: boolean;
       result?: { protocol?: number; ok?: boolean; status?: string };
@@ -142,13 +169,10 @@ export class SshTransport {
     options: ExecuteOptions = {},
   ) {
     await this.ensureHelper();
-    const output = await this.execute(
-      `export PATH="$HOME/.local/bin:$PATH"; exec python3 ${shellQuote(this.config.remoteHelper)}`,
-      {
-        ...options,
-        input: JSON.stringify(request),
-      },
-    );
+    const output = await this.execute(this.helperCommand(), {
+      ...options,
+      input: JSON.stringify(request),
+    });
     let envelope: unknown;
     try {
       // Login banners or shell startup noise may precede the helper envelope.

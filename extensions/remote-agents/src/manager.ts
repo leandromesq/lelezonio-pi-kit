@@ -62,6 +62,7 @@ export class RemoteAgentManager {
   private disposed = false;
   private onSettled?: (snapshot: RemoteAgentSnapshot) => void;
   private onBlocked?: (snapshot: RemoteAgentSnapshot) => void;
+  private onWarning?: (message: string) => void;
   private readonly config: RemoteAgentsConfig;
   private readonly client: Pick<
     HerdrClient,
@@ -145,6 +146,10 @@ export class RemoteAgentManager {
 
   setOnBlocked(handler: ((snapshot: RemoteAgentSnapshot) => void) | undefined) {
     this.onBlocked = handler;
+  }
+
+  setOnWarning(handler: ((message: string) => void) | undefined) {
+    this.onWarning = handler;
   }
 
   list() {
@@ -413,14 +418,19 @@ export class RemoteAgentManager {
     this.blockedPending.delete(id);
   }
 
+  /**
+   * Forget a job locally. Closing its Herdr workspace is best-effort: a job
+   * whose host is unreachable must still be removable, otherwise it is polled
+   * forever and no surface can ever clear it.
+   */
   async remove(id: string, signal?: AbortSignal) {
     const snapshot = this.require(id);
-    await this.closeWorkspace(snapshot, signal);
-    this.jobs.delete(id);
-    this.deliveryPending.delete(id);
-    this.blockedPending.delete(id);
-    this.store.remove([id]);
-    this.changed();
+    const closeError = await this.closeWorkspaceBestEffort(snapshot, signal);
+    this.forget(snapshot.id);
+    if (closeError)
+      this.warn(
+        `Remote agent ${snapshot.id} was removed locally, but its Herdr workspace could not be closed: ${closeError}`,
+      );
   }
 
   async cleanStale(signal?: AbortSignal) {
@@ -428,22 +438,47 @@ export class RemoteAgentManager {
       (snapshot) => !isRemoteAgentActive(snapshot.status),
     );
     const removed: string[] = [];
-    const failed: Array<{ id: string; error: string }> = [];
+    const closeFailures: Array<{ id: string; error: string }> = [];
     for (const snapshot of stale) {
-      try {
-        await this.closeWorkspace(snapshot, signal);
-        this.jobs.delete(snapshot.id);
-        removed.push(snapshot.id);
-      } catch (error) {
-        failed.push({
-          id: snapshot.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+      const closeError = await this.closeWorkspaceBestEffort(snapshot, signal);
+      if (closeError)
+        closeFailures.push({ id: snapshot.id, error: closeError });
+      this.forget(snapshot.id);
+      removed.push(snapshot.id);
     }
     this.store.remove(removed);
     this.changed();
-    return { removed, failed };
+    return { removed, closeFailures };
+  }
+
+  private forget(id: string) {
+    this.jobs.delete(id);
+    this.deliveryPending.delete(id);
+    this.blockedPending.delete(id);
+    this.store.remove([id]);
+    this.changed();
+  }
+
+  private warn(message: string) {
+    try {
+      this.onWarning?.(message);
+    } catch {}
+  }
+
+  /**
+   * Close the Herdr workspace, reporting the failure instead of throwing: the
+   * local registry entry is the caller's to drop either way.
+   */
+  private async closeWorkspaceBestEffort(
+    snapshot: RemoteAgentSnapshot,
+    signal?: AbortSignal,
+  ) {
+    try {
+      await this.closeWorkspace(snapshot, signal);
+      return undefined;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
   }
 
   private async closeWorkspace(

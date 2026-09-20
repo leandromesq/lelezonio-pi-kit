@@ -164,7 +164,90 @@ test("missing remote workspaces can still be forgotten and cleaned", async () =>
     assert.equal(manager.get("ra-gone-one"), undefined);
     const cleaned = await manager.cleanStale();
     assert.deepEqual(cleaned.removed, ["ra-gone-two"]);
-    assert.deepEqual(cleaned.failed, []);
+    assert.deepEqual(cleaned.closeFailures, []);
+    assert.deepEqual(store.load(), []);
+  } finally {
+    manager.dispose();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a job whose host is unreachable can still be forgotten", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-unreachable-test-"),
+  );
+  const store = new RemoteJobStore(path.join(directory, "jobs.json"));
+  store.save(
+    ["ra-offline", "ra-settled"].map((id, index) => ({
+      id,
+      name: `pi-remote-${id}`,
+      title: id,
+      host: "macmini",
+      localCwd: "C:/project",
+      remoteCwd: "/remote/project",
+      workspaceId: `w${index + 5}`,
+      // Tracked as active: this is the state that made `d` a silent no-op,
+      // because closing the workspace threw before the entry was dropped.
+      status: (index === 0 ? "unreachable" : "done") as "unreachable" | "done",
+      createdAt: index + 1,
+      updatedAt: index + 1,
+      transcript: "",
+      transcriptVersion: 0,
+      generation: 1,
+    })),
+  );
+  const client = {
+    async start() {
+      throw new Error("not used");
+    },
+    async list() {
+      return [];
+    },
+    async get() {
+      throw new Error("not used");
+    },
+    async read() {
+      return "";
+    },
+    async result() {
+      throw new Error("not used");
+    },
+    async pathInfo() {
+      return { exists: true, isGitRepository: true };
+    },
+    async cloneProject() {
+      return { path: "/remote/project", output: "" };
+    },
+    async prompt() {
+      throw new Error("not used");
+    },
+    async cancel() {},
+    async close() {
+      throw new Error("ssh: connect to host macmini port 22: No route to host");
+    },
+  };
+  const manager = new RemoteAgentManager(config, client, store);
+  const warnings: string[] = [];
+  manager.setOnWarning((message) => warnings.push(message));
+  try {
+    await manager.initialize();
+
+    await manager.remove("ra-offline");
+    assert.equal(manager.get("ra-offline"), undefined);
+    assert.deepEqual(
+      store.load().map((job) => job.id),
+      ["ra-settled"],
+    );
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /removed locally/);
+    assert.match(warnings[0]!, /No route to host/);
+
+    const cleaned = await manager.cleanStale();
+    assert.deepEqual(cleaned.removed, ["ra-settled"]);
+    assert.deepEqual(
+      cleaned.closeFailures.map((failure) => failure.id),
+      ["ra-settled"],
+    );
     assert.deepEqual(store.load(), []);
   } finally {
     manager.dispose();

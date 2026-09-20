@@ -241,6 +241,12 @@ export default function (pi: ExtensionAPI) {
       const next = new RemoteAgentManager(config, client, store);
       next.setOnSettled((snapshot) => void deliverCompletion(snapshot));
       next.setOnBlocked((snapshot) => void deliverBlocked(snapshot));
+      next.setOnWarning((message) => {
+        // Warnings can outlive the session that started the manager, and the
+        // captured ui context would be stale by then.
+        if (closed || sessionGeneration !== startedGeneration) return;
+        ui?.notify(message, "warning");
+      });
       manager = next;
       unsubscribe?.();
       unsubscribe = next.view.subscribe(updateStatus);
@@ -597,12 +603,12 @@ export default function (pi: ExtensionAPI) {
       )
         return;
       const result = await remote.cleanStale();
-      const suffix = result.failed.length
-        ? `; ${result.failed.length} could not be removed`
+      const suffix = result.closeFailures.length
+        ? `; ${result.closeFailures.length} Herdr workspace${result.closeFailures.length === 1 ? "" : "s"} could not be closed`
         : "";
       ctx.ui.notify(
         `Removed ${result.removed.length} stale remote workspaces${suffix}`,
-        result.failed.length ? "warning" : "info",
+        result.closeFailures.length ? "warning" : "info",
       );
     },
   });
