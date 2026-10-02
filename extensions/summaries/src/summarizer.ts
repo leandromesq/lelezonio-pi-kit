@@ -3,9 +3,10 @@ import {
   Type,
   parseJsonWithRepair,
   parseStreamingJson,
+  type Api,
+  type Model,
   type Tool,
 } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { SummaryConfig } from "./config.ts";
 import { buildSummaryPrompt, SUMMARY_SYSTEM_PROMPT } from "./prompt.ts";
 
@@ -57,6 +58,17 @@ interface SummaryResponse {
     readonly arguments?: Record<string, unknown>;
   }[];
   readonly stopReason: string;
+  readonly usage?: { readonly cost?: { readonly total?: number } };
+}
+
+/**
+ * Cost reported by the recap model itself. Kept separate from the session's
+ * canonical model cost: recap calls never persist usage entries, so this is
+ * the only place their spend is visible. Unknown/non-finite totals are 0.
+ */
+function responseCost(response: SummaryResponse) {
+  const total = response.usage?.cost?.total;
+  return typeof total === "number" && Number.isFinite(total) ? total : 0;
 }
 
 function summaryError(kind: SummaryFailureKind, attempts = 0): SummaryError {
@@ -247,6 +259,12 @@ function parseRecapResponseSafe(text: string) {
 export interface RunRecap {
   readonly recap: string;
   readonly next: string;
+  /**
+   * Cost reported by the recap model for this call, labelled auxiliary and
+   * never folded into the session's canonical cost. Absent on the local
+   * fallback, which spends nothing.
+   */
+  readonly auxCost?: number;
 }
 
 export function parseRecapResponse(text: string) {
@@ -295,14 +313,10 @@ function forcedToolChoice(api: string) {
 }
 
 async function requestSummary(
-  model: Parameters<typeof completeSimple>[0],
+  model: Model<Api>,
+  modelRegistry: ModelRegistry,
   transcript: string,
   signal: AbortSignal,
-  auth: {
-    readonly apiKey?: string;
-    readonly env?: Record<string, string>;
-    readonly headers?: Record<string, string | null>;
-  },
   reasoning: SummaryConfig["reasoning"],
   corrective: boolean,
 ) {
@@ -312,26 +326,31 @@ async function requestSummary(
       ? "\n\nCorrection: The previous response was not valid. Return only one recap tool call with non-empty string fields recap and next; add no commentary."
       : ""
   }`;
+  // Provider-neutral request through the session's ModelRuntime facade:
+  // request-time authentication (API keys, OAuth, headers, base URL) is
+  // resolved internally, replacing getApiKeyAndHeaders + compat completeSimple.
+  // `toolChoice` carries provider-native forced-tool strings ("any"/"required")
+  // that the adapters consume; the neutral option type only names "auto"/"none",
+  // so the cast mirrors the previous compat call.
   const requestOptions = {
-    apiKey: auth.apiKey,
-    env: auth.env,
-    headers: auth.headers,
     maxTokens: 1_000,
     maxRetries: 0,
     signal,
     timeoutMs: SUMMARY_REQUEST_TIMEOUT_MS,
     ...reasoningOptions(reasoning),
     ...(toolChoice ? { toolChoice } : {}),
-  } as unknown as Parameters<typeof completeSimple>[2];
-  return completeSimple(
-    model,
-    {
-      systemPrompt: SUMMARY_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-      tools: [RECAP_TOOL],
-    },
-    requestOptions,
-  );
+  } as unknown as Parameters<ModelRegistry["streamSimple"]>[2];
+  return modelRegistry
+    .streamSimple(
+      model,
+      {
+        systemPrompt: SUMMARY_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
+        tools: [RECAP_TOOL],
+      },
+      requestOptions,
+    )
+    .result();
 }
 
 export async function summarizeRun(options: {
@@ -359,9 +378,10 @@ export async function summarizeRun(options: {
       options.config.model,
     );
     if (!model) throw summaryError("unavailable");
-
-    const auth = await options.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok) throw summaryError("auth");
+    // Preserve the previous "auth" classification for an unconfigured
+    // provider; a request that still fails auth later maps to "request".
+    if (!options.modelRegistry.hasConfiguredAuth(model))
+      throw summaryError("auth");
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       throwIfAborted(requestController.signal);
@@ -369,9 +389,9 @@ export async function summarizeRun(options: {
       try {
         response = await requestSummary(
           model,
+          options.modelRegistry,
           options.transcript,
           requestController.signal,
-          auth,
           options.config.reasoning,
           attempt === 2,
         );
@@ -386,7 +406,13 @@ export async function summarizeRun(options: {
       if (response.stopReason === "error") throw summaryError("request");
 
       const parsed = parseAssistantResponse(response);
-      if (parsed) return parsed;
+      if (parsed) {
+        // Only surface a recap cost the model actually reported. This is the
+        // recap call's own usage, labelled auxiliary where shown: recap calls
+        // do not persist usage entries, so it never enters the session total.
+        const auxCost = responseCost(response);
+        return auxCost > 0 ? { ...parsed, auxCost } : parsed;
+      }
     }
     throw summaryError("invalid-output", 2);
   } catch (cause) {

@@ -20,7 +20,7 @@
 - Delegate per the subagents skill with a self-contained prompt (paths, constraints, context, and expected output). Use `planner` to design a future approach, `coder` for substantial implementation, and `reviewer` for independent evaluation of an existing plan, diff, or implementation. A `coder` should spawn a nested `reviewer` only for nontrivial changes where independent validation is materially useful.
 - Spawn up to 3 subagents in parallel only for genuinely independent tracks; this is a ceiling, not a target. While they run, continue useful review, planning, or integration work instead of idling. Use Herdr panes when the user wants to watch agents work side by side.
 - Keep critical review of delegated results before integrating. Never apply a subagent's output blindly — check it against the task first.
-- Profile routing (`subagents.json`): all named profiles run on the Pi harness and use `opencode-go/deepseek-v4.1-flash` (`planner`, `coder`, `reviewer`); profile-less spawns also default to the Pi harness and that model. The Codex harness keeps `gpt-5.6-luna` and is the only exception, reserved for subagents that call Codex CLI. Override the harness to Codex only when Pi lacks a tool required by the task, such as an MCP integration available through Codex CLI.
+- Profile routing (`subagents.json`): all named profiles run on the Pi harness and use `opencode-go/deepseek-v4.1-flash` (`planner`, `coder`, `reviewer`); profile-less spawns also default to the Pi harness and that model. The Codex harness keeps `gpt-5.6-luna` and is the only exception, reserved for subagents that call Codex CLI. Override the harness to Codex only when the task specifically requires Codex CLI or a capability genuinely unavailable in Pi. Pi 1.0 has native MCP; MCP alone is not a reason to choose Codex. SDK children load native built-ins explicitly only with a full tool surface; narrowed/read-only profiles must keep their callable-tool policy intact.
 - This file overrides the herdr skill's "use only when explicitly mentioned" gating (that skill is installed externally from the herdr repo). Treat herdr as the default for visible side-by-side agents.
 
 ---
@@ -33,12 +33,14 @@
 
 # Context hygiene
 
-- Targeted reads only: rg/fd with filters, never dump whole files into context. If exploration is big, it's a subagent job.
+- Targeted reads only: native grep/find/ls with filters (Pi provisions rg/fd), never dump whole files into context. If exploration is big, it's a subagent job.
 
 ---
 
 # Extension authoring
 
+- In-process SDK children must exclude DonSeTch: its upstream cached transport is not session-owned. Keep parent web tools active; do not fork the external package without user approval.
+- Preserve Pi's native startup header; `ui-customization` owns the dashboard/footer and editor, not the startup logo or repository banner.
 - Any visible surface follows `docs/ui-conventions.md` (borders, glyphs, color roles, empty/error states, key hints via keybindings, English-only UI).
 - Shared primitives are the single source: `extensions/shared/format.ts` (tokens, elapsed), `extensions/shared/activity-status.ts` (status lines), `extensions/shared/terminal-text.ts` (sanitization), `extensions/shared/ui/viewport.ts` (heights), `extensions/shared/context-utilization.ts`. Do not add a local copy; a drifted copy is a bug.
 - Extensions that only serve an interactive parent (memory workers, dashboards, naming, recaps) must stay out of child sessions: Herdr workers get `PI_SUBAGENT=1` (env-gate there) and in-process children filter via `CHILD_EXCLUDED_EXTENSION_PATHS` in `extensions/shared/child-session.ts`.
@@ -62,4 +64,4 @@
 # Meta
 
 - Keep this file current: when a workflow decision becomes a habit, write it down here.
-- Per-run findings and open items live in `docs/reviews/`; the current one is `2026-09-18-extensions-review.md`.
+- Per-run findings and open items live in `docs/reviews/`; the current one is `2026-10-02-setup-corrections.md`.

@@ -36,8 +36,21 @@ export interface RemoteAgentSnapshot {
   readonly promptObservedActivity?: boolean;
   readonly resultMissingSince?: number;
   readonly cancelRequested?: boolean;
+  /** Legacy shared delivery flag, kept for older registries and the in-process
+   * notification dedupe. New code records the concrete recipient session in
+   * `completionDeliveredTo`/`blockedDeliveredTo`. */
   readonly completionDelivered?: boolean;
   readonly blockedDelivered?: boolean;
+  /** Pi session that spawned (and therefore owns the result of) this job. An
+   * absent owner is a legacy entry: it is preserved and still inspectable, but
+   * it is never auto-delivered to an arbitrary session — a user adopts it
+   * explicitly. */
+  readonly ownerSessionId?: string;
+  /** Session that already received the settled/blocked result. Scoping by
+   * session keeps one parent from stealing or permanently suppressing
+   * another parent's delivery. */
+  readonly completionDeliveredTo?: string;
+  readonly blockedDeliveredTo?: string;
 }
 
 export function isRemoteAgentActive(status: RemoteAgentStatus) {

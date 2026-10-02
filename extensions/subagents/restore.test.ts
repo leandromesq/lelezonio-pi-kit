@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import {
+  discoverWorkerSessions,
   readFileTail,
   readWorkerSummary,
   summaryFromSessionFile,
@@ -11,15 +12,24 @@ import {
   WORKER_TAIL_BYTES,
 } from "./src/restore.ts";
 
-function withTempFile(lines: string[], run: (filePath: string) => void) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagents-restore-"));
-  const filePath = path.join(dir, "session.jsonl");
-  fs.writeFileSync(filePath, `${lines.join("\n")}\n`);
+async function withTempDir(run: (directory: string) => Promise<void>) {
+  const directory = await mkdtemp(path.join(tmpdir(), "subagents-restore-"));
   try {
-    run(filePath);
+    await run(directory);
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true });
   }
+}
+
+async function withTempFile(
+  lines: string[],
+  run: (filePath: string) => Promise<void>,
+) {
+  await withTempDir(async (directory) => {
+    const filePath = path.join(directory, "session.jsonl");
+    await writeFile(filePath, `${lines.join("\n")}\n`);
+    await run(filePath);
+  });
 }
 
 const assistantRecord = (
@@ -42,25 +52,28 @@ const assistantRecord = (
 const filler = (bytes: number) =>
   JSON.stringify({ type: "tool", timestamp: 1, payload: "z".repeat(bytes) });
 
-test("a terminal message inside the small tail avoids the wide read", () => {
-  withTempFile([filler(4000), assistantRecord("done!", 1234)], (filePath) => {
-    const summary = readWorkerSummary(filePath);
-    assert.equal(summary.found, true);
-    assert.equal(summary.finalText, "done!");
-    assert.equal(summary.settledAt, 1234);
-    assert.equal(summary.budgetBytes, WORKER_TAIL_BYTES);
-  });
+test("a terminal message inside the small tail avoids the wide read", async () => {
+  await withTempFile(
+    [filler(4000), assistantRecord("done!", 1234)],
+    async (filePath) => {
+      const summary = await readWorkerSummary(filePath);
+      assert.equal(summary.found, true);
+      assert.equal(summary.finalText, "done!");
+      assert.equal(summary.settledAt, 1234);
+      assert.equal(summary.budgetBytes, WORKER_TAIL_BYTES);
+    },
+  );
 });
 
-test("a terminal message older than the small tail widens to the full tail", () => {
-  withTempFile(
+test("a terminal message older than the small tail widens to the full tail", async () => {
+  await withTempFile(
     [assistantRecord("archived", 999), filler(20 * 1024), filler(20 * 1024)],
-    (filePath) => {
+    async (filePath) => {
       assert.equal(
-        summaryFromSessionFile(filePath, WORKER_TAIL_BYTES).found,
+        (await summaryFromSessionFile(filePath, WORKER_TAIL_BYTES)).found,
         false,
       );
-      const summary = readWorkerSummary(filePath);
+      const summary = await readWorkerSummary(filePath);
       assert.equal(summary.found, true);
       assert.equal(summary.finalText, "archived");
       assert.equal(summary.settledAt, 999);
@@ -69,30 +82,71 @@ test("a terminal message older than the small tail widens to the full tail", () 
   );
 });
 
-test("an error record restores its message", () => {
-  withTempFile([assistantRecord("", 5, "error", "boom")], (filePath) => {
-    const summary = readWorkerSummary(filePath);
-    assert.equal(summary.found, true);
-    assert.equal(summary.errorText, "boom");
-    assert.equal(summary.budgetBytes, WORKER_TAIL_BYTES);
-  });
+test("an error record restores its message", async () => {
+  await withTempFile(
+    [assistantRecord("", 5, "error", "boom")],
+    async (filePath) => {
+      const summary = await readWorkerSummary(filePath);
+      assert.equal(summary.found, true);
+      assert.equal(summary.errorText, "boom");
+      assert.equal(summary.budgetBytes, WORKER_TAIL_BYTES);
+    },
+  );
 });
 
-test("readFileTail drops a partial first line", () => {
+test("readFileTail drops a partial first line", async () => {
   const first = JSON.stringify({ type: "x", pad: "a".repeat(200) });
   const second = assistantRecord("kept", 1);
-  withTempFile([first, second], (filePath) => {
-    assert.equal(readFileTail(filePath, second.length + 10), `${second}\n`);
+  await withTempFile([first, second], async (filePath) => {
+    assert.equal(
+      await readFileTail(filePath, second.length + 10),
+      `${second}\n`,
+    );
   });
 });
 
-test("an unreadable file yields an empty summary instead of throwing", () => {
-  const missing = path.join(
-    os.tmpdir(),
-    `subagents-missing-${Date.now()}.jsonl`,
-  );
-  const summary = readWorkerSummary(missing);
-  assert.equal(summary.found, false);
-  assert.equal(summary.finalText, "");
-  assert.equal(summary.settledAt, 0);
+test("an unreadable file yields an empty summary instead of throwing", async () => {
+  await withTempDir(async (directory) => {
+    const missing = path.join(directory, "missing.jsonl");
+    const summary = await readWorkerSummary(missing);
+    assert.equal(summary.found, false);
+    assert.equal(summary.finalText, "");
+    assert.equal(summary.settledAt, 0);
+  });
+});
+
+test("discoverWorkerSessions finds the newest JSONL per worker directory", async () => {
+  await withTempDir(async (directory) => {
+    const root = path.join(directory, "workers", "parent-session");
+    await mkdir(path.join(root, "child-one"), { recursive: true });
+    await mkdir(path.join(root, "child-two"), { recursive: true });
+    // A directory with no session file is not restorable.
+    await mkdir(path.join(root, "child-empty"), { recursive: true });
+    // A stray file directly under the root is not a worker directory.
+    await writeFile(path.join(root, "not-a-worker.jsonl"), "{}");
+
+    await writeFile(path.join(root, "child-one", "2026-01-01_old.jsonl"), "{}");
+    await writeFile(path.join(root, "child-one", "2026-01-02_new.jsonl"), "{}");
+    await writeFile(path.join(root, "child-two", "only.jsonl"), "{}");
+
+    const found = await discoverWorkerSessions(root);
+    assert.deepEqual(found.map((entry) => entry.id).sort(), [
+      "child-one",
+      "child-two",
+    ]);
+    const one = found.find((entry) => entry.id === "child-one");
+    assert.equal(
+      one?.filePath,
+      path.join(root, "child-one", "2026-01-02_new.jsonl"),
+    );
+  });
+});
+
+test("discoverWorkerSessions treats a missing root as no previous session", async () => {
+  await withTempDir(async (directory) => {
+    const found = await discoverWorkerSessions(
+      path.join(directory, "does-not-exist"),
+    );
+    assert.deepEqual(found, []);
+  });
 });

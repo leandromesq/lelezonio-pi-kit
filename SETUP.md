@@ -6,9 +6,9 @@ Lelezonio Pi Kit is installed as the Pi agent directory itself. Do not install i
 
 Required:
 
-- [Pi](https://github.com/earendil-works/pi-mono)
+- [Pi](https://github.com/earendil-works/pi) 1.0
 - Git
-- Node.js 22 or newer
+- Node.js 22.19 or newer
 - A Bash-compatible shell available to Pi
 
 Optional:
@@ -16,7 +16,7 @@ Optional:
 - [Codex CLI](https://github.com/openai/codex) for Codex subagents
 - [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login` for `/git`
 - An SSH-accessible host running [Herdr](https://github.com/epilande/herdr) for persistent remote agents
-- System `fd` and `rg` binaries; the file-search extension can provision supported builds when they are missing
+- System `fd` and `rg` binaries are optional; Pi's native search tools provision supported builds when missing
 - A Chromium build (system, Playwright-cached, or Edge on Windows) for the optional DonSeTch tier-2 browser bypasses; tier-1 fetch and keyless search work without one
 
 ## Clean installation
@@ -96,7 +96,7 @@ Copy any memory directories you intentionally use. Keep the backup until the new
 {
   "theme": "noctalia",
   "tuiMode": "fullscreen",
-  "quietStartup": true,
+  "quietStartup": "header",
   "packages": []
 }
 ```
@@ -192,17 +192,25 @@ pi --list-models
 
 Reload Pi after editing the configuration.
 
-### Codex account switching
+### Pi OpenAI account switching
 
-Authenticate Codex CLI normally, then save the current credentials with a portable account name:
+Authenticate through Pi's `/login` with OpenAI (ChatGPT) or legacy OpenAI Codex, then save the current credentials with a portable account name:
 
 ```text
 /codex save personal
 ```
 
-Repeat after authenticating other Codex accounts. Run `/codex` to choose a saved account. The selected credentials apply to new Codex CLI processes and future Codex subagents; already-running processes are unchanged.
+Repeat after authenticating other accounts. Run `/codex` to choose a saved account. This switches **Pi's** login for the stored provider, not Codex CLI authentication. The next Pi request uses it; other providers are preserved. If both supported providers have OAuth credentials, `/codex save` prefers `openai` (ChatGPT). API-key entries are not treated as ChatGPT accounts.
 
-Credential snapshots are stored under `~/.codex/accounts/`, or under `$CODEX_HOME/accounts/` when `CODEX_HOME` is set. They contain secrets and must not be committed or shared.
+Snapshots are stored under `~/.pi/agent/codex-accounts/`, or the configured `PI_CODING_AGENT_DIR`. Old raw `openai-codex` snapshots remain readable; new ChatGPT snapshots retain the provider and associated device metadata. These files contain secrets and must not be committed or shared.
+
+### Native MCP and codemode
+
+Pi 1.0 supports MCP without Codex CLI or an external MCP adapter. Configure user servers in `~/.pi/agent/mcp.json` and trusted-project servers in `.pi/mcp.json`; use `/mcp` for status and authentication. No MCP server is created by this kit.
+
+The CLI loads native MCP/codemode/tool-search built-ins. Full-surface in-process subagents and workflow children explicitly add the same built-ins; narrowed/read-only SDK profiles omit them. Server tools still obey the session's callable-tool restrictions and project trust. Do not use removal from the active set as a security boundary for `codemode`/`deferred` tools.
+
+Codemode is opt-in unless a configured MCP server activates it. Add `"codemode"` to your existing `defaultTools` list, or use `["+codemode"]` when inheriting defaults. Keep the other tools you need. `ask_user`, `workflow` and `subagent_*` stay model-only and are invoked directly, never inside a script. Browser tools remain default-off behind `/browser on` and follow the current history branch.
 
 ## Remote agents
 
@@ -248,68 +256,155 @@ The model can use `remote_spawn`, `remote_check`, `remote_list`, `remote_send`, 
 
 Runtime job metadata is stored under `remote-agents/` and the machine-specific `remote-agents.json` is intentionally ignored by Git.
 
-## `fd` and `rg`
+Automatic results belong to the originating Pi session, not whichever dashboard polls first.
+Herdr child workers do not start remote reconciliation, and SDK/Herdr child tool policies exclude
+`remote_*`. Legacy unowned jobs remain visible; an explicit `remote_check`, `remote_send`,
+`remote_wait`, or `remote_cancel` adopts an unowned job for the current session. Inspection of an
+already-owned job does not transfer ownership. Delivery leases prevent concurrent live managers
+from sending the same result, but registry and Pi transcript commits are not one transaction:
+this is not a promise of exactly-once delivery across a process crash.
 
-The file-search extension registers `fd` and `rg` as model tools. At startup it prefers system-installed binaries, then existing fallback binaries under `~/.pi/agent/bin/`. When neither exists, it can download official release binaries on supported platforms.
+Dashboards close with the configured selection-cancel shortcut (normally Esc/Ctrl+C), without
+cancelling jobs. Press `x` twice on the same selected active job to cancel it. In a transcript
+view, the configured clear shortcut (normally Ctrl+C) similarly requires a second press before
+cancellation; Esc closes without stopping work.
+
+## Recaps and auxiliary model work
+
+Recaps remain enabled in automatic mode, but skip runs below the configured `minToolCalls`
+threshold (default one tool call). `/summary-mode auto|manual|off` controls automatic generation;
+`/recap` requests the latest run's recap on demand, regardless of automatic mode. Generated
+content and local fallback stay in pt-BR; interface labels remain English. Expanded recap details
+show the recap model's reported cost when available.
+
+The footer's `est. session` amount is the parent session's estimated model usage, not a provider
+invoice or aggregate spend for memory, naming, recaps and child agents. `/om:status` labels its
+worker estimate separately. No setup presets are created and the existing packages remain active.
+
+## Native file search
+
+The setup enables Pi's native `grep`, `find`, and `ls` tools. `grep` uses ripgrep and `find` uses fd; Pi itself resolves system binaries or provisions supported builds under `~/.pi/agent/bin/` on demand. No separate search extension is required.
+
+The former `file-search` source is preserved in `archive/file-search/`, outside automatic extension discovery. It is not loaded or tested as part of the active kit. Native search returns textual results rather than the old extension's structured output and advanced flag surface.
 
 If automatic provisioning does not support your platform, install both binaries with your system package manager and restart Pi.
 
 ## Fullscreen TUI
 
-The setup enables Pi's native fullscreen TUI through `"tuiMode": "fullscreen"` in `settings.json`. The transcript scrolls independently while queued messages, status, widgets, editor, and footer remain fixed at the bottom. It also enables Pi's supported `"quietStartup": true` setting so the custom header stays clean without mutating Pi's internal component tree; resource conflicts and diagnostics remain available through Pi's configuration surfaces.
+Fullscreen scroll bindings belong in `keybindings.json`, not `settings.json`. This kit binds
+`ctrl+shift+up/down` to half-page scrolling and `alt+shift+up/down` to previous/next prompt,
+so the two actions do not compete for the same shortcut.
+
+The setup enables Pi's native fullscreen TUI through `"tuiMode": "fullscreen"` in `settings.json`. The transcript scrolls independently while queued messages, status, widgets, editor, and footer remain fixed at the bottom. The extension leaves Pi 1.0's native startup header untouched. `"quietStartup": "header"` shows the native logo/version/key hints while hiding the verbose resource listing; the custom dashboard and thinking-colored editor remain.
 
 Change `tuiMode` to `"regular"` if you prefer the terminal's native scrollback, or disable `quietStartup` if you want the complete loaded-resource listing on every launch.
 
 ## Observational memory (optional)
 
-[`pi-observational-memory`](https://github.com/elpapi42/pi-observational-memory) keeps long
-sessions coherent across compactions: it records observations and reflections in the background
-and renders that memory deterministically when Pi compacts, instead of asking a model to
-re-summarize the session at that moment. It is a third-party package, installed into the private
-`settings.json` (not tracked here):
+The kit uses a pinned [local adaptation](vendor/pi-observational-memory/README.md) of
+[amosblomqvist/pi-observational-memory](https://github.com/amosblomqvist/pi-observational-memory),
+not the elpapi42 npm package. Isolated headless Pi workers observe raw-history chunks; a
+consolidator writes per-topic Markdown, `INDEX.md`, and `JOURNEY.md` under
+`<project>/.memory/<session-id>/`. Compaction renders this memory deterministically.
 
-```sh
-pi install npm:pi-observational-memory@3.1.3
-```
+Add `"./vendor/pi-observational-memory"` to `packages` in private `settings.json`, replacing
+any previous observational-memory package entry. Never load both implementations. Restart
+Pi after changing the package. This local adaptation preserves the upstream MIT license and
+pinned provenance; it does not automatically receive upstream updates.
 
-Recommended private settings: use a cheap dedicated worker model instead of the session model,
-bound the observer chunk (the derived default is 20% of the worker's context window, which is
-200k tokens on a 1M model), and scale the proactive compaction trigger with the active model
-window instead of the calibrated ~81k default:
+The new ledger uses `om2.*` to avoid confusing legacy elpapi42 observations with the new
+schema. Old session entries and memory data remain intact, but are not automatically converted
+into topic files. Historical `recall` IDs belong to the old implementation, not the new one.
+Topic files are session-wide: navigating `/tree` changes branch observations/gating but does
+not rewind existing Markdown. A fork seeds its own memory directory.
+
+Example private settings (use a cheap authenticated model available in your installation):
 
 ```json
 {
   "observational-memory": {
-    "model": {
-      "provider": "opencode-go",
-      "id": "deepseek-v4.1-flash",
-      "thinking": "low"
+    "enabled": true,
+    "chunkTokens": 10000,
+    "chunkOverlapTokens": 0,
+    "poolTargetTokens": 20000,
+    "consolidateAtPoolTokens": 30000,
+    "compactAtContextTokens": 0,
+    "tailTokens": 20000,
+    "journeyTargetTokens": 4000,
+    "observerConcurrency": 1,
+    "timeoutMs": 300000,
+    "maxTurns": 16,
+    "models": {
+      "observer": {
+        "provider": "opencode-go",
+        "id": "deepseek-v4.1-flash",
+        "thinking": "low"
+      },
+      "consolidator": {
+        "provider": "opencode-go",
+        "id": "deepseek-v4.1-flash",
+        "thinking": "low"
+      }
     },
-    "observerChunkMaxTokens": 30000,
-    "compactAfterTokensMode": "ratio",
-    "compactAfterTokensRatio": 0.5,
-    "showWorkerNotifications": false
+    "passive": false,
+    "debugLog": false
   }
 }
 ```
 
-Tuning notes:
-
-- `compactAfterTokensRatio` is a policy decision, not a bug: 0.5 compacts a 1M-token model around
-  500k source tokens, well before Pi's own window-pressure threshold (`contextWindow -
-reserveTokens`). Raise it to keep more raw context, lower it if latency matters more than range.
-- `/om:status` shows memory counts and the resolved compaction threshold; `/om:view` copies the
-  rendered memory. Set `debugLog: true` to write `~/.pi/agent/observational-memory/debug/<session>.ndjson`
-  while diagnosing.
+- `enabled` is the initial fallback; `/om on` and `/om off` persist branch-local overrides.
+- `compactAtContextTokens: 0` leaves automatic compaction to Pi's native window-pressure
+  policy. `/om:compact` remains available. A positive value opts into earlier compaction.
+- `/om:status` reports memory/worker state; `/om:consolidate` requests consolidation.
+- `chunkOverlapTokens` is reserved by upstream and currently has no effect; leave it at zero.
+- `timeoutMs` and `maxTurns` bound worker lifetime/turns; interrupted batches remain eligible
+  for retry rather than being marked covered or consolidated. Coverage is committed in order,
+  including successfully completed empty chunks. If coverage is missing or too far behind,
+  compaction falls back to Pi's native model summary (which can incur additional model cost).
+- Worker sessions are inspectable, but incur model cost. Low concurrency limits simultaneous
+  process/model load; it does not eliminate total memory-worker spend.
+- Memory and worker artifacts can contain sensitive conversation content. Add `.memory/` to
+  each project's `.gitignore`; do not commit or publish those files.
 
 This repository keeps the extension out of child sessions, where background memory work is cost
 without benefit:
 
-- Herdr workers receive `PI_OBSERVATIONAL_MEMORY_PASSIVE=1` in the launcher spec
-  (`extensions/subagents/src/backends/herdr-worker.ts`, `writeWorkerLaunchSpec`).
+- Herdr workers receive `PI_SUBAGENT=1` / `PI_OBSERVATIONAL_MEMORY_PASSIVE=1` in the launcher spec;
+  the local build's factory returns before registering any hooks or tools.
 - In-process children filter the package out of their resource loader
   (`CHILD_EXCLUDED_EXTENSION_PATHS` in `extensions/shared/child-session.ts`).
-- Removing it: `pi remove npm:pi-observational-memory` and drop the `observational-memory` block.
+- To disable it, remove the local source from `packages` and drop the `observational-memory`
+  block. Keep memory/session data if you may want it later.
+
+Use a modest global compaction reserve (the example uses 24000 with 20000 recent tokens).
+For an exact model that needs different budgets, set `compaction.modelOverrides` keyed by
+`provider/modelId`. Keep reserve plus recent tokens comfortably below its context window.
+A global 120000-token reserve would leave only 8000 tokens before compaction on a 128k model.
+The memory package's proactive trigger and Pi's own context-pressure compaction are separate
+thresholds; both should leave useful room for raw history.
+
+## Startup performance
+
+Run `npm run benchmark:startup` after a development install to compare fresh-process
+extension-loader costs. It does not start sessions, call models, connect SSH, or perform
+web-daemon handshakes, so it is not a complete interactive-startup benchmark.
+
+On this Windows setup (2026-10-02), three samples measured roughly 12–17 ms for the empty
+loader versus 495–554 ms for the 20 kit extensions, excluding SDK import time and optional
+packages. Individual times cannot be added: extensions share dependency/module caches.
+The browser was only 31–37 ms; Chromium remains lazy.
+
+- Native `grep`/`find` provision rg/fd on demand; `file-search` has been archived.
+- DonSeTch still starts its supervised daemon in an awaited `session_start`; this is an
+  additional startup cost not measured above. Keep it for web research, or disable the
+  optional package through `pi config` when unused. All in-process SDK children omit
+  DonSeTch to prevent a child's shutdown from killing the parent's cached transport.
+  Independent Herdr CLI workers still load the upstream package; its code is not patched.
+- Pi's native `grep`/`find`/`ls` now replace file-search; its old structured output is not part of the active setup.
+- Auto-naming and recaps are optional model work after prompting, not demonstrated startup
+  bottlenecks. The custom dashboard is also optional; this setup retains it intentionally.
+- No whole extension is removed solely for performance. Further lazy-import changes need
+  measurement and lifecycle/isolation regression tests, not guesses.
 
 ## Updating
 

@@ -1,5 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { CodexAccountStore, validateAccountName } from "./src/account-store.ts";
+import {
+  CodexAccountStore,
+  SUPPORTED_PROVIDERS,
+  providerLabel,
+  validateAccountName,
+  type CodexAccount,
+} from "./src/account-store.ts";
 
 const COMMAND_NAME = "codex";
 const REMOVE_LABEL = "— remove account…";
@@ -30,23 +36,45 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** `/login` provider hints for every provider `/codex` understands. */
+function loginHint() {
+  return SUPPORTED_PROVIDERS.map(providerLabel).join(" or ");
+}
+
+/**
+ * Label for the account picker. Provider tags only appear when accounts span
+ * more than one provider, so legacy `openai-codex`-only users see the same
+ * labels as before.
+ */
+function accountLabel(account: CodexAccount, showProvider: boolean) {
+  const name = account.active ? `${account.name} (current)` : account.name;
+  return showProvider ? `${name} · ${providerLabel(account.provider)}` : name;
+}
+
+function accountLabels(accounts: CodexAccount[]) {
+  const showProvider =
+    new Set(accounts.map((account) => account.provider)).size > 1;
+  return accounts.map((account) => accountLabel(account, showProvider));
+}
+
 export default function codexAccounts(pi: ExtensionAPI) {
   const store = new CodexAccountStore();
 
   pi.registerCommand(COMMAND_NAME, {
     description:
-      "Save, switch or remove Pi's OpenAI Codex account: /codex, /codex save <name>, /codex remove <name>",
+      "Save, switch or remove Pi's OpenAI ChatGPT accounts: /codex, /codex save <name>, /codex remove <name>",
     getArgumentCompletions: async (prefix) => {
       const actionMatches = [
         {
           value: "save ",
           label: "save <name>",
-          description: "Save the currently logged-in Pi OpenAI Codex account",
+          description:
+            "Save the currently logged-in OpenAI (ChatGPT) or OpenAI Codex account",
         },
         {
           value: "remove ",
           label: "remove <name>",
-          description: "Delete a saved OpenAI Codex account",
+          description: "Delete a saved OpenAI account",
         },
       ].filter((item) => item.value.startsWith(prefix));
 
@@ -98,7 +126,7 @@ export default function codexAccounts(pi: ExtensionAPI) {
         if (command.action === "save") {
           if (!(await store.hasCurrentCredentials())) {
             ctx.ui.notify(
-              `Pi has no OpenAI Codex credentials yet. Run /login (provider: OpenAI Codex) first, then /${COMMAND_NAME} save <name>.`,
+              `Pi has no OpenAI credentials yet. Run /login (provider: ${loginHint()}) first, then /${COMMAND_NAME} save <name>.`,
               "warning",
             );
             return;
@@ -112,13 +140,13 @@ export default function codexAccounts(pi: ExtensionAPI) {
             command.name,
           );
           if (sameIdentityName !== undefined) {
-            const message = `The current OpenAI Codex account is already saved as "${sameIdentityName}" (same account id). They are the same identity — saving "${command.name}" only duplicates it.`;
+            const message = `The current OpenAI account is already saved as "${sameIdentityName}" (same account id). They are the same identity — saving "${command.name}" only duplicates it.`;
             if (!ctx.hasUI) {
               ctx.ui.notify(message, "warning");
               return;
             }
             const duplicateAnyway = await ctx.ui.confirm(
-              "Duplicate Codex identity",
+              "Duplicate OpenAI identity",
               `${message} Save it anyway under "${command.name}"?`,
             );
             if (!duplicateAnyway) return;
@@ -136,13 +164,28 @@ export default function codexAccounts(pi: ExtensionAPI) {
 
             const overwrite = await ctx.ui.confirm(
               "Overwrite Codex account?",
-              `Replace the saved credentials for "${command.name}" with Pi's current OpenAI Codex credentials?`,
+              `Replace the saved credentials for "${command.name}" with Pi's current OpenAI credentials?`,
             );
             if (!overwrite) return;
           }
 
-          await store.save(command.name, { overwrite: exists });
-          ctx.ui.notify(`Saved OpenAI Codex account "${command.name}"`, "info");
+          const providers = await store.currentProviders();
+          const provider = await store.save(command.name, {
+            overwrite: exists,
+          });
+          const otherProviders = providers.filter(
+            (candidate) => candidate !== provider,
+          );
+          ctx.ui.notify(
+            otherProviders.length > 0
+              ? `Saved ${providerLabel(provider)} account "${command.name}". ${otherProviders
+                  .map(providerLabel)
+                  .join(
+                    " and ",
+                  )} is also logged in but is not part of this snapshot.`
+              : `Saved ${providerLabel(provider)} account "${command.name}"`,
+            "info",
+          );
           return;
         }
 
@@ -155,33 +198,24 @@ export default function codexAccounts(pi: ExtensionAPI) {
           return;
         }
 
+        const labels = accountLabels(accounts);
+
         if (!ctx.hasUI) {
-          const names = accounts
-            .map((account) =>
-              account.active ? `${account.name} (current)` : account.name,
-            )
-            .join(", ");
-          ctx.ui.notify(`Saved Codex accounts: ${names}`, "info");
+          ctx.ui.notify(`Saved Codex accounts: ${labels.join(", ")}`, "info");
           return;
         }
 
-        const labels = [
-          ...accounts.map((account) =>
-            account.active ? `${account.name} (current)` : account.name,
-          ),
+        const selected = await ctx.ui.select("Codex account", [
+          ...labels,
           REMOVE_LABEL,
-        ];
-        const selected = await ctx.ui.select("Codex account", labels);
+        ]);
         if (!selected) return;
 
         if (selected === REMOVE_LABEL) {
-          const removeLabels = accounts.map((account) =>
-            account.active ? `${account.name} (current)` : account.name,
-          );
-          const chosen = await ctx.ui.select("Remove account", removeLabels);
+          const chosen = await ctx.ui.select("Remove account", labels);
           if (!chosen) return;
 
-          const target = accounts[removeLabels.indexOf(chosen)];
+          const target = accounts[labels.indexOf(chosen)];
           if (!target) return;
 
           const confirmed = await ctx.ui.confirm(
@@ -198,9 +232,9 @@ export default function codexAccounts(pi: ExtensionAPI) {
         const account = accounts[labels.indexOf(selected)];
         if (!account || account.active) return;
 
-        await store.switchTo(account.name);
+        const provider = await store.switchTo(account.name);
         ctx.ui.notify(
-          `Switched Pi's OpenAI Codex account to "${account.name}". The next request will use it.`,
+          `Switched Pi's ${providerLabel(provider)} account to "${account.name}". The next request will use it.`,
           "info",
         );
       } catch (error) {

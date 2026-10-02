@@ -46,7 +46,13 @@ class RemoteProjectMissingError extends Error {
 }
 
 function describe(snapshot: RemoteAgentSnapshot) {
-  return `${snapshot.id} [${snapshot.status}] "${snapshot.title}" (${snapshot.host}:${snapshot.remoteCwd}, ${formatElapsed(snapshot.createdAt, snapshot.settledAt)})`;
+  // A legacy (unowned) job is preserved and inspectable but never
+  // auto-delivered; an explicit check/wait/send adopts it for this session.
+  const ownership =
+    snapshot.ownerSessionId === undefined
+      ? " [unowned · remote_check to adopt]"
+      : "";
+  return `${snapshot.id} [${snapshot.status}] "${snapshot.title}" (${snapshot.host}:${snapshot.remoteCwd}, ${formatElapsed(snapshot.createdAt, snapshot.settledAt)})${ownership}`;
 }
 
 function snapshotDetails(snapshot: RemoteAgentSnapshot) {
@@ -128,6 +134,10 @@ export default function (pi: ExtensionAPI) {
   let manager: RemoteAgentManager | undefined;
   let closed = false;
   let ui: ExtensionUIContext | undefined;
+  // The Pi session id of the current session. Jobs spawned here record it as
+  // their owner, and only that session (resumed with the same id) delivers
+  // their results.
+  let sessionId: string | undefined;
   let unsubscribe: (() => void) | undefined;
   // Incremented on every session_start. Async continuations capture the value
   // when they start and bail when it changes: after session replacement or
@@ -142,11 +152,36 @@ export default function (pi: ExtensionAPI) {
     );
   };
 
+  /**
+   * Report a delivery failure only while the originating session is still
+   * current. `console.error` would write into the TUI and a captured `ui`
+   * context is stale after a reload, so both are bounded by generation.
+   */
+  const notifyDeliveryFailure = (
+    startedGeneration: number,
+    kind: string,
+    error: unknown,
+  ) => {
+    if (closed || sessionGeneration !== startedGeneration) return;
+    const message = error instanceof Error ? error.message : String(error);
+    ui?.notify(`Remote ${kind} delivery failed: ${message}`, "error");
+  };
+
+  /**
+   * Deliver one settled run. The atomic claim prevents two live managers (or
+   * two sessions) from both sending the same result, but it cannot make
+   * `pi.sendMessage` and this external registry commit atomically: a process
+   * crash between the send and `settle*Delivery` can still redeliver once. That
+   * is a bounded, at-least-once window, not a promise of crash-proof
+   * exactly-once delivery.
+   */
   const deliverCompletion = async (snapshot: RemoteAgentSnapshot) => {
-    if (!manager || snapshot.completionDelivered) return;
+    if (!manager || !manager.owns(snapshot)) return;
     const owningManager = manager;
     const startedGeneration = sessionGeneration;
     const generation = snapshot.generation;
+    let claimed = false;
+    let settled = false;
     try {
       // Herdr can report the Pi turn settled just before post-run integrations
       // finish updating the terminal/session file.
@@ -154,48 +189,78 @@ export default function (pi: ExtensionAPI) {
       // The session was replaced/reloaded while delivery was pending: the
       // captured manager is disposed and pi is stale — drop delivery silently.
       if (closed || sessionGeneration !== startedGeneration) return;
+      // Refresh BEFORE claiming: the lease is held only across the synchronous
+      // send, never across an SSH round-trip where it could expire and be taken
+      // by another manager.
       await owningManager
         .refresh(snapshot.id, { transcript: true })
         .catch(() => snapshot);
       const latest = owningManager.get(snapshot.id) ?? snapshot;
       if (
         latest.generation !== generation ||
-        latest.completionDelivered ||
-        isRemoteAgentActive(latest.status)
+        isRemoteAgentActive(latest.status) ||
+        !owningManager.owns(latest)
       ) {
-        owningManager.releaseCompletionDelivery(snapshot.id);
+        return;
+      }
+      // The claim is the LAST await before the send: after it resolves, only
+      // synchronous work runs until pi.sendMessage.
+      claimed = await owningManager.claimCompletionDelivery(
+        snapshot.id,
+        generation,
+      );
+      if (!claimed) return;
+      // session_shutdown may have run while the claim awaited; re-check the
+      // live session, generation and ownership synchronously.
+      const current = owningManager.get(snapshot.id) ?? latest;
+      if (
+        closed ||
+        sessionGeneration !== startedGeneration ||
+        current.generation !== generation ||
+        isRemoteAgentActive(current.status) ||
+        !owningManager.owns(current)
+      ) {
         return;
       }
       pi.sendMessage(
         {
           customType: "remote-agent-result",
-          content: completionMessage(latest),
+          content: completionMessage(current),
           display: true,
           details: {
-            id: latest.id,
-            title: latest.title,
-            status: latest.status,
+            id: current.id,
+            title: current.title,
+            status: current.status,
           },
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
-      owningManager.markCompletionDelivered(snapshot.id);
+      await owningManager.settleCompletionDelivery(current.id, generation);
+      settled = true;
     } catch (error) {
-      owningManager?.releaseCompletionDelivery(snapshot.id);
-      console.error("remote-agents: completion delivery failed", error);
+      notifyDeliveryFailure(startedGeneration, "completion", error);
+    } finally {
+      // A dropped or failed delivery must not strand the run behind a claim.
+      if (claimed && !settled)
+        await owningManager
+          .releaseCompletionDelivery(snapshot.id)
+          .catch(() => {});
     }
   };
 
   const deliverBlocked = async (snapshot: RemoteAgentSnapshot) => {
-    if (!manager || snapshot.blockedDelivered) return;
+    if (!manager || !manager.owns(snapshot)) return;
     const owningManager = manager;
     const startedGeneration = sessionGeneration;
     const generation = snapshot.generation;
+    let claimed = false;
+    let settled = false;
     try {
       await new Promise((resolve) => setTimeout(resolve, 500));
       // The session was replaced/reloaded while delivery was pending: the
       // captured manager is disposed and pi is stale — drop delivery silently.
       if (closed || sessionGeneration !== startedGeneration) return;
+      // Refresh before the claim; see `deliverCompletion`.
       await owningManager
         .refresh(snapshot.id, { transcript: true })
         .catch(() => snapshot);
@@ -203,32 +268,49 @@ export default function (pi: ExtensionAPI) {
       if (
         latest.generation !== generation ||
         latest.status !== "blocked" ||
-        latest.blockedDelivered
+        !owningManager.owns(latest)
       ) {
-        owningManager.releaseBlockedDelivery(snapshot.id);
+        return;
+      }
+      claimed = await owningManager.claimBlockedDelivery(
+        snapshot.id,
+        generation,
+      );
+      if (!claimed) return;
+      const current = owningManager.get(snapshot.id) ?? latest;
+      if (
+        closed ||
+        sessionGeneration !== startedGeneration ||
+        current.generation !== generation ||
+        current.status !== "blocked" ||
+        !owningManager.owns(current)
+      ) {
         return;
       }
       const question =
-        latest.finalText?.trim() ||
-        latest.transcript.trim().slice(-RESULT_TRANSCRIPT_CHARS) ||
+        current.finalText?.trim() ||
+        current.transcript.trim().slice(-RESULT_TRANSCRIPT_CHARS) ||
         "The remote agent is waiting for clarification.";
       pi.sendMessage(
         {
           customType: "remote-agent-blocked",
-          content: `Remote agent ${latest.id} "${latest.title}" needs input.\n\n${question}\n\nRespond with remote_send or open /remotes.`,
+          content: `Remote agent ${current.id} "${current.title}" needs input.\n\n${question}\n\nRespond with remote_send or open /remotes.`,
           display: true,
           details: {
-            id: latest.id,
-            title: latest.title,
-            status: latest.status,
+            id: current.id,
+            title: current.title,
+            status: current.status,
           },
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
-      owningManager.markBlockedDelivered(snapshot.id);
+      await owningManager.settleBlockedDelivery(current.id, generation);
+      settled = true;
     } catch (error) {
-      owningManager?.releaseBlockedDelivery(snapshot.id);
-      console.error("remote-agents: blocked delivery failed", error);
+      notifyDeliveryFailure(startedGeneration, "blocked", error);
+    } finally {
+      if (claimed && !settled)
+        await owningManager.releaseBlockedDelivery(snapshot.id).catch(() => {});
     }
   };
 
@@ -238,7 +320,9 @@ export default function (pi: ExtensionAPI) {
     const promise = (async () => {
       const transport = new SshTransport(config);
       const client = new HerdrClient(transport);
-      const next = new RemoteAgentManager(config, client, store);
+      const next = new RemoteAgentManager(config, client, store, {
+        sessionId,
+      });
       next.setOnSettled((snapshot) => void deliverCompletion(snapshot));
       next.setOnBlocked((snapshot) => void deliverBlocked(snapshot));
       next.setOnWarning((message) => {
@@ -275,8 +359,13 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     closed = false;
     const startedGeneration = ++sessionGeneration;
+    sessionId = ctx.sessionManager.getSessionId();
     if (ctx.hasUI) ui = ctx.ui;
     if (ctx.mode !== "tui") return;
+    // Every Herdr child is a full Pi process that loads this extension. A
+    // child never owns a remote job or its delivery, so it must not
+    // auto-initialize the manager (and its SSH round-trips) on startup.
+    if (process.env.PI_SUBAGENT === "1") return;
     // Every child Herdr agent is a full Pi process that loads this extension.
     // Initializing the manager with nothing to reconcile would still upload the
     // remote helper and ping it over SSH, per process, for no benefit. Real
@@ -671,6 +760,9 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, signal) {
       const remote = await getManager();
+      // An explicit check is the user adopting a legacy (unowned) job; a job
+      // owned by another session is left alone.
+      await remote.adopt(params.id);
       const snapshot = await remote.refresh(params.id, {
         transcript: true,
         signal,
@@ -716,6 +808,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ id: Type.String(), message: Type.String() }),
     async execute(_toolCallId, params, signal) {
       const remote = await getManager();
+      await remote.adopt(params.id);
       await remote.send(params.id, params.message, signal);
       return {
         content: [
@@ -739,6 +832,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ id: Type.String() }),
     async execute(_toolCallId, params, signal) {
       const remote = await getManager();
+      await remote.adopt(params.id);
       const snapshot = await remote.wait(params.id, signal);
       if (snapshot.status !== "blocked")
         remote.markCompletionDelivered(snapshot.id);
@@ -757,6 +851,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ id: Type.String() }),
     async execute(_toolCallId, params, signal) {
       const remote = await getManager();
+      await remote.adopt(params.id);
       const snapshot = await remote.cancel(params.id, signal);
       return {
         content: [

@@ -35,13 +35,17 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { drainLast } from "./src/buffer.ts";
 import { stringifyEvalResult, wrapEvalSource } from "./src/eval.ts";
 import { renderConsoleText, renderNetworkText } from "./src/format.ts";
 import {
   applyGate,
+  BROWSER_NAMESPACE,
   computeEnabledFromEntries,
   ENABLED_ENTRY_TYPE,
   parseBrowserCommand,
@@ -138,16 +142,18 @@ export default function browserExtension(pi: ExtensionAPI) {
   const headless = !process.env.PI_BROWSER_HEADFUL;
   const runtime = new BrowserRuntime({ profileDir, headless });
 
-  // Default-off gate. The browser tools are registered so they show up in
-  // `pi.getAllTools()` and command discovery stays normal, but they are
-  // stripped from the ACTIVE set so their promptSnippet / promptGuidelines
-  // drop out of the system prompt and they are not callable. `/browser on`
-  // flips them back.
+  // Default-off gate. The browser tools are registered (so they show up in
+  // `pi.getAllTools()` and command discovery stays normal) with
+  // `defaultActive: false` and stripped from the ACTIVE set, so their
+  // promptSnippet / promptGuidelines drop out of the system prompt and they
+  // are not callable. `/browser on` flips them back.
   //
   // We cannot call setActiveTools during the factory — the extension runtime
   // is not bound yet and pi rejects action methods during extension loading.
   // session_start is the first safe point; it also restores the persisted
-  // per-session bit from custom entries.
+  // per-session bit from the ACTIVE BRANCH (`getBranch`, not `getEntries`:
+  // an opt-in on an abandoned branch must not enable the current one), and
+  // session_tree re-evaluates it after /tree navigation.
   let enabled = false;
 
   function setEnabled(on: boolean): void {
@@ -155,9 +161,18 @@ export default function browserExtension(pi: ExtensionAPI) {
     enabled = on;
   }
 
-  pi.on("session_start", async (_event, ctx) => {
-    const want = computeEnabledFromEntries(ctx.sessionManager.getEntries());
-    setEnabled(want);
+  /** Recompute the gate from the active branch and apply it. */
+  function syncGate(ctx: ExtensionContext): void {
+    setEnabled(computeEnabledFromEntries(ctx.sessionManager.getBranch()));
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    syncGate(ctx);
+  });
+
+  pi.on("session_tree", (_event, ctx) => {
+    // Branch navigation can expose a different enable bit (or none).
+    syncGate(ctx);
   });
 
   pi.on("session_shutdown", async () => {
@@ -168,6 +183,10 @@ export default function browserExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "browser_goto",
+    // Inactive at registration; the /browser gate owns the active set.
+    exposure: "direct",
+    defaultActive: false,
+    namespace: BROWSER_NAMESPACE,
     label: "Browser Goto",
     description:
       "Navigate the persistent headless Chromium to a URL. Returns final URL and HTTP status. Cookies + localStorage persist across calls.",
@@ -197,6 +216,9 @@ export default function browserExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "browser_eval",
+    exposure: "direct",
+    defaultActive: false,
+    namespace: BROWSER_NAMESPACE,
     label: "Browser Eval",
     description:
       "Evaluate JS in the current page. Pass an expression ('localStorage.length'), a function ('() => Object.keys(localStorage)', 'async () => { ... }'), or an already-called IIFE — all three forms work. Return value must be JSON-serializable; for DOM nodes return primitive properties (.outerHTML, .textContent, .value) rather than the node itself.",
@@ -231,6 +253,9 @@ export default function browserExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "browser_console",
+    exposure: "direct",
+    defaultActive: false,
+    namespace: BROWSER_NAMESPACE,
     label: "Browser Console",
     description:
       "Drain buffered console + pageerror entries (oldest first). With clear=true (default) the ENTIRE buffer is wiped after read, not just the entries returned — this is intentional, so subsequent calls observe a fresh window of activity rather than re-walking the same noise. Pass clear=false to peek without draining.",
@@ -259,6 +284,9 @@ export default function browserExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "browser_network",
+    exposure: "direct",
+    defaultActive: false,
+    namespace: BROWSER_NAMESPACE,
     label: "Browser Network",
     promptSnippet:
       "Inspect the actual HTTP requests the page made — status, method, URL, and (with verbose=true) Authorization / apikey / content-type headers. Use for 401 / 403 / CORS debugging",
@@ -323,6 +351,9 @@ export default function browserExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "browser_fill",
+    exposure: "direct",
+    defaultActive: false,
+    namespace: BROWSER_NAMESPACE,
     label: "Browser Fill",
     description:
       "Type a value into the input matching the selector (dispatches proper input/change events, unlike a raw .value= assignment). Selector may be CSS, text=..., role=..., etc.",
@@ -343,6 +374,9 @@ export default function browserExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "browser_click",
+    exposure: "direct",
+    defaultActive: false,
+    namespace: BROWSER_NAMESPACE,
     label: "Browser Click",
     description:
       "Click the element matching the selector. CSS selectors and Playwright text= / role= selectors supported. Note: CSS attribute selectors match HTML attributes, not DOM properties — e.g. `button[type=submit]` will NOT match `<button>Submit</button>` even though that button's DOM `.type === 'submit'`. For semantic matching prefer `text=Submit` or `role=button[name=Submit]`.",
@@ -363,6 +397,9 @@ export default function browserExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "browser_screenshot",
+    exposure: "direct",
+    defaultActive: false,
+    namespace: BROWSER_NAMESPACE,
     label: "Browser Screenshot",
     description:
       "Save a PNG screenshot to a temp file and return its path. Use the read tool on that path to view it (separate step, so vision-token cost is paid only when you choose). The temp file is removed on session shutdown.",
@@ -382,6 +419,9 @@ export default function browserExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "browser_close",
+    exposure: "direct",
+    defaultActive: false,
+    namespace: BROWSER_NAMESPACE,
     label: "Browser Close",
     description:
       "Close the persistent browser context. Next browser_* call relaunches. Also done automatically on session shutdown.",

@@ -29,6 +29,38 @@ export interface CapturedOutput {
   readonly fullOutputPath?: string;
 }
 
+/**
+ * Machine-readable result declared by the fd/rg `outputSchema`, so codemode
+ * scripts receive the match list instead of the formatted text.
+ */
+export type SearchStructuredOutput = {
+  files?: string[];
+  matches?: string[];
+  count: number;
+  truncated: boolean;
+  full_output_path?: string;
+};
+
+/**
+ * Build the structured content from the bounded captured preview (the same
+ * bound the model-facing text uses). `count` is the total before truncation.
+ */
+export function searchStructuredContent(
+  kind: "fd" | "rg",
+  captured: CapturedOutput,
+): SearchStructuredOutput {
+  const trimmed = captured.preview.replace(/\n+$/, "");
+  const entries = trimmed === "" ? [] : trimmed.split("\n");
+  return {
+    ...(kind === "fd" ? { files: entries } : { matches: entries }),
+    count: captured.lineCount,
+    truncated: captured.truncated,
+    ...(captured.truncated && captured.fullOutputPath
+      ? { full_output_path: captured.fullOutputPath }
+      : {}),
+  };
+}
+
 export interface FormatOutputOptions {
   /** Temp-file prefix, e.g. "pi-fd-". */
   readonly tempPrefix: string;

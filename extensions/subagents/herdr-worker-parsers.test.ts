@@ -72,7 +72,7 @@ test("piWorkerLaunch passes a private deterministic session and child exclusions
     "high",
     "--approve",
     "--exclude-tools",
-    "subagent_spawn,subagent_send,subagent_wait,subagent_cancel,subagent_check,subagent_list,workflow,ask_user",
+    "subagent_spawn,subagent_send,subagent_wait,subagent_cancel,subagent_check,subagent_list,remote_spawn,remote_send,remote_wait,remote_cancel,remote_check,remote_list,workflow,ask_user",
   ]);
 });
 

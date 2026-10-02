@@ -27,6 +27,7 @@ import {
   shouldRefreshAfterTool,
   shouldRefreshOnInput,
   shouldTrackGit,
+  shouldPollGit,
 } from "./src/refresh-policy.ts";
 
 const REFRESH_DEBOUNCE_MS = 500;
@@ -180,10 +181,17 @@ export default function gitInfo(pi: ExtensionAPI) {
    * prepends a delay when an eager refresh already ran at session start (see
    * `session_start`).
    */
+  let lastPoll = 0;
   const poll = (intervalMs: number) =>
-    Effect.suspend(() =>
-      currentContext ? refreshIfIdle(currentContext) : Effect.void,
-    ).pipe(
+    Effect.suspend(() => {
+      if (
+        !currentContext ||
+        !shouldPollGit(Date.now(), lastPoll, currentContext.isIdle())
+      )
+        return Effect.void;
+      lastPoll = Date.now();
+      return refreshIfIdle(currentContext);
+    }).pipe(
       Effect.catchDefect(reportBackgroundDefect),
       Effect.repeat(Schedule.fixed(intervalMs)),
       Effect.asVoid,
@@ -212,6 +220,7 @@ export default function gitInfo(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     generation += 1;
     queriedPrBranch = null;
+    lastPoll = 0;
 
     const previousPollingFiber = pollingFiber;
     pollingFiber = undefined;

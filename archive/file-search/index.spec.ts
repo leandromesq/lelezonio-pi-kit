@@ -22,9 +22,16 @@ import {
   type ReleaseAsset,
   type ResolvedBinary,
 } from "./src/binaries.ts";
-import { formatCapturedOutput, formatOutput } from "./src/output.ts";
+import {
+  formatCapturedOutput,
+  formatOutput,
+  searchStructuredContent,
+} from "./src/output.ts";
 import { executeSearchProcess } from "./src/process.ts";
-import { installNotifications, makeBinaryInitializers } from "./index.ts";
+import fileSearchTools, {
+  installNotifications,
+  makeBinaryInitializers,
+} from "./index.ts";
 
 // --- argument construction -------------------------------------------------
 
@@ -441,4 +448,48 @@ it("output: oversized results are truncated and persisted", async () => {
   );
   const shownLines = formatted.text.split("\n");
   assert.equal(shownLines[0], "file-0.ts");
+});
+
+it("fd and rg declare schemas without eager session-start initialization", () => {
+  const tools = new Map<string, { outputSchema?: unknown }>();
+  const events: string[] = [];
+  fileSearchTools({
+    on: (name: string) => {
+      events.push(name);
+    },
+    registerTool: (tool: { name: string; outputSchema?: unknown }) => {
+      tools.set(tool.name, tool);
+    },
+  } as never);
+  assert.isDefined(tools.get("fd")?.outputSchema);
+  assert.isDefined(tools.get("rg")?.outputSchema);
+  assert.notInclude(events, "session_start");
+});
+
+it("structured search content carries the bounded match list", () => {
+  const captured = {
+    preview: "a.ts\nb.ts\n",
+    lineCount: 3,
+    totalBytes: 100,
+    truncated: true,
+    fullOutputPath: "/tmp/pi-fd-x/output.txt",
+  };
+  assert.deepEqual(searchStructuredContent("fd", captured), {
+    files: ["a.ts", "b.ts"],
+    count: 3,
+    truncated: true,
+    full_output_path: "/tmp/pi-fd-x/output.txt",
+  });
+  assert.deepEqual(
+    searchStructuredContent("rg", {
+      ...captured,
+      truncated: false,
+      fullOutputPath: undefined,
+    }),
+    {
+      matches: ["a.ts", "b.ts"],
+      count: 3,
+      truncated: false,
+    },
+  );
 });

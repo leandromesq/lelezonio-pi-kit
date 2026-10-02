@@ -123,11 +123,11 @@ const ACTIONS: KitAction[] = [
   },
   {
     value: "codex",
-    label: "Codex account",
-    description: "Save or switch CLI accounts",
+    label: "OpenAI accounts",
+    description: "Save or switch OpenAI accounts",
     command: "/codex",
     category: "Accounts",
-    detail: "Open the Codex CLI account manager.",
+    detail: "Open the OpenAI (ChatGPT/Codex) account manager.",
   },
   {
     value: "copy",

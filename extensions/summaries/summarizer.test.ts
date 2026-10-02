@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import {
+  registerFauxProvider,
+  streamSimple as compatStreamSimple,
+} from "@earendil-works/pi-ai/compat";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { SummaryConfig } from "./src/config.ts";
 import {
@@ -92,16 +95,20 @@ test("strips terminal control sequences from recap fields", () => {
 });
 
 function testConfig(provider: string, model: string): SummaryConfig {
-  return { provider, model, reasoning: "off" };
+  return { provider, model, reasoning: "off", mode: "auto", minToolCalls: 1 };
 }
 
 function testRegistry(registration: ReturnType<typeof registerFauxProvider>) {
   return {
     find: () => registration.getModel(),
-    getApiKeyAndHeaders: async () => ({
-      ok: true as const,
-      apiKey: "test-key",
-    }),
+    hasConfiguredAuth: () => true,
+    // Route the provider-neutral call back through the globally registered
+    // faux API provider, which is how production auth/transport is stubbed.
+    streamSimple: (
+      model: Parameters<NonNullable<ModelRegistry["streamSimple"]>>[0],
+      context: Parameters<NonNullable<ModelRegistry["streamSimple"]>>[1],
+      options: Parameters<NonNullable<ModelRegistry["streamSimple"]>>[2],
+    ) => compatStreamSimple(model, context, options),
   } as unknown as ModelRegistry;
 }
 

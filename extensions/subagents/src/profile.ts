@@ -26,6 +26,15 @@ export const CHILD_ORCHESTRATION_TOOLS = [
   "subagent_cancel",
   "subagent_check",
   "subagent_list",
+  // Remote orchestration belongs to the parent session. A child never owns a
+  // remote job, so Herdr workers (whose launch args come from this list via
+  // `childToolLoadout`) and in-process SDK children both deny these.
+  "remote_spawn",
+  "remote_send",
+  "remote_wait",
+  "remote_cancel",
+  "remote_check",
+  "remote_list",
   "workflow",
   "ask_user",
 ] as const;

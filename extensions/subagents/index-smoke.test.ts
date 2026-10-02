@@ -94,6 +94,9 @@ test("registers the full tool surface (and no child-only tools outside a child)"
       "subagent_list",
     ]) {
       assert.ok(tools.has(name), `missing tool ${name}`);
+      // Orchestration stays model-only: declared to the model, never
+      // callable from a codemode script.
+      assert.equal(tools.get(name)?.exposure, "model-only", name);
     }
     assert.ok(!tools.has("ask_question"), "ask_question is child-only");
   } finally {
@@ -116,6 +119,7 @@ test("registers ask_question inside a child (PI_SUBAGENT=1)", () => {
     const { pi, tools } = makeFakePi();
     subagentsExtension(pi as never);
     assert.ok(tools.has("ask_question"));
+    assert.equal(tools.get("ask_question")?.exposure, "model-only");
   } finally {
     process.env.PI_SUBAGENT = saved.PI_SUBAGENT;
     process.env.PI_SUBAGENT_ASK_FILE = saved.PI_SUBAGENT_ASK_FILE;

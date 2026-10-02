@@ -19,11 +19,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   createAgentSession,
-  DefaultResourceLoader,
   defineTool,
-  getAgentDir,
   SessionManager,
-  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
@@ -37,11 +34,16 @@ import type {
 import { SendError, SpawnError } from "../domain.ts";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
+import {
+  bindChildSessionExtensions,
+  CHILD_SHUTDOWN_TIMEOUT_MS,
+  createChildResources,
+  shutdownAndDisposeChildSession,
+  waitBounded,
+} from "../../../shared/child-session.ts";
 import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
 import { childToolLoadout } from "../profile.ts";
 import { trySpawnHerdrWorkerOutcome } from "./herdr-worker.ts";
-
-const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 
 // --- Model + effort resolution -----------------------------------------------
 
@@ -84,60 +86,6 @@ function resolvePiModel(
     );
   }
   throw new Error(`Unknown model "${hint}".`);
-}
-
-// --- Child session helpers (ported from v1 shared/child-session.ts) -----------
-
-/** Load normal global/package resources and trust-gated project resources. */
-async function createChildResources(cwd: string, projectTrusted: boolean) {
-  const agentDir = getAgentDir();
-  const settingsManager = SettingsManager.create(cwd, agentDir, {
-    projectTrusted,
-  });
-  const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
-  await loader.reload();
-  return { loader, settingsManager };
-}
-
-function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<void>((resolve) => {
-    timer = setTimeout(resolve, timeoutMs);
-  });
-  return Promise.race([
-    operation.then(
-      () => undefined,
-      () => undefined,
-    ),
-    timeout,
-  ])
-    .catch(() => {})
-    .finally(() => {
-      if (timer) clearTimeout(timer);
-    });
-}
-
-/** Emit child session_shutdown (bounded), then dispose. Never throws. */
-async function shutdownAndDisposeChildSession(session: AgentSession) {
-  try {
-    if (session.extensionRunner.hasHandlers("session_shutdown")) {
-      await waitBounded(
-        session.extensionRunner.emit({
-          type: "session_shutdown",
-          reason: "quit",
-        }),
-        CHILD_SHUTDOWN_TIMEOUT_MS,
-      );
-    }
-  } catch {
-    // Extension runner inspection/emission is best-effort during teardown.
-  } finally {
-    try {
-      session.dispose();
-    } catch {
-      // Disposal is terminal and must remain idempotent for callers.
-    }
-  }
 }
 
 // --- Event translation ----------------------------------------------------------
@@ -283,10 +231,23 @@ const makePiSession = (
 
     const session = yield* Effect.tryPromise({
       try: async () => {
-        const { loader, settingsManager } = await createChildResources(
-          task.cwd,
-          task.parent.projectTrusted,
-        );
+        const { loader, settingsManager } = await createChildResources({
+          cwd: task.cwd,
+          projectTrusted: task.parent.projectTrusted,
+          // Native MCP/codemode/tool_search parity with the CLI, but only for
+          // a full default-surface child. A narrowed profile uses a real
+          // `tools` allowlist, and those tools must not even be registered:
+          // codemode/deferred tools are callable from scripts regardless of
+          // the active set (see shared/child-session.ts).
+          nativeBuiltins: loadout.tools === undefined,
+          // DonSeTch is always excluded by the shared child loader
+          // (`CHILD_EXCLUDED_EXTENSION_PATHS` in shared/child-session.ts): its
+          // session_start daemon/transport is process-wide and an in-process
+          // child's session_shutdown could cross-kill the parent's transport.
+          // A parent that wants web research keeps its own DonSeTch; a child
+          // gets web tools only through the supported native MCP surface.
+          excludedExtensionPaths: [],
+        });
         const { session } = await createAgentSession({
           cwd: task.cwd,
           sessionManager: SessionManager.create(task.cwd),
@@ -310,6 +271,9 @@ const makePiSession = (
                   defineTool({
                     name: "subagent_spawn",
                     label: "Spawn Child Subagent",
+                    // Orchestration: declared to the model, never callable from
+                    // a codemode script.
+                    exposure: "model-only",
                     description:
                       `Spawn a child subagent and wait for its result. Allowed profiles: ${task.parent.nest.allow.join(", ")}. ` +
                       "The child runs under its own profile's tool policy; its final output returns here as the tool result.",
@@ -370,6 +334,9 @@ const makePiSession = (
             defineTool({
               name: "ask_question",
               label: "Ask Orchestrator",
+              // Interactive: declared to the model, never callable from a
+              // codemode script.
+              exposure: "model-only",
               description:
                 "Ask the orchestrator a single freeform question and stop. Your session stays resumable; the answer arrives as a follow-up task message. Prefer asking over guessing when requirements are ambiguous.",
               promptSnippet:
@@ -410,7 +377,7 @@ const makePiSession = (
         // A rejection here would otherwise leak the freshly created session:
         // the scope finalizer that owns cleanup is only registered later.
         try {
-          await session.bindExtensions({ mode: "print" });
+          await bindChildSessionExtensions(session);
         } catch (error) {
           await shutdownAndDisposeChildSession(session);
           throw error;

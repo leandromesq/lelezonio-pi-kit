@@ -35,9 +35,18 @@ import {
  */
 
 const SSH_DELAY_MS = 800;
+// The delayed fixture is a shebang executable, not a Windows executable.
+// Other lifecycle tests below use portable executables and still run on Windows.
+const posixSshFixture = {
+  skip:
+    process.platform === "win32"
+      ? "Requires a POSIX shebang executable fixture"
+      : false,
+};
 
 const ENV_VARS = [
   "PI_CODING_AGENT_DIR",
+  "PI_SUBAGENT",
   "FAKE_SSH_LOG",
   "FAKE_SSH_DELAY_S",
 ] as const;
@@ -247,7 +256,59 @@ function settleDelay() {
 }
 
 for (const reason of ["new", "reload"] as const) {
-  test(`session teardown during delayed initialization is silent (${reason})`, async () => {
+  test(
+    `session teardown during delayed initialization is silent (${reason})`,
+    posixSshFixture,
+    async () => {
+      const previousEnv: Record<string, string | undefined> = {};
+      for (const name of ENV_VARS) previousEnv[name] = process.env[name];
+      const rejections: unknown[] = [];
+      const onRejection = (value: unknown) => {
+        rejections.push(value);
+      };
+      process.on("unhandledRejection", onRejection);
+      const env = await createEnv({ trackedJobs: true });
+      try {
+        const { runner, ui, errors } = await createHarness(env);
+        await runner.emit({ type: "session_start", reason: "startup" });
+        // Make sure the delayed ssh is in flight before tearing down: this is
+        // the race that used to crash (SSH delay widens it).
+        await waitFor(sshStarted(env), "fake ssh to start");
+        await runner.emit({ type: "session_shutdown", reason });
+        // Mirrors AgentSession.dispose(): the old runner's ctx becomes stale.
+        runner.invalidate();
+        await settleDelay();
+        // Extra margin: the rejection (if any) must have surfaced by now.
+        await sleep(200);
+
+        assert.deepEqual(
+          rejections,
+          [],
+          `expected zero unhandled rejections after session_shutdown (${reason})`,
+        );
+        assert.deepEqual(
+          ui.notifyCalls,
+          [],
+          "expected expected teardown during initialization to be silent",
+        );
+        assert.deepEqual(
+          errors,
+          [],
+          "expected no errors reported through the extension runner",
+        );
+      } finally {
+        process.removeListener("unhandledRejection", onRejection);
+        restoreEnv(previousEnv);
+        fs.rmSync(env.directory, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+test(
+  "initialization failure while current is contained and graceful shutdown stays silent",
+  posixSshFixture,
+  async () => {
     const previousEnv: Record<string, string | undefined> = {};
     for (const name of ENV_VARS) previousEnv[name] = process.env[name];
     const rejections: unknown[] = [];
@@ -259,92 +320,48 @@ for (const reason of ["new", "reload"] as const) {
     try {
       const { runner, ui, errors } = await createHarness(env);
       await runner.emit({ type: "session_start", reason: "startup" });
-      // Make sure the delayed ssh is in flight before tearing down: this is
-      // the race that used to crash (SSH delay widens it).
       await waitFor(sshStarted(env), "fake ssh to start");
-      await runner.emit({ type: "session_shutdown", reason });
-      // Mirrors AgentSession.dispose(): the old runner's ctx becomes stale.
-      runner.invalidate();
       await settleDelay();
-      // Extra margin: the rejection (if any) must have surfaced by now.
       await sleep(200);
 
       assert.deepEqual(
         rejections,
         [],
-        `expected zero unhandled rejections after session_shutdown (${reason})`,
+        "expected zero unhandled rejections while the session stays current",
       );
+      // The manager swallows the ssh failure during reconcile and comes up
+      // degraded; there is nothing to report to the user.
       assert.deepEqual(
         ui.notifyCalls,
         [],
-        "expected expected teardown during initialization to be silent",
+        "expected ssh failure during reconcile not to notify",
       );
+      // updateStatus() ran after initialization completed: the status line was
+      // refreshed for the seeded job.
+      assert.ok(
+        ui.statusCalls.some(
+          (call) => call.key === "remote-agents" && call.text !== undefined,
+        ),
+        "expected initialization to complete and update the status line",
+      );
+      assert.deepEqual(errors, []);
+
+      // Graceful teardown afterwards must also stay silent.
+      await runner.emit({ type: "session_shutdown", reason: "quit" });
+      runner.invalidate();
+      await sleep(200);
       assert.deepEqual(
-        errors,
+        rejections,
         [],
-        "expected no errors reported through the extension runner",
+        "expected zero unhandled rejections after graceful shutdown",
       );
     } finally {
       process.removeListener("unhandledRejection", onRejection);
       restoreEnv(previousEnv);
       fs.rmSync(env.directory, { recursive: true, force: true });
     }
-  });
-}
-
-test("initialization failure while current is contained and graceful shutdown stays silent", async () => {
-  const previousEnv: Record<string, string | undefined> = {};
-  for (const name of ENV_VARS) previousEnv[name] = process.env[name];
-  const rejections: unknown[] = [];
-  const onRejection = (value: unknown) => {
-    rejections.push(value);
-  };
-  process.on("unhandledRejection", onRejection);
-  const env = await createEnv({ trackedJobs: true });
-  try {
-    const { runner, ui, errors } = await createHarness(env);
-    await runner.emit({ type: "session_start", reason: "startup" });
-    await waitFor(sshStarted(env), "fake ssh to start");
-    await settleDelay();
-    await sleep(200);
-
-    assert.deepEqual(
-      rejections,
-      [],
-      "expected zero unhandled rejections while the session stays current",
-    );
-    // The manager swallows the ssh failure during reconcile and comes up
-    // degraded; there is nothing to report to the user.
-    assert.deepEqual(
-      ui.notifyCalls,
-      [],
-      "expected ssh failure during reconcile not to notify",
-    );
-    // updateStatus() ran after initialization completed: the status line was
-    // refreshed for the seeded job.
-    assert.ok(
-      ui.statusCalls.some(
-        (call) => call.key === "remote-agents" && call.text !== undefined,
-      ),
-      "expected initialization to complete and update the status line",
-    );
-    assert.deepEqual(errors, []);
-
-    // Graceful teardown afterwards must also stay silent.
-    await runner.emit({ type: "session_shutdown", reason: "quit" });
-    runner.invalidate();
-    await sleep(200);
-    assert.deepEqual(
-      rejections,
-      [],
-      "expected zero unhandled rejections after graceful shutdown",
-    );
-  } finally {
-    process.removeListener("unhandledRejection", onRejection);
-    restoreEnv(previousEnv);
-    fs.rmSync(env.directory, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 test("session_start still initializes the manager when the registry tracks a job", async () => {
   const previousEnv: Record<string, string | undefined> = {};
@@ -369,6 +386,39 @@ test("session_start still initializes the manager when the registry tracks a job
       ui.statusCalls.map((call) => call.text),
       ["remote: ■ 1 running · /remotes to view"],
     );
+    assert.equal(ui.notifyCalls.length, 0);
+    assert.deepEqual(errors, []);
+
+    await runner.emit({ type: "session_shutdown", reason: "quit" });
+    runner.invalidate();
+    await sleep(200);
+    assert.deepEqual(errors, []);
+  } finally {
+    restoreEnv(previousEnv);
+    fs.rmSync(env.directory, { recursive: true, force: true });
+  }
+});
+
+test("a subagent child never auto-starts the remote manager", async () => {
+  const previousEnv: Record<string, string | undefined> = {};
+  for (const name of ENV_VARS) previousEnv[name] = process.env[name];
+  // A tracked job would normally make session_start upload/ping the helper.
+  const env = await createEnv({
+    trackedJobs: true,
+    sshExecutable: process.execPath,
+  });
+  process.env.PI_SUBAGENT = "1";
+  try {
+    const { runner, ui, errors } = await createHarness(env);
+    await runner.emit({ type: "session_start", reason: "startup" });
+    await settleDelay();
+    await sleep(200);
+    assert.equal(
+      fs.existsSync(env.sshLog),
+      false,
+      "a child must not run ssh on startup even with a tracked job",
+    );
+    assert.deepEqual(ui.statusCalls, [], "no manager status in a child");
     assert.equal(ui.notifyCalls.length, 0);
     assert.deepEqual(errors, []);
 

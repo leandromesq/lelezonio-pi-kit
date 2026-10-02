@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   isSubagentProcess,
+  shouldPollGit,
+  IDLE_POLL_INTERVAL_MS,
   POLL_INTERVAL_MS,
   pollIntervalMs,
   shouldRefreshAfterTool,
@@ -73,6 +75,12 @@ test("a subagent child never refreshes from tool mutations", () => {
 test("a subagent child never refreshes from input", () => {
   assert.equal(shouldRefreshOnInput(true), false);
   assert.equal(shouldRefreshOnInput(false), true);
+});
+
+test("idle polling backs off while active sessions retain the fallback cadence", () => {
+  assert.equal(shouldPollGit(1000, 100, false), true);
+  assert.equal(shouldPollGit(1000, 100, true), false);
+  assert.equal(shouldPollGit(IDLE_POLL_INTERVAL_MS + 100, 100, true), true);
 });
 
 test("a subagent child polls, but slower than the parent", () => {

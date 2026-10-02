@@ -9,12 +9,12 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 - Fixed-bottom editor with a compact custom dashboard and color-coded thinking level
 - Curated theme collection (Noctalia by default)
 - Named Pi/Codex subagent profiles with configurable models and thinking effort
-- Fast Codex CLI account saving and switching with `/codex`
+- Pi OpenAI/ChatGPT and legacy OpenAI Codex account saving and switching with `/codex`
 - Multi-agent workflows with phased and parallel execution
 - Subagents spawn as real interactive Pi/Codex TUIs in a shared `Pi Workers` Herdr workspace when running inside Herdr (in-process fallback outside Herdr), with live pane take-over from `/subagents`
 - Background terminals for servers, watchers, and long-running commands
 - Persistent remote Pi agents over SSH and Herdr, with context handoff and reconnectable monitoring
-- First-class `fd` and `rg` tools
+- Native `grep`, `find`, and `ls` tools, with Pi-managed rg/fd provisioning
 - Default-off Playwright browser tools for live web-app debugging
 - Composable one-turn prompt snippets via `Alt+S`
 - YouTube transcript extraction through a cross-platform skill
@@ -22,7 +22,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 - Height-aware multiple-choice `ask_user` tool with scrollable context and expandable descriptions
 - `/kit` control centre and `/perf` lightweight runtime diagnostics
 - Automatic run summaries and conversation export
-- No Claude Code, Firecrawl, or external memory package dependencies
+- No Claude Code or Firecrawl dependency; optional observational memory includes a pinned Pi 1.0 compatibility build
 
 ## Extensions
 
@@ -33,8 +33,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 | `background-terminals` | Background process tools and the `/ps` dashboard                                                                    |
 | `browser`              | Default-off Playwright tools, enabled per session with `/browser on`                                                |
 | `copy-all`             | `/copy-all` conversation export                                                                                     |
-| `codex-accounts`       | Save and switch Codex CLI accounts with `/codex`                                                                    |
-| `file-search`          | Typed `fd` and `rg` model tools                                                                                     |
+| `codex-accounts`       | Save and switch Pi OpenAI/ChatGPT accounts with `/codex`                                                            |
 | `git-info`             | Branch/PR dashboard state, `/lg`, and `/pr`                                                                         |
 | `git-pr`               | `/yeet` and guarded `/git <target-branch>` workflows                                                                |
 | `kit`                  | `/kit` control centre for discovering and launching setup features                                                  |
@@ -44,7 +43,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 | `remote-agents`        | Persistent remote Pi jobs over SSH and Herdr with `/remote` and `/remotes`                                          |
 | `subagents`            | Pi and Codex children (Herdr-native TUIs in Herdr, in-process outside), profiles, result delivery, and `/subagents` |
 | `summaries`            | Asynchronous post-run recaps and `/summary-model`                                                                   |
-| `ui-customization`     | Startup logo, footer, thinking colors, and fixed-bottom editor                                                      |
+| `ui-customization`     | Native startup header, dashboard footer, thinking colors, and fixed-bottom editor                                   |
 | `workflows`            | Scriptable phased/parallel multi-agent workflows and `/workflows`                                                   |
 | `zed`                  | Open the current directory in Zed with `/zed`                                                                       |
 
@@ -112,18 +111,30 @@ Profiles live in [`subagents.json`](subagents.json):
 
 Explicit spawn fields override profile values. Profile values override per-harness defaults. The concurrency cap is also configured in this file.
 
-The main agent executes small tasks directly and delegates only independent, complex, long, or parallelizable work to subagents. All named profiles run on the Pi harness with `opencode-go/deepseek-v4.1-flash`, and profile-less spawns default to the Pi harness and the same model. The Codex harness keeps `gpt-5.6-luna` and is the only exception, reserved for subagents that call Codex CLI or that require tooling unavailable in Pi, such as an MCP integration exposed by Codex CLI. See AGENTS.md for the full delegation policy.
+The main agent executes small tasks directly and delegates only independent, complex, long, or parallelizable work to subagents. All named profiles run on the Pi harness with `opencode-go/deepseek-v4.1-flash`, and profile-less spawns default to the Pi harness and the same model. The Codex harness keeps `gpt-5.6-luna` and is reserved for tasks specifically requiring Codex CLI or a capability unavailable in Pi. Pi 1.0 supports MCP natively; MCP alone is not a reason to switch harnesses. See AGENTS.md for the full delegation policy.
 
 These model names reflect my accounts and preferences. Replace them with models and providers available from `pi --list-models`; Codex-harness profiles additionally require a compatible Codex CLI installation.
 
-Save the Codex CLI account that is currently authenticated, then repeat after logging into each account you use:
+Use Pi's `/login` with OpenAI (ChatGPT) or legacy OpenAI Codex, then save each account:
 
 ```text
 /codex save personal
 /codex save work
 ```
 
-Run `/codex` to select an account. The switch updates Codex CLI credentials for new Codex processes, including future Codex subagents. Saved credentials remain private under `~/.codex/accounts/` (or `$CODEX_HOME/accounts/`).
+Run `/codex` to select an account. These are **Pi authentication snapshots**, not Codex CLI credentials. Switching changes Pi's next request for that account's provider and leaves other providers untouched. Saved snapshots live privately under `~/.pi/agent/codex-accounts/`; never commit them.
+
+## Pi 1.0 integration
+
+The CLI provides native MCP, codemode and deferred tool discovery. Full-surface SDK children explicitly load these built-ins; read-only/allowlisted SDK children do not connect native MCP. Configure servers in `mcp.json` deliberately â€” no server is added by the kit.
+
+Interactive/orchestrating tools such as `ask_user`, `workflow` and `subagent_*` are `model-only`: the model calls them directly, not through codemode scripts. Native `grep`/`find`/`ls` replace the archived file-search extension and return textual results. Browser tools remain direct and default-off; `/browser on` is required, and the opt-in follows the active history branch.
+
+The dashboard cost includes persisted assistant/tool usage, cache warming, compaction and branch summaries across all session branches. Auxiliary title/summary and separate memory-worker calls are not automatically billed to the parent transcript.
+
+The optional [local memory build](vendor/pi-observational-memory/README.md) adapts the amosblomqvist fork for Pi 1.0: isolated Pi workers and session-scoped topic Markdown. Legacy memory stays intact but is not automatically migrated; this is a pinned local adaptation, not an official release or an auto-updating npm package. See [SETUP.md](SETUP.md#observational-memory-optional).
+
+Pi Durable is a separate experimental harness, not a prerequisite or replacement for these extensions. Saved workflow artifacts aid inspection; they do not imply automatic crash-resume.
 
 ## Git workflows
 

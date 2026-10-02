@@ -80,6 +80,9 @@ export default function askUser(pi: ExtensionAPI) {
   pi.registerTool({
     name: "ask_user",
     label: "Ask User",
+    // Interactive: declared to the model, never callable from a codemode
+    // script.
+    exposure: "model-only",
     description: ASK_USER_TOOL_DESCRIPTION,
     promptSnippet: ASK_USER_PROMPT_SNIPPET,
     promptGuidelines: ASK_USER_PROMPT_GUIDELINES,

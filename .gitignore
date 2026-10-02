@@ -49,6 +49,7 @@ skills/*
 !skills/youtube-transcript/
 
 # Local caches and checkpoints
+.memory/
 checkpoints/
 /git/
 /npm/

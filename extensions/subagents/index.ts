@@ -85,7 +85,7 @@ import {
   nestingAllowed,
   toolPolicyFor,
 } from "./src/profile.ts";
-import { readWorkerSummary } from "./src/restore.ts";
+import { discoverWorkerSessions, readWorkerSummary } from "./src/restore.ts";
 import {
   buildSubagentResultMessage,
   buildSubagentSendResult,
@@ -222,6 +222,7 @@ export default function (pi: ExtensionAPI) {
   let runtime: SubagentRuntime | undefined;
   let managerPromise: Promise<SubagentManagerShape> | undefined;
   let sessionContext: ExtensionContext | undefined;
+  let restorationEpoch = 0;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
   const resultDelivery = createDeferredResultDelivery<SettledResult>(
@@ -367,37 +368,30 @@ export default function (pi: ExtensionAPI) {
   /** Re-surface persisted children of a previous pi session as inspect-only
    * entries (dashboard, subagent_check). Resume after restart is not wired
    * for restored entries — send() explains how to take over in a pane. */
-  const restoreWorkers = async (parentSessionId: string) => {
+  const restoreWorkers = async (parentSessionId: string, epoch: number) => {
+    const current = () =>
+      epoch === restorationEpoch && sessionContext !== undefined;
     const root = path.join(
       getAgentDir(),
       "sessions",
       "workers",
       parentSessionId,
     );
-    let dirs: string[] = [];
-    try {
-      dirs = fs
-        .readdirSync(root, { withFileTypes: true })
-        .filter((dirent) => dirent.isDirectory())
-        .map((dirent) => path.join(root, dirent.name));
-    } catch {
-      return; // no previous session persisted
-    }
+    // Async discovery + tail reads: this is a detached startup task, and a
+    // synchronous directory walk or JSONL read would block the event loop
+    // while the session is still coming up.
+    const candidates = await discoverWorkerSessions(root);
+    if (!current() || candidates.length === 0) return;
     const manager = await getManager();
-    for (const dir of dirs) {
-      const id = path.basename(dir);
+    if (!current()) return;
+    for (const { id, filePath } of candidates) {
+      if (!current()) return;
       if (manager.view.get(id)) continue;
-      const files = fs
-        .readdirSync(dir)
-        .filter((file) => file.endsWith(".jsonl"))
-        .sort();
-      const filePath = files.length
-        ? path.join(dir, files[files.length - 1])
-        : undefined;
-      if (!filePath) continue;
       // Tail-first: a normal final message lives in the last ~8 KiB, so most
       // restored children never pay the 256 KiB read.
-      const { finalText, errorText, settledAt } = readWorkerSummary(filePath);
+      const { finalText, errorText, settledAt } =
+        await readWorkerSummary(filePath);
+      if (!current()) return;
       try {
         await runTool(
           getRuntime(),
@@ -506,6 +500,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", (_event, ctx) => {
+    const epoch = ++restorationEpoch;
     sessionContext = ctx;
     if (ctx.hasUI) ui = ctx.ui;
     // One ephemeral "Pi Workers" workspace per parent pi session, shared via
@@ -553,12 +548,15 @@ export default function (pi: ExtensionAPI) {
     }
     // Re-surface children of a previous pi session (same parent id) that are
     // persisted under the workers dir: inspect-only entries in the dashboard.
-    void restoreWorkers(parentSessionId ?? "session");
+    void restoreWorkers(parentSessionId ?? "session", epoch).catch(() => {
+      // Inspection is best-effort; a failed detached restore must not reject globally.
+    });
   });
 
   pi.on("agent_settled", flushResults);
 
   pi.on("session_shutdown", async () => {
+    restorationEpoch += 1;
     sessionContext = undefined;
     resultDelivery.clear();
     subagentNames.clear();
@@ -589,6 +587,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_spawn",
     label: "Spawn Subagent",
+    // Orchestration: declared to the model, never callable from a script.
+    exposure: "model-only",
     description: `${SUBAGENT_SPAWN_TOOL_DESCRIPTION} Configured profiles: ${profileSummary}. Maximum concurrent runs: ${subagentConfig.maxConcurrent}.`,
     promptSnippet: SUBAGENT_SPAWN_PROMPT_SNIPPET,
     promptGuidelines: [
@@ -741,6 +741,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_send",
     label: "Send to Subagent",
+    // Orchestration: declared to the model, never callable from a script.
+    exposure: "model-only",
     description: SUBAGENT_SEND_TOOL_DESCRIPTION,
     parameters: Type.Object({
       target: Type.String({
@@ -794,6 +796,8 @@ export default function (pi: ExtensionAPI) {
     pi.registerTool({
       name: "ask_question",
       label: "Ask Orchestrator",
+      // Interactive: declared to the model, never callable from a script.
+      exposure: "model-only",
       description:
         "Ask the orchestrator (the parent agent that spawned you) a single freeform question and stop. The answer arrives as your next user message. Prefer asking over guessing.",
       promptSnippet:
@@ -830,6 +834,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_wait",
     label: "Wait for Subagents",
+    // Orchestration: declared to the model, never callable from a script.
+    exposure: "model-only",
     description: SUBAGENT_WAIT_TOOL_DESCRIPTION,
     parameters: Type.Object({
       ids: Type.Array(Type.String(), {
@@ -937,6 +943,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_cancel",
     label: "Cancel Subagents",
+    // Orchestration: declared to the model, never callable from a script.
+    exposure: "model-only",
     description: SUBAGENT_CANCEL_TOOL_DESCRIPTION,
     parameters: Type.Object({
       ids: Type.Array(Type.String(), {
@@ -1008,6 +1016,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_check",
     label: "Check Subagent",
+    // Orchestration: declared to the model, never callable from a script.
+    exposure: "model-only",
     description: SUBAGENT_CHECK_TOOL_DESCRIPTION,
     parameters: Type.Object({
       id: Type.String({
@@ -1049,6 +1059,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_list",
     label: "List Subagents",
+    // Orchestration: declared to the model, never callable from a script.
+    exposure: "model-only",
     description: SUBAGENT_LIST_TOOL_DESCRIPTION,
     parameters: Type.Object({}),
     async execute() {

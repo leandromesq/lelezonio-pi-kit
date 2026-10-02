@@ -7,8 +7,9 @@
  * - Press alt+s or run /snippets to open the toggle menu (space: toggle,
  *   tab: preview, enter: apply, esc: cancel). The menu is a bordered,
  *   scrollable view.
- * - Active snippets appear as a widget above the editor, with prepend and
- *   append groups visually distinguished.
+ * - Active snippets appear as a single bounded widget line above the editor,
+ *   with prepend and append groups marked by ↑/↓ and a `+N` tail when the
+ *   names do not fit the terminal width.
  * - When a message is sent, active snippet bodies are prepended/appended to
  *   the message text in order (prepend group sorted by `order` first, then
  *   the typed text, then the append group sorted by `order`).
@@ -21,11 +22,13 @@ import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
   Key,
   matchesKey,
   truncateToWidth,
+  visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { viewportRows } from "../shared/ui/viewport.ts";
@@ -34,6 +37,68 @@ import { loadSnippets, type Snippet } from "./snippets.ts";
 const extensionDir = dirname(fileURLToPath(import.meta.url));
 const snippetsDir = join(extensionDir, "snippets");
 const WIDGET_ID = "prompt-snippets";
+
+/**
+ * One bounded widget line for the active snippets. Prepend and append groups
+ * keep their `↑`/`↓` markers, and when the full list does not fit the line
+ * drops trailing names and appends `+N` instead of wrapping or overflowing.
+ */
+export function buildSnippetWidgetLine(
+  prepends: readonly string[],
+  appends: readonly string[],
+  width: number,
+) {
+  const total = prepends.length + appends.length;
+  if (total === 0) return "";
+
+  const build = (preCount: number, appCount: number) => {
+    const parts: string[] = [];
+    if (preCount > 0)
+      parts.push(`↑ ${prepends.slice(0, preCount).join(" · ")}`);
+    if (appCount > 0) parts.push(`↓ ${appends.slice(0, appCount).join(" · ")}`);
+    return parts.join("  ");
+  };
+
+  let preCount = prepends.length;
+  let appCount = appends.length;
+  while (preCount + appCount > 0) {
+    const hidden = total - preCount - appCount;
+    const text = build(preCount, appCount) + (hidden > 0 ? ` +${hidden}` : "");
+    if (visibleWidth(text) <= width) return text;
+    // Drop trailing append names first, then prepend names, so the earliest
+    // (most actionable) snippets stay visible.
+    if (appCount > 0) appCount--;
+    else preCount--;
+  }
+  return truncateToWidth(`snippets +${total}`, width, "…");
+}
+
+/**
+ * Stateless widget component. It renders on every frame with the live theme,
+ * so a theme change never leaves stale ANSI colors embedded in cached lines.
+ */
+class SnippetWidget {
+  private readonly getTheme: () => Theme;
+  private readonly prepends: readonly string[];
+  private readonly appends: readonly string[];
+
+  constructor(
+    getTheme: () => Theme,
+    prepends: readonly string[],
+    appends: readonly string[],
+  ) {
+    this.getTheme = getTheme;
+    this.prepends = prepends;
+    this.appends = appends;
+  }
+
+  render(width: number) {
+    const line = buildSnippetWidgetLine(this.prepends, this.appends, width);
+    return [this.getTheme().fg("accent", line)];
+  }
+
+  invalidate() {}
+}
 
 export default function (pi: ExtensionAPI) {
   // Snippets last seen on disk (sorted). Refreshed whenever the menu opens or a message is sent.
@@ -52,25 +117,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const theme = ctx.ui.theme;
-    const lines: string[] = [];
-    if (prepends.length > 0) {
-      lines.push(
-        theme.fg(
-          "accent",
-          `↑ prepend: ${prepends.map((s) => s.name).join(" · ")}`,
-        ),
-      );
-    }
-    if (appends.length > 0) {
-      lines.push(
-        theme.fg(
-          "warning",
-          `↓ append: ${appends.map((s) => s.name).join(" · ")}`,
-        ),
-      );
-    }
-    ctx.ui.setWidget(WIDGET_ID, lines);
+    const prependNames = prepends.map((s) => s.name);
+    const appendNames = appends.map((s) => s.name);
+    // Component factory, not a pre-rendered string array: the widget renders at
+    // the terminal width and reads the live theme each frame.
+    ctx.ui.setWidget(
+      WIDGET_ID,
+      () => new SnippetWidget(() => ctx.ui.theme, prependNames, appendNames),
+    );
   }
 
   async function openMenu(ctx: ExtensionContext) {

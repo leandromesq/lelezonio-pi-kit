@@ -120,7 +120,7 @@ test("transcript omits thinking, images, and recap entries while redacting tool 
   assert.match(transcript, /tool arguments capped/);
 });
 
-test("fallback recap is written in English", () => {
+test("fallback recap is written in pt-BR to match the model prompt", () => {
   const recap = buildFallbackRecap([
     entry("assistant", {
       role: "assistant",
@@ -136,12 +136,12 @@ test("fallback recap is written in English", () => {
       timestamp: 0,
     }),
   ]);
-  assert.match(recap.recap, /^The main agent run finished\./);
-  assert.match(recap.recap, /1 tool call \(bash\)\./);
+  assert.match(recap.recap, /^A execução principal do agente foi concluída\./);
+  assert.match(recap.recap, /1 chamada de ferramenta \(bash\)\./);
   assert.match(recap.recap, /Done\.$/);
   assert.equal(
     recap.next,
-    "Review the completed work above and continue if anything is still pending.",
+    "Revise o trabalho concluído acima e continue se algo ainda estiver pendente.",
   );
 });
 

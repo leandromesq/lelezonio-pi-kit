@@ -1,15 +1,23 @@
 {
   "private": true,
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.84.4",
-    "@earendil-works/pi-coding-agent": "^0.84.4",
-    "@earendil-works/pi-tui": "^0.84.4",
     "@effect/platform-node": "^4.0.0-beta.99",
     "acorn": "^8.17.0",
-    "effect": "^4.0.0-beta.99",
-    "typebox": "^1.3.6"
+    "effect": "^4.0.0-beta.99"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-agent-core": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-tui": "1.0.0",
+    "typebox": "^1.3.6",
     "@effect/vitest": "^4.0.0-beta.99",
     "@types/node": "^26.1.1",
     "prettier": "^3.9.5",
@@ -18,10 +26,12 @@
   },
   "type": "module",
   "scripts": {
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit && tsc --noEmit --project vendor/pi-observational-memory/tsconfig.json",
     "format": "prettier --write \"extensions/**/*.{ts,mts,cjs,mjs}\" \"scripts/**/*.mjs\" \"skills/**/*.md\" \"*.{json,md}\"",
     "format:check": "prettier --check \"extensions/**/*.{ts,mts,cjs,mjs}\" \"scripts/**/*.mjs\" \"skills/**/*.md\" \"*.{json,md}\"",
     "gen:themes": "node scripts/gen-themes.mjs",
-    "test": "node scripts/test.mjs"
+    "benchmark:startup": "node scripts/benchmark-startup.mjs",
+    "test": "node scripts/test.mjs",
+    "test:memory": "node --test scripts/observational-memory.test.mjs && npm --prefix vendor/pi-observational-memory test"
   }
 }

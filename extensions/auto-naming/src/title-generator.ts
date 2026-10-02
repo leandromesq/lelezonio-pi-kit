@@ -1,5 +1,5 @@
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { redactSensitiveText } from "../../shared/sensitive-text.ts";
 import type { NamingConfig } from "./config.ts";
 import { TITLE_MAX_LENGTH } from "./constants.ts";
@@ -73,9 +73,7 @@ export function parseTitleResponse(text: string) {
   throw new Error("The title model did not return valid title JSON.");
 }
 
-function assistantText(
-  content: Awaited<ReturnType<typeof completeSimple>>["content"],
-) {
+function assistantText(content: AssistantMessage["content"]) {
   return content
     .filter((block) => block.type === "text")
     .map((block) => block.text)
@@ -109,37 +107,39 @@ export async function generateTaskTitle(options: {
     );
     if (!model) return fallback;
 
-    const auth = await options.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok) return fallback;
-
-    const response = await completeSimple(
-      model,
-      {
-        systemPrompt: TITLE_SYSTEM_PROMPT,
-        messages: [
-          {
-            role: "user",
-            content: buildTitlePrompt({
-              prompt: redactSensitiveText(options.prompt),
-              hint: options.hint
-                ? redactSensitiveText(options.hint)
-                : undefined,
-            }),
-            timestamp: Date.now(),
-          },
-        ],
-      },
-      {
-        apiKey: auth.apiKey,
-        env: auth.env,
-        headers: auth.headers,
-        maxTokens: 80,
-        maxRetries: 0,
-        signal: options.signal,
-        timeoutMs: 8_000,
-        ...reasoningOptions(options.config.reasoning),
-      },
-    );
+    // Provider-neutral request through the session's ModelRuntime facade:
+    // request-time authentication (API keys, OAuth, headers, base URL) is
+    // resolved internally, replacing the former
+    // getApiKeyAndHeaders + compat completeSimple pair. Errors surface as a
+    // stopReason of "error"/"aborted" (or a thrown setup failure), all of
+    // which fall back exactly as before.
+    const response = await options.modelRegistry
+      .streamSimple(
+        model,
+        {
+          systemPrompt: TITLE_SYSTEM_PROMPT,
+          messages: [
+            {
+              role: "user",
+              content: buildTitlePrompt({
+                prompt: redactSensitiveText(options.prompt),
+                hint: options.hint
+                  ? redactSensitiveText(options.hint)
+                  : undefined,
+              }),
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        {
+          maxTokens: 80,
+          maxRetries: 0,
+          signal: options.signal,
+          timeoutMs: 8_000,
+          ...reasoningOptions(options.config.reasoning),
+        },
+      )
+      .result();
 
     if (response.stopReason === "error" || response.stopReason === "aborted") {
       return fallback;

@@ -564,3 +564,204 @@ test("manager tracks settlement and never cancels remote work on dispose", async
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+/** A client that reports one named agent as already settled with a result. */
+function settledClient(id: string) {
+  const name = `pi-remote-${id}`;
+  return {
+    async start() {
+      throw new Error("not used");
+    },
+    async list() {
+      return [agent(name, "done")];
+    },
+    async get() {
+      return agent(name, "done");
+    },
+    async read() {
+      return "tail";
+    },
+    async result() {
+      return { text: "structured", sessionPath: "/remote/session.jsonl" };
+    },
+    async pathInfo() {
+      return { exists: true, isGitRepository: true };
+    },
+    async cloneProject() {
+      return { path: "/remote/project", output: "" };
+    },
+    async prompt() {
+      return { agent: agent(name, "working") };
+    },
+    async cancel() {},
+    async close() {},
+  };
+}
+
+/** Seed a settled job directly into the registry, with optional ownership. */
+function seedJob(
+  store: RemoteJobStore,
+  id: string,
+  extra: Record<string, unknown> = {},
+) {
+  store.save([
+    {
+      id,
+      name: `pi-remote-${id}`,
+      title: id,
+      host: "macmini",
+      localCwd: "C:/project",
+      remoteCwd: "/remote/project",
+      workspaceId: "w2",
+      paneId: "w2:p1",
+      status: "done" as const,
+      createdAt: 1,
+      updatedAt: 2,
+      settledAt: 2,
+      transcript: "",
+      transcriptVersion: 0,
+      generation: 1,
+      ...extra,
+    },
+  ]);
+}
+
+test("a session only delivers remote results for jobs it owns", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-ownership-test-"),
+  );
+  const filePath = path.join(directory, "jobs.json");
+  const store = new RemoteJobStore(filePath);
+  seedJob(store, "ra-owned", { ownerSessionId: "session-owner" });
+  const client = settledClient("ra-owned");
+  try {
+    // A different session sharing the registry must not deliver the result.
+    const other = new RemoteAgentManager(config, client, store, {
+      sessionId: "session-other",
+    });
+    const otherSettled: string[] = [];
+    other.setOnSettled((snapshot) => otherSettled.push(snapshot.id));
+    await other.initialize();
+    assert.deepEqual(otherSettled, []);
+    other.dispose();
+
+    // The owning session recovers the still-undelivered completion.
+    const owner = new RemoteAgentManager(config, client, store, {
+      sessionId: "session-owner",
+    });
+    const ownerSettled: string[] = [];
+    owner.setOnSettled((snapshot) => ownerSettled.push(snapshot.id));
+    await owner.initialize();
+    assert.deepEqual(ownerSettled, ["ra-owned"]);
+    owner.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a legacy job is preserved but delivered only after explicit adoption", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-legacy-test-"),
+  );
+  const store = new RemoteJobStore(path.join(directory, "jobs.json"));
+  // No ownerSessionId: a job from before ownership existed.
+  seedJob(store, "ra-legacy");
+  const client = settledClient("ra-legacy");
+  try {
+    const manager = new RemoteAgentManager(config, client, store, {
+      sessionId: "session-adopter",
+    });
+    const settled: string[] = [];
+    manager.setOnSettled((snapshot) => settled.push(snapshot.id));
+    await manager.initialize();
+    // Preserved and inspectable, but never auto-delivered to an arbitrary
+    // session.
+    assert.equal(manager.get("ra-legacy")?.ownerSessionId, undefined);
+    assert.deepEqual(settled, []);
+
+    assert.equal(await manager.adopt("ra-legacy"), true);
+    assert.equal(manager.get("ra-legacy")?.ownerSessionId, "session-adopter");
+    await manager.refresh("ra-legacy", { transcript: true });
+    assert.deepEqual(settled, ["ra-legacy"]);
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("adoption never steals a job owned by another session", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-steal-test-"),
+  );
+  const store = new RemoteJobStore(path.join(directory, "jobs.json"));
+  seedJob(store, "ra-owned", { ownerSessionId: "session-a" });
+  try {
+    const manager = new RemoteAgentManager(
+      config,
+      settledClient("ra-owned"),
+      store,
+      {
+        sessionId: "session-b",
+      },
+    );
+    await manager.initialize();
+    assert.equal(await manager.adopt("ra-owned"), false);
+    assert.equal(manager.get("ra-owned")?.ownerSessionId, "session-a");
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a spawned job records its owning session", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-spawn-owner-test-"),
+  );
+  try {
+    const manager = new RemoteAgentManager(
+      config,
+      trackedClient(),
+      new RemoteJobStore(path.join(directory, "jobs.json")),
+      { sessionId: "session-spawn" },
+    );
+    await manager.initialize();
+    const snapshot = await manager.spawn({
+      title: "owned",
+      prompt: "work",
+      localCwd: "C:/project",
+      remoteCwd: "/remote/project",
+    });
+    assert.equal(snapshot.ownerSessionId, "session-spawn");
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("marking delivered never steals another session's delivery marker", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-marker-test-"),
+  );
+  const store = new RemoteJobStore(path.join(directory, "jobs.json"));
+  seedJob(store, "ra-owned", { ownerSessionId: "session-a" });
+  try {
+    const manager = new RemoteAgentManager(
+      config,
+      settledClient("ra-owned"),
+      store,
+      { sessionId: "session-b" },
+    );
+    await manager.initialize();
+    // Checking another session's job must not mark it delivered for this one.
+    manager.markCompletionDelivered("ra-owned");
+    manager.markBlockedDelivered("ra-owned");
+    assert.equal(manager.get("ra-owned")?.completionDeliveredTo, undefined);
+    await store.flush();
+    const persisted = store.load().find((job) => job.id === "ra-owned");
+    assert.equal(persisted?.completionDeliveredTo, undefined);
+    assert.equal(persisted?.blockedDeliveredTo, undefined);
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

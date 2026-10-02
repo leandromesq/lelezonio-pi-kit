@@ -38,7 +38,11 @@ import {
   type PlatformTarget,
   type ResolvedBinary,
 } from "./src/binaries.ts";
-import { formatCapturedOutput, type CapturedOutput } from "./src/output.ts";
+import {
+  formatCapturedOutput,
+  searchStructuredContent,
+  type CapturedOutput,
+} from "./src/output.ts";
 import {
   FD_PARAMETER_DESCRIPTIONS,
   FD_PROMPT_GUIDELINES,
@@ -101,6 +105,21 @@ export interface RgToolDetails {
   readonly fullOutputPath?: string;
 }
 
+/** Machine-readable match list for codemode scripts. */
+const fdOutputSchema = Type.Object({
+  files: Type.Array(Type.String(), { description: "Matching paths" }),
+  count: Type.Number({ description: "Total matches before truncation" }),
+  truncated: Type.Boolean(),
+  full_output_path: Type.Optional(Type.String()),
+});
+
+const rgOutputSchema = Type.Object({
+  matches: Type.Array(Type.String(), { description: "Matching output lines" }),
+  count: Type.Number({ description: "Total matches before truncation" }),
+  truncated: Type.Boolean(),
+  full_output_path: Type.Optional(Type.String()),
+});
+
 const EXEC_TIMEOUT_MS = 60_000;
 
 function causeMessage<E>(cause: Cause.Cause<E>) {
@@ -117,54 +136,25 @@ function unwrapToolExit<A, E>(exit: Exit.Exit<A, E>, tool: "fd" | "rg") {
 }
 
 export default function fileSearchTools(pi: ExtensionAPI) {
-  let notified = false;
+  const notified = new Set<"fd" | "rg">();
 
   const binDir = repositoryBinDir();
   const target = currentTarget();
   const initializers = makeBinaryInitializers(binDir, target, liveBinaryEnv);
 
-  pi.on("session_start", async (_event, ctx) => {
-    const exit = await Effect.runPromiseExit(
-      Effect.gen(function* () {
-        const initialized = yield* Effect.all(
-          {
-            fd: Effect.exit(initializers.fd),
-            rg: Effect.exit(initializers.rg),
-          },
-          { concurrency: "unbounded" },
-        );
-        if (!ctx.hasUI || notified) return;
-
-        notified = true;
-        for (const tool of ["fd", "rg"] as const) {
-          const toolExit = initialized[tool];
-          if (Exit.isSuccess(toolExit)) {
-            for (const message of installNotifications([toolExit.value])) {
-              ctx.ui.notify(message, "info");
-            }
-          } else {
-            ctx.ui.notify(
-              `file-search ${tool} setup failed: ${causeMessage(toolExit.cause)}`,
-              "error",
-            );
-          }
-        }
-      }),
-    );
-
-    if (Exit.isFailure(exit) && ctx.hasUI && !notified) {
-      notified = true;
-      ctx.ui.notify(
-        `file-search setup failed: ${causeMessage(exit.cause)}`,
-        "error",
-      );
-    }
-  });
+  // Cached initializers run only on first use. Binary probes/downloads must
+  // not delay session_start (especially in SDK children that never search).
 
   /** Await init, stream the binary output to disk, and classify its exit. */
   function runSearch(tool: "fd" | "rg", args: string[], ctx: ExtensionContext) {
     return Effect.gen(function* () {
       const binary = yield* initializers[tool];
+      if (ctx.hasUI && !notified.has(tool)) {
+        notified.add(tool);
+        for (const message of installNotifications([binary])) {
+          ctx.ui.notify(message, "info");
+        }
+      }
       const result = yield* executeSearchProcess({
         command: binary.command,
         args,
@@ -214,6 +204,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
     promptSnippet: FD_PROMPT_SNIPPET,
     promptGuidelines: FD_PROMPT_GUIDELINES,
     parameters: fdParameters(),
+    outputSchema: fdOutputSchema,
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const exit = await Effect.runPromiseExit(
@@ -227,6 +218,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
                 matchCount: 0,
                 truncated: false,
               },
+              structuredContent: searchStructuredContent("fd", outcome.output),
             } satisfies AgentToolResult<FdToolDetails>;
           }
 
@@ -239,6 +231,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
               truncated: formatted.truncated,
               fullOutputPath: formatted.fullOutputPath,
             },
+            structuredContent: searchStructuredContent("fd", outcome.output),
           } satisfies AgentToolResult<FdToolDetails>;
         }),
         signal ? { signal } : undefined,
@@ -285,6 +278,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
     promptSnippet: RG_PROMPT_SNIPPET,
     promptGuidelines: RG_PROMPT_GUIDELINES,
     parameters: rgParameters(),
+    outputSchema: rgOutputSchema,
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const exit = await Effect.runPromiseExit(
@@ -298,6 +292,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
                 outputLines: 0,
                 truncated: false,
               },
+              structuredContent: searchStructuredContent("rg", outcome.output),
             } satisfies AgentToolResult<RgToolDetails>;
           }
 
@@ -310,6 +305,7 @@ export default function fileSearchTools(pi: ExtensionAPI) {
               truncated: formatted.truncated,
               fullOutputPath: formatted.fullOutputPath,
             },
+            structuredContent: searchStructuredContent("rg", outcome.output),
           } satisfies AgentToolResult<RgToolDetails>;
         }),
         signal ? { signal } : undefined,

@@ -107,6 +107,12 @@ export function createWorkflowResources(
   return createChildResources({
     cwd,
     projectTrusted,
+    // Workflow children keep the default full tool surface (`childToolPolicy`
+    // is a denylist), so they get the same native MCP/codemode/tool_search
+    // parity as the CLI. `excludeTools` still removes orchestration tools from
+    // the callable registry, which is what stops codemode/deferred exposure
+    // from reaching them.
+    nativeBuiltins: true,
     ...(variant === "structured"
       ? { appendSystemPrompt: [STRUCTURED_OUTPUT_SYSTEM_INSTRUCTION] }
       : {}),

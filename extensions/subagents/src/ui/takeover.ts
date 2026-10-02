@@ -12,9 +12,6 @@
  */
 
 import {
-  keyHint,
-  keyText,
-  rawKeyHint,
   type ExtensionCommandContext,
   type KeybindingsManager,
   type Theme,
@@ -29,6 +26,18 @@ import { createTranscriptLineCache } from "./transcript.ts";
 
 /** Explicit ellipsis: the pi-tui default `...` must not appear in overlays. */
 const ELLIPSIS = "…";
+
+/**
+ * Hint keys must come from the manager the component was actually built with,
+ * not the process-global `keyText()`: a user remap would otherwise make the
+ * hint lie about the key the handler accepts.
+ */
+function configuredKeys(
+  keybindings: KeybindingsManager,
+  binding: Parameters<KeybindingsManager["getKeys"]>[0],
+) {
+  return keybindings.getKeys(binding).join("/") || "unbound";
+}
 
 function statusGlyph(snap: SubagentSnapshot, theme: Theme): string {
   switch (snap.status) {
@@ -158,7 +167,7 @@ export function reconcileDashboardSelection(
   selection.id = subs[selection.index]?.id;
 }
 
-class SubagentDashboard implements Component {
+export class SubagentDashboard implements Component {
   private tui: TUI;
   private theme: Theme;
   private keybindings: KeybindingsManager;
@@ -167,6 +176,8 @@ class SubagentDashboard implements Component {
   private done: (value: string | null) => void;
 
   private closed = false;
+  /** Id of a running subagent whose abort is armed (awaiting a second `x`). */
+  private armedAbortId: string | undefined;
   private ticker: ReturnType<typeof setInterval>;
   private unsubChange: () => void;
 
@@ -213,6 +224,11 @@ class SubagentDashboard implements Component {
     const subs = this.subs();
     reconcileDashboardSelection(this.selection, subs);
 
+    // The destructive `x` is armed by its first press and confirmed by the
+    // second; any other key (including close) disarms it.
+    const wasArmed = this.armedAbortId;
+    if (data !== "x") this.armedAbortId = undefined;
+
     if (this.keybindings.matches(data, "tui.select.cancel")) {
       this.close(null);
       return;
@@ -241,7 +257,14 @@ class SubagentDashboard implements Component {
     }
     if (data === "x") {
       const snap = subs[this.selection.index];
-      if (snap && snap.status === "running") this.view.requestAbort(snap.id);
+      if (snap && snap.status === "running") {
+        if (wasArmed === snap.id) {
+          this.view.requestAbort(snap.id);
+        } else {
+          this.armedAbortId = snap.id;
+        }
+      }
+      this.tui.requestRender();
       return;
     }
   }
@@ -278,12 +301,11 @@ class SubagentDashboard implements Component {
 
     const lines: string[] = [];
 
-    // Header: title left, count right
+    // Header: title left, settled/total right. The count appears exactly once;
+    // the panel border below carries only the section label.
+    const settled = subs.filter((s) => s.status !== "running").length;
     const headerLeft = theme.fg("accent", theme.bold("Subagents"));
-    const headerRight = theme.fg(
-      "muted",
-      `${subs.length} agent${subs.length === 1 ? "" : "s"}`,
-    );
+    const headerRight = theme.fg("dim", `${settled}/${subs.length}`);
     const headerPad = Math.max(
       1,
       width - visibleWidth(headerLeft) - visibleWidth(headerRight) - 4,
@@ -297,10 +319,9 @@ class SubagentDashboard implements Component {
     );
 
     // Top border with panel title
-    const settled = subs.filter((s) => s.status !== "running").length;
     lines.push(
       theme.fg("border", "╭") +
-        this.borderSegment(innerWidth, `agents · ${settled}/${subs.length}`) +
+        this.borderSegment(innerWidth, "subagents") +
         theme.fg("border", "╮"),
     );
 
@@ -318,17 +339,25 @@ class SubagentDashboard implements Component {
         theme.fg("border", "╯"),
     );
 
-    // Hints
+    // Hints. The armed abort is called out so the confirmation is explicit.
     lines.push(
       truncateToWidth(
         [
           theme.fg(
             "dim",
-            `  ${keyText("tui.select.up")}/${keyText("tui.select.down")}/jk`,
+            `  ${configuredKeys(this.keybindings, "tui.select.up")}/${configuredKeys(this.keybindings, "tui.select.down")}/jk`,
           ) + theme.fg("muted", " select"),
-          keyHint("tui.select.confirm", "take over"),
-          rawKeyHint("x", "abort"),
-          keyHint("tui.select.cancel", "close"),
+          theme.fg(
+            "dim",
+            configuredKeys(this.keybindings, "tui.select.confirm"),
+          ) + theme.fg("muted", " take over"),
+          this.armedAbortId !== undefined
+            ? theme.fg("error", "x again to abort")
+            : theme.fg("dim", "x") + theme.fg("muted", " abort"),
+          theme.fg(
+            "dim",
+            configuredKeys(this.keybindings, "tui.select.cancel"),
+          ) + theme.fg("muted", " close"),
         ].join(theme.fg("dim", " · ")),
         width,
         ELLIPSIS,
@@ -414,7 +443,7 @@ class SubagentDashboard implements Component {
 
 const TRANSCRIPT_SCROLL_STEP = 6;
 
-class TakeoverView implements Component, Focusable {
+export class TakeoverView implements Component, Focusable {
   private tui: TUI;
   private theme: Theme;
   private keybindings: KeybindingsManager;
@@ -431,6 +460,8 @@ class TakeoverView implements Component, Focusable {
   private renderTimer?: ReturnType<typeof setTimeout>;
   private ticker: ReturnType<typeof setInterval>;
   private closed = false;
+  /** True while `app.clear` is armed and awaiting a second press to abort. */
+  private cancelArmed = false;
 
   private _focused = false;
   get focused(): boolean {
@@ -503,9 +534,29 @@ class TakeoverView implements Component, Focusable {
   }
 
   handleInput(data: string): void {
-    if (this.keybindings.matches(data, "app.clear")) {
+    const clearPressed = this.keybindings.matches(data, "app.clear");
+    const wasArmed = this.cancelArmed;
+    if (!clearPressed) this.cancelArmed = false;
+
+    // `app.clear` (ctrl+c by default) is the only cancel/abort trigger: it
+    // arms on the first press and confirms on the second. It is checked before
+    // the generic overlay cancel because ctrl+c matches both; escape and every
+    // other close path must never abort a running worker.
+    if (clearPressed) {
       const snap = this.snap();
-      if (snap?.status === "running") this.view.requestAbort(this.id);
+      if (snap?.status === "running") {
+        if (wasArmed) {
+          this.cancelArmed = false;
+          this.view.requestAbort(this.id);
+        } else {
+          this.cancelArmed = true;
+        }
+      } else {
+        // Nothing to cancel: `app.clear` falls back to closing the view.
+        this.close();
+        return;
+      }
+      this.tui.requestRender();
       return;
     }
     if (
@@ -622,7 +673,7 @@ class TakeoverView implements Component, Focusable {
         truncateToWidth(
           theme.fg(
             "dim",
-            `${ELLIPSIS} ${window.below} lines below · ${keyText("tui.editor.pageDown")}`,
+            `${ELLIPSIS} ${window.below} lines below · ${configuredKeys(this.keybindings, "tui.editor.pageDown")}`,
           ),
           width,
           ELLIPSIS,
@@ -634,24 +685,35 @@ class TakeoverView implements Component, Focusable {
 
     lines.push(border);
     lines.push(...this.input.render(width));
+    const hintParts = [
+      theme.fg("dim", configuredKeys(this.keybindings, "tui.input.submit")) +
+        theme.fg("muted", " send"),
+      theme.fg("dim", configuredKeys(this.keybindings, "app.interrupt")) +
+        theme.fg("muted", " back"),
+    ];
+    if (snap.status === "running") {
+      hintParts.push(
+        this.cancelArmed
+          ? theme.fg(
+              "error",
+              `${configuredKeys(this.keybindings, "app.clear")} again to cancel`,
+            )
+          : theme.fg("dim", configuredKeys(this.keybindings, "app.clear")) +
+              theme.fg("muted", " cancel"),
+      );
+    }
+    hintParts.push(
+      theme.fg(
+        "dim",
+        `${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")}`,
+      ) + theme.fg("muted", " scroll"),
+      theme.fg(
+        "dim",
+        `${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")}`,
+      ) + theme.fg("muted", " page"),
+    );
     lines.push(
-      truncateToWidth(
-        [
-          keyHint("tui.input.submit", "send"),
-          keyHint("app.interrupt", "back"),
-          keyHint("app.clear", "abort run"),
-          theme.fg(
-            "dim",
-            `${keyText("tui.editor.cursorUp")}/${keyText("tui.editor.cursorDown")}`,
-          ) + theme.fg("muted", " scroll"),
-          theme.fg(
-            "dim",
-            `${keyText("tui.editor.pageUp")}/${keyText("tui.editor.pageDown")}`,
-          ) + theme.fg("muted", " page"),
-        ].join(theme.fg("dim", " · ")),
-        width,
-        ELLIPSIS,
-      ),
+      truncateToWidth(hintParts.join(theme.fg("dim", " · ")), width, ELLIPSIS),
     );
     lines.push(border);
     return lines;

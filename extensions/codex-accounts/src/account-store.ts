@@ -14,18 +14,82 @@ import { basename, dirname, join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 
 const ACCOUNT_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,63})$/;
-const PROVIDER_ID = "openai-codex";
 const AUTH_FILE_NAME = "auth.json";
+const SETTINGS_FILE_NAME = "settings.json";
 const ACCOUNTS_DIRECTORY_NAME = "codex-accounts";
+const SNAPSHOT_VERSION = 2;
+const DEVICE_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Claim namespace used by OpenAI's OAuth access tokens.
+const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 
-type CodexCredential = { type: string; accountId?: string } & Record<
-  string,
-  unknown
->;
+/**
+ * Providers `/codex` can snapshot, in selection priority order. The modern
+ * `openai` provider ("Sign in with ChatGPT") wins over the legacy
+ * `openai-codex` provider when both hold a credential.
+ */
+export const SUPPORTED_PROVIDERS = ["openai", "openai-codex"] as const;
+export type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
+
+const PROVIDER_LABELS: Record<SupportedProvider, string> = {
+  openai: "OpenAI (ChatGPT)",
+  "openai-codex": "OpenAI Codex (legacy)",
+};
+
+export function providerLabel(provider: SupportedProvider) {
+  return PROVIDER_LABELS[provider];
+}
+
+export function isSupportedProvider(
+  value: unknown,
+): value is SupportedProvider {
+  return (
+    typeof value === "string" &&
+    (SUPPORTED_PROVIDERS as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Deterministic selection when more than one supported provider is logged in:
+ * the modern `openai` ("Sign in with ChatGPT") provider always wins over the
+ * legacy `openai-codex` provider. `list()` still marks every saved account of
+ * every logged-in provider as current, so both logins remain usable.
+ */
+export function selectCurrentProvider(
+  providers: Iterable<SupportedProvider>,
+): SupportedProvider | undefined {
+  const present = new Set(providers);
+  return SUPPORTED_PROVIDERS.find((provider) => present.has(provider));
+}
+
+type CredentialRecord = {
+  type?: unknown;
+  accountId?: unknown;
+  access?: unknown;
+} & Record<string, unknown>;
+
+/** Provider-specific, non-secret metadata kept alongside a saved credential. */
+export type SnapshotMetadata = {
+  /**
+   * Global installation device ID (`settings.json`) captured when an `openai`
+   * account was saved. OpenAI's ChatGPT login binds tokens to this host ID.
+   */
+  deviceId?: string;
+};
+
+/** A saved account snapshot after normalization (legacy files upgrade in memory). */
+export type SavedAccount = {
+  provider: SupportedProvider;
+  credential: CredentialRecord;
+  metadata: SnapshotMetadata;
+  /** True when the file used the pre-1.0 raw-credential format. */
+  legacy: boolean;
+};
 
 export type CodexAccount = {
   name: string;
   active: boolean;
+  provider: SupportedProvider;
 };
 
 /** Pi's agent dir: $PI_CODING_AGENT_DIR or ~/.pi/agent. */
@@ -46,6 +110,10 @@ export function validateAccountName(name: string) {
   return name;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function parseEntries(contents: Buffer, path: string) {
   let value: unknown;
   try {
@@ -54,11 +122,11 @@ function parseEntries(contents: Buffer, path: string) {
     throw new Error(`Pi auth store is not valid JSON: ${path}`);
   }
 
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecord(value)) {
     throw new Error(`Pi auth store must contain a JSON object: ${path}`);
   }
 
-  return value as Record<string, unknown>;
+  return value;
 }
 
 async function readEntries(path: string) {
@@ -86,29 +154,133 @@ class AuthStoreNotFoundError extends Error {
   }
 }
 
-/** The stored credential for the OpenAI Codex provider, if any. */
-function providerCredential(entries: Record<string, unknown>) {
-  const entry = entries[PROVIDER_ID];
-  return entry && typeof entry === "object" && !Array.isArray(entry)
-    ? (entry as CodexCredential)
-    : undefined;
-}
-
-function credentialIdentity(credential: CodexCredential) {
-  const accountId = credential.accountId;
-  return typeof accountId === "string" && accountId
-    ? `account:${accountId}`
-    : undefined;
-}
-
-function credentialsMatch(
-  first: { credential: CodexCredential },
-  second: { credential: CodexCredential },
+/**
+ * The stored OAuth credential for one supported provider, if any. The modern
+ * `openai` provider also accepts API keys; those are not ChatGPT accounts and
+ * are deliberately ignored by save/list/switch.
+ */
+function providerCredential(
+  entries: Record<string, unknown>,
+  provider: SupportedProvider,
 ) {
-  const firstIdentity = credentialIdentity(first.credential);
-  const secondIdentity = credentialIdentity(second.credential);
+  const entry = entries[provider];
+  return isRecord(entry) && entry.type === "oauth"
+    ? (entry as CredentialRecord)
+    : undefined;
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> | undefined {
+  const parts = token.split(".");
+  const payload = parts[1];
+  if (parts.length !== 3 || !payload) return undefined;
+  try {
+    const decoded = Buffer.from(payload, "base64url").toString("utf8");
+    const value: unknown = JSON.parse(decoded);
+    return isRecord(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Stable account identity used to detect the current account across token
+ * refreshes. Legacy `openai-codex` credentials carry an `accountId`; the new
+ * `openai` ChatGPT credential does not, so fall back to the OAuth access
+ * token's `https://api.openai.com/auth` claim (or its `sub`).
+ */
+function credentialIdentity(credential: CredentialRecord) {
+  if (typeof credential.accountId === "string" && credential.accountId) {
+    return `account:${credential.accountId}`;
+  }
+
+  if (typeof credential.access === "string" && credential.access) {
+    const payload = decodeJwtPayload(credential.access);
+    const auth = payload?.[JWT_CLAIM_PATH];
+    const accountId = isRecord(auth) ? auth.chatgpt_account_id : undefined;
+    if (typeof accountId === "string" && accountId) {
+      return `account:${accountId}`;
+    }
+    const subject = payload?.sub;
+    if (typeof subject === "string" && subject) return `subject:${subject}`;
+  }
+
+  return undefined;
+}
+
+function credentialsMatch(first: CredentialRecord, second: CredentialRecord) {
+  const firstIdentity = credentialIdentity(first);
+  const secondIdentity = credentialIdentity(second);
   if (firstIdentity && secondIdentity) return firstIdentity === secondIdentity;
-  return JSON.stringify(first.credential) === JSON.stringify(second.credential);
+  return JSON.stringify(first) === JSON.stringify(second);
+}
+
+/**
+ * Normalize a snapshot file. Pre-1.0 files stored the raw `openai-codex`
+ * credential; v2 files wrap the credential with its provider and any
+ * provider-specific metadata.
+ */
+function normalizeSnapshot(
+  value: Record<string, unknown>,
+  path: string,
+): SavedAccount {
+  if (value.version !== undefined || value.provider !== undefined) {
+    if (!isSupportedProvider(value.provider)) {
+      throw new Error(
+        `Saved account has unsupported provider "${String(value.provider)}": ${path}`,
+      );
+    }
+    if (!isRecord(value.credential)) {
+      throw new Error(`Saved account is missing its credential: ${path}`);
+    }
+    const metadata = isRecord(value.metadata) ? value.metadata : {};
+    const deviceId =
+      typeof metadata.deviceId === "string" &&
+      DEVICE_ID_PATTERN.test(metadata.deviceId)
+        ? metadata.deviceId
+        : undefined;
+    return {
+      provider: value.provider,
+      credential: value.credential as CredentialRecord,
+      metadata: deviceId ? { deviceId } : {},
+      legacy: false,
+    };
+  }
+
+  if (typeof value.type === "string") {
+    return {
+      provider: "openai-codex",
+      credential: value as CredentialRecord,
+      metadata: {},
+      legacy: true,
+    };
+  }
+
+  throw new Error(`Saved account is not a recognised snapshot: ${path}`);
+}
+
+function serializeSnapshot(account: SavedAccount) {
+  // Keep legacy `openai-codex` snapshots in the pre-1.0 raw format so files
+  // stay byte-compatible with older tooling and with accounts saved before
+  // the `openai` provider existed.
+  if (
+    account.provider === "openai-codex" &&
+    Object.keys(account.metadata).length === 0
+  ) {
+    return `${JSON.stringify(account.credential, null, 2)}\n`;
+  }
+
+  return `${JSON.stringify(
+    {
+      version: SNAPSHOT_VERSION,
+      provider: account.provider,
+      ...(Object.keys(account.metadata).length > 0
+        ? { metadata: account.metadata }
+        : {}),
+      credential: account.credential,
+    },
+    null,
+    2,
+  )}\n`;
 }
 
 async function atomicWrite(path: string, contents: Buffer) {
@@ -171,6 +343,10 @@ export class CodexAccountStore {
     return join(this.agentDir, AUTH_FILE_NAME);
   }
 
+  private get settingsPath() {
+    return join(this.agentDir, SETTINGS_FILE_NAME);
+  }
+
   private get accountsDirectory() {
     return join(this.agentDir, ACCOUNTS_DIRECTORY_NAME);
   }
@@ -179,21 +355,84 @@ export class CodexAccountStore {
     return join(this.accountsDirectory, `${validateAccountName(name)}.json`);
   }
 
-  /** Current Pi credential for the OpenAI Codex provider, or undefined when
-   * no auth store exists yet. Parse/storage errors propagate. */
-  async currentCredential() {
-    let result;
+  /** auth.json entries, or undefined when the file does not exist yet. */
+  private async readAuthEntries() {
     try {
-      result = await readEntries(this.authPath);
+      const { entries } = await readEntries(this.authPath);
+      return entries;
     } catch (error) {
       if (error instanceof AuthStoreNotFoundError) return undefined;
       throw error;
     }
-    return providerCredential(result.entries);
+  }
+
+  /** Every supported provider that currently has a stored credential. */
+  private async currentCredentials() {
+    const entries = await this.readAuthEntries();
+    const found = new Map<SupportedProvider, CredentialRecord>();
+    if (!entries) return found;
+
+    for (const provider of SUPPORTED_PROVIDERS) {
+      const credential = providerCredential(entries, provider);
+      if (credential) found.set(provider, credential);
+    }
+    return found;
+  }
+
+  /**
+   * Provider of the credential `/codex save` would snapshot right now, or
+   * undefined when no supported provider is logged in.
+   */
+  async currentProviders(): Promise<SupportedProvider[]> {
+    const current = await this.currentCredentials();
+    return SUPPORTED_PROVIDERS.filter((provider) => current.has(provider));
+  }
+
+  /**
+   * Provider `/codex save` snapshots when several are logged in. See
+   * {@link selectCurrentProvider} for the precedence rule.
+   */
+  async currentProvider(): Promise<SupportedProvider | undefined> {
+    return selectCurrentProvider(await this.currentProviders());
+  }
+
+  /**
+   * Credential currently logged in for `provider`, or the highest-priority
+   * supported provider when none is given. Undefined when the auth store does
+   * not exist. Parse/storage errors propagate.
+   */
+  async currentCredential(provider?: SupportedProvider) {
+    const current = await this.currentCredentials();
+    const selected = provider ?? selectCurrentProvider(current.keys());
+    return selected ? current.get(selected) : undefined;
   }
 
   async hasCurrentCredentials() {
-    return (await this.currentCredential()) !== undefined;
+    return (await this.currentProvider()) !== undefined;
+  }
+
+  /**
+   * Global installation device ID from `settings.json`. OpenAI's ChatGPT login
+   * sends it as the agent host ID, so `openai` snapshots record it as
+   * provider-specific metadata. Best effort: missing or malformed settings are
+   * never an error here.
+   */
+  async globalDeviceId(): Promise<string | undefined> {
+    try {
+      const parsed: unknown = JSON.parse(
+        await readFile(this.settingsPath, "utf8"),
+      );
+      if (
+        isRecord(parsed) &&
+        typeof parsed.deviceId === "string" &&
+        DEVICE_ID_PATTERN.test(parsed.deviceId)
+      ) {
+        return parsed.deviceId;
+      }
+    } catch {
+      // settings.json is optional metadata for this extension.
+    }
+    return undefined;
   }
 
   async hasAccount(name: string) {
@@ -235,26 +474,49 @@ export class CodexAccountStore {
     await rm(path);
   }
 
+  /**
+   * Snapshot the current credential under `name`. Returns the provider that
+   * was saved so callers can report it.
+   */
   async save(name: string, options: { overwrite?: boolean } = {}) {
     const path = this.accountPath(name);
     if (!options.overwrite && (await this.hasAccount(name))) {
       throw new Error(`Codex account "${name}" already exists.`);
     }
 
-    const credential = await this.currentCredential();
-    if (!credential) {
+    const current = await this.currentCredentials();
+    const provider = selectCurrentProvider(current.keys());
+    if (!provider) {
       throw new Error(
-        `Pi has no ${PROVIDER_ID} credentials yet. Run /login (provider: OpenAI Codex) first.`,
+        `Pi has no OpenAI credentials yet. Run /login (provider: ${SUPPORTED_PROVIDERS.map(
+          providerLabel,
+        ).join(" or ")}) first.`,
       );
+    }
+
+    const metadata: SnapshotMetadata = {};
+    if (provider === "openai") {
+      const deviceId = await this.globalDeviceId();
+      if (deviceId) metadata.deviceId = deviceId;
     }
 
     await atomicWrite(
       path,
-      Buffer.from(`${JSON.stringify(credential, null, 2)}\n`, "utf8"),
+      Buffer.from(
+        serializeSnapshot({
+          provider,
+          credential: current.get(provider) as CredentialRecord,
+          metadata,
+          legacy: false,
+        }),
+        "utf8",
+      ),
     );
+
+    return provider;
   }
 
-  async list() {
+  private async savedNames() {
     let entries;
     try {
       entries = await readdir(this.accountsDirectory, { withFileTypes: true });
@@ -269,82 +531,63 @@ export class CodexAccountStore {
       throw error;
     }
 
-    const names = entries
+    return entries
       .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
       .map((entry) => entry.name.slice(0, -".json".length))
       .filter((name) => ACCOUNT_NAME_PATTERN.test(name))
       .sort((left, right) => left.localeCompare(right));
+  }
 
-    const activeCredential = await this.currentCredential().catch(
-      () => undefined,
+  /** Read and normalize one saved account snapshot. */
+  async readSavedAccount(name: string): Promise<SavedAccount> {
+    const path = this.accountPath(name);
+    const { contents } = await readEntries(path);
+    return normalizeSnapshot(parseEntries(contents, path), path);
+  }
+
+  async list() {
+    const names = await this.savedNames();
+    const current = await this.currentCredentials().catch(
+      () => new Map<SupportedProvider, CredentialRecord>(),
     );
 
     return Promise.all(
       names.map(async (name): Promise<CodexAccount> => {
-        if (!activeCredential) return { name, active: false };
+        const saved = await this.readSavedAccount(name).catch(() => undefined);
+        if (!saved) return { name, active: false, provider: "openai-codex" };
 
-        const savedCredential = await this.readSavedCredential(name).catch(
-          () => undefined,
-        );
+        const activeCredential = current.get(saved.provider);
         return {
           name,
           active:
-            savedCredential !== undefined &&
-            credentialsMatch(
-              { credential: activeCredential },
-              { credential: savedCredential },
-            ),
+            activeCredential !== undefined &&
+            credentialsMatch(activeCredential, saved.credential),
+          provider: saved.provider,
         };
       }),
     );
   }
 
-  private async readSavedCredential(name: string) {
-    const path = this.accountPath(name);
-    // Each snapshot file holds exactly one Pi credential entry.
-    const { contents } = await readEntries(path);
-    return parseEntries(contents, path) as CodexCredential;
-  }
-
-  /** Name of an already-saved account whose credential matches the CURRENT
-   * pi credential, excluding `targetName` (typically the name being saved).
-   * Returns undefined when the current identity is not saved anywhere. */
+  /**
+   * Name of an already-saved account, of the same provider, whose credential
+   * matches the CURRENT credential, excluding `targetName` (typically the name
+   * being saved). Returns undefined when no saved account matches.
+   */
   async findCurrentIdentityName(targetName?: string) {
-    const activeCredential = await this.currentCredential().catch(
-      () => undefined,
+    const current = await this.currentCredentials().catch(
+      () => new Map<SupportedProvider, CredentialRecord>(),
     );
-    if (!activeCredential) return undefined;
+    if (current.size === 0) return undefined;
 
-    let entries;
-    try {
-      entries = await readdir(this.accountsDirectory, { withFileTypes: true });
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        "code" in error &&
-        error.code === "ENOENT"
-      ) {
-        return undefined;
-      }
-      throw error;
-    }
-
-    const names = entries
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-      .map((entry) => entry.name.slice(0, -".json".length))
-      .filter((name) => ACCOUNT_NAME_PATTERN.test(name));
-
-    for (const name of names) {
+    for (const name of await this.savedNames()) {
       if (name === targetName) continue;
-      const savedCredential = await this.readSavedCredential(name).catch(
-        () => undefined,
-      );
+      const saved = await this.readSavedAccount(name).catch(() => undefined);
+      if (!saved) continue;
+
+      const activeCredential = current.get(saved.provider);
       if (
-        savedCredential !== undefined &&
-        credentialsMatch(
-          { credential: activeCredential },
-          { credential: savedCredential },
-        )
+        activeCredential !== undefined &&
+        credentialsMatch(activeCredential, saved.credential)
       ) {
         return name;
       }
@@ -352,20 +595,26 @@ export class CodexAccountStore {
     return undefined;
   }
 
-  /** Switch Pi's OpenAI Codex credential to the saved account. */
-  async switchTo(name: string) {
-    const savedCredential = await this.readSavedCredential(name);
+  /**
+   * Switch Pi to the saved account, writing only that account's provider entry
+   * so credentials for the other provider (e.g. a legacy `openai-codex`
+   * login) stay intact. Returns the provider that was switched.
+   */
+  async switchTo(name: string): Promise<SupportedProvider> {
+    const saved = await this.readSavedAccount(name);
 
     await withAuthStoreLock(this.authPath, async () => {
       const { contents } = await readEntries(this.authPath).catch(() => ({
         contents: Buffer.from("{}", "utf8"),
       }));
       const entries = parseEntries(contents, this.authPath);
-      entries[PROVIDER_ID] = savedCredential;
+      entries[saved.provider] = saved.credential;
       await atomicWrite(
         this.authPath,
         Buffer.from(`${JSON.stringify(entries, null, 2)}\n`, "utf8"),
       );
     });
+
+    return saved.provider;
   }
 }

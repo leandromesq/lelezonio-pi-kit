@@ -31,13 +31,11 @@ import {
 } from "../shared/dashboard-state.ts";
 import { formatTokens } from "../shared/format.ts";
 import { sanitizeTerminalText } from "../shared/terminal-text.ts";
-const TITLE_LINES = [
-  "▀████████████▀",
-  " ╘███    ███  ",
-  "  ███    ███  ",
-  "  ███    ███  ",
-  " ▄███▄  ▄███▄ ",
-];
+import {
+  COST_SCOPE_CHANNEL,
+  isCostScope,
+  type CostScope,
+} from "../model-info/index.ts";
 const ANSI_PATTERN =
   /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
 
@@ -50,11 +48,6 @@ function formatDirectory(cwd: string) {
   if (cwd === home) return "~";
   const display = cwd.startsWith(`${home}/`) ? `~/${relative(home, cwd)}` : cwd;
   return sanitizeTerminalLabel(display);
-}
-
-function center(text: string, width: number) {
-  const padding = Math.max(0, Math.floor((width - visibleWidth(text)) / 2));
-  return truncateToWidth(`${" ".repeat(padding)}${text}`, width);
 }
 
 /**
@@ -403,12 +396,27 @@ export function buildGitLine(
   return line;
 }
 
+/**
+ * Honest, compact scope label for the session cost shown in the footer. The
+ * canonical total covers model-attributed usage persisted for this session
+ * only; auxiliary title/recap/memory calls and child sessions are billed
+ * elsewhere and are not part of it. `est.` marks the value as an estimate (not
+ * an invoice) and `session` states the scope. `sub` is added only when the
+ * public registry reports the active model authenticates through a
+ * subscription (OAuth).
+ */
+export function formatSessionCost(cost: number, subscription: boolean): string {
+  const amount = `$${cost.toFixed(2)}`;
+  return `${subscription ? "sub · " : ""}est. session ${amount}`;
+}
+
 export function buildFooterContent(
   cwd: string,
   git: GitInfoState,
   model: ModelInfoState,
   theme: FooterTheme,
   hyperlinksEnabled: boolean,
+  costScope?: CostScope,
 ): FooterContent {
   const directory = theme.fg("text", formatDirectory(cwd));
 
@@ -437,7 +445,7 @@ export function buildFooterContent(
     model: theme.fg("muted", modelIdentity),
     usage: `${contextIndicator} · ${theme.fg(
       "muted",
-      `$${model.cost.toFixed(2)}`,
+      formatSessionCost(model.cost, costScope?.subscription === true),
     )}`,
     context: contextIndicator,
     contextPercent: compactIndicator,
@@ -485,6 +493,7 @@ export default function uiCustomization(pi: ExtensionAPI) {
   let title = "pi";
   let modelInfo = emptyModelInfoState();
   let gitInfo = emptyGitInfoState();
+  let costScope: CostScope = { subscription: false, provider: "" };
   let requestRender: (() => void) | undefined;
 
   const stopModelListener = pi.events.on(MODEL_INFO_CHANNEL, (value) => {
@@ -496,6 +505,12 @@ export default function uiCustomization(pi: ExtensionAPI) {
   const stopGitListener = pi.events.on(GIT_INFO_CHANNEL, (value) => {
     if (!isGitInfoState(value)) return;
     gitInfo = value;
+    requestRender?.();
+  });
+
+  const stopCostScopeListener = pi.events.on(COST_SCOPE_CHANNEL, (value) => {
+    if (!isCostScope(value)) return;
+    costScope = value;
     requestRender?.();
   });
 
@@ -511,6 +526,7 @@ export default function uiCustomization(pi: ExtensionAPI) {
       modelInfo,
       theme,
       getCapabilities().hyperlinks,
+      costScope,
     );
     const lines = footerLayout(content, width);
     return appendStatusLines(
@@ -557,21 +573,8 @@ export default function uiCustomization(pi: ExtensionAPI) {
   function install(ctx: ExtensionContext) {
     if (ctx.mode !== "tui") return;
 
-    ctx.ui.setHeader((tui, theme) => {
-      requestRender = () => tui.requestRender();
-
-      return {
-        render(width: number) {
-          const art = TITLE_LINES.map((line) =>
-            center(theme.fg("accent", line), width),
-          );
-          const subtitle = center(theme.fg("accent", theme.bold(title)), width);
-          return ["", ...art, subtitle, ""];
-        },
-        invalidate() {},
-      };
-    });
-
+    // Leave Pi's native startup/header untouched; customize only the editor
+    // and dashboard footer.
     ctx.ui.setFooter((tui, theme, footerData: ReadonlyFooterDataProvider) => {
       requestRender = () => tui.requestRender();
       const stopBranchListener = footerData.onBranchChange(() =>
@@ -598,15 +601,16 @@ export default function uiCustomization(pi: ExtensionAPI) {
     title = formatDirectory(ctx.cwd);
     modelInfo = emptyModelInfoState();
     gitInfo = emptyGitInfoState();
+    costScope = { subscription: false, provider: "" };
     install(ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
     stopModelListener();
     stopGitListener();
+    stopCostScopeListener();
     requestRender = undefined;
     if (ctx.mode === "tui") {
-      ctx.ui.setHeader(undefined);
       ctx.ui.setEditorComponent(undefined);
       ctx.ui.setFooter(undefined);
     }

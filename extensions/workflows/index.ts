@@ -367,6 +367,9 @@ export default function workflows(pi: ExtensionAPI) {
   pi.registerTool({
     name: "workflow",
     label: "Workflow",
+    // Orchestration: declared to the model, never callable from a codemode
+    // script.
+    exposure: "model-only",
     description: WORKFLOW_TOOL_DESCRIPTION,
     promptSnippet: WORKFLOW_PROMPT_SNIPPET,
     promptGuidelines: WORKFLOW_PROMPT_GUIDELINES,

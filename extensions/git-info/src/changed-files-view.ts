@@ -11,6 +11,7 @@ import { Effect } from "effect";
 // diff keeps tabs here and lets `styleDiffLine` expand them to four columns.
 import { sanitizeTerminalText as sanitizeSharedTerminalText } from "../../shared/terminal-text.ts";
 import { runCommand } from "./process.ts";
+import { viewportRows } from "../../shared/ui/viewport.ts";
 
 const DIFF_SCROLL_STEP = 5;
 const MAX_DIFF_LINES = 20_000;
@@ -169,14 +170,18 @@ export async function showChangedFiles(
   if (ctx.mode !== "tui") return;
 
   await ctx.ui.custom<void>(
-    (tui, theme, _keybindings, done) => {
+    (tui, theme, keybindings, done) => {
       let focus: "files" | "diff" = "files";
       let selectedIndex = 0;
       let sidebarOffset = 0;
       let diffOffset = 0;
 
       function bodyHeight() {
-        return Math.max(8, Math.floor(tui.terminal.rows * 0.8) - 2);
+        return viewportRows(
+          tui.terminal.rows,
+          Math.ceil(tui.terminal.rows * 0.2) + 2,
+          1,
+        );
       }
 
       function ensureSelectedFileVisible() {
@@ -234,22 +239,22 @@ export async function showChangedFiles(
           truncateToWidth(
             `${left}${text}${"─".repeat(remaining)}${right}`,
             width,
-            "",
+            "…",
           ),
         );
       }
 
       function handleInput(data: string) {
         if (focus === "files") {
-          if (matchesKey(data, Key.escape)) {
+          if (keybindings.matches(data, "tui.select.cancel")) {
             done(undefined);
             return;
           }
-          if (matchesKey(data, Key.down) || data === "j") {
+          if (keybindings.matches(data, "tui.select.down") || data === "j") {
             moveFile(1);
             return;
           }
-          if (matchesKey(data, Key.up) || data === "k") {
+          if (keybindings.matches(data, "tui.select.up") || data === "k") {
             moveFile(-1);
             return;
           }
@@ -268,9 +273,9 @@ export async function showChangedFiles(
             return;
           }
           if (
-            matchesKey(data, Key.enter) ||
+            keybindings.matches(data, "tui.select.confirm") ||
             matchesKey(data, Key.space) ||
-            matchesKey(data, Key.right) ||
+            keybindings.matches(data, "tui.editor.cursorRight") ||
             data === "l"
           ) {
             focus = "diff";
@@ -280,27 +285,27 @@ export async function showChangedFiles(
         }
 
         if (
-          matchesKey(data, Key.escape) ||
-          matchesKey(data, Key.left) ||
+          keybindings.matches(data, "tui.select.cancel") ||
+          keybindings.matches(data, "tui.editor.cursorLeft") ||
           data === "h"
         ) {
           focus = "files";
           tui.requestRender();
           return;
         }
-        if (matchesKey(data, Key.down) || data === "j") {
+        if (keybindings.matches(data, "tui.select.down") || data === "j") {
           moveDiff(DIFF_SCROLL_STEP);
           return;
         }
-        if (matchesKey(data, Key.up) || data === "k") {
+        if (keybindings.matches(data, "tui.select.up") || data === "k") {
           moveDiff(-DIFF_SCROLL_STEP);
           return;
         }
-        if (matchesKey(data, Key.ctrl("d"))) {
+        if (keybindings.matches(data, "tui.editor.pageDown")) {
           moveDiff(Math.max(1, Math.floor(bodyHeight() / 2)));
           return;
         }
-        if (matchesKey(data, Key.ctrl("u"))) {
+        if (keybindings.matches(data, "tui.editor.pageUp")) {
           moveDiff(-Math.max(1, Math.floor(bodyHeight() / 2)));
           return;
         }
@@ -388,10 +393,12 @@ export async function showChangedFiles(
           );
         }
 
+        const hint = (action: Parameters<typeof keybindings.getKeys>[0]) =>
+          keybindings.getKeys(action).join("/") || "unbound";
         const help =
           focus === "files"
-            ? "j/k or ↑/↓ select · enter/space/l open diff · esc close"
-            : "j/k or ↑/↓ scroll · ctrl-d/u page · g/G top/bottom · esc/h files";
+            ? `${hint("tui.select.up")}/${hint("tui.select.down")} or j/k select · ${hint("tui.select.confirm")}/space/l diff · ${hint("tui.select.cancel")} close`
+            : `${hint("tui.select.up")}/${hint("tui.select.down")} or j/k scroll · ${hint("tui.editor.pageUp")}/${hint("tui.editor.pageDown")} page · g/G top/bottom · ${hint("tui.select.cancel")}/h files`;
         lines.push(border(width, help, false));
         return lines;
       }

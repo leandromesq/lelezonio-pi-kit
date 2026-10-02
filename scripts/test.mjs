@@ -22,6 +22,9 @@ function runNpm(args) {
   run("npm", args, process.platform === "win32");
 }
 
+run(process.execPath, ["--test", "scripts/native-search.test.mjs"]);
+run(process.execPath, ["--test", "scripts/observational-memory.test.mjs"]);
+runNpm(["--prefix", "vendor/pi-observational-memory", "test"]);
 runNpm(["--prefix", "extensions/background-terminals", "test"]);
 
 const extensionsDir = join(root, "extensions");
@@ -37,5 +40,11 @@ const tests = readdirSync(extensionsDir, { recursive: true })
   )
   .map((file) => join(extensionsDir, file));
 
-run(process.execPath, ["--test", "--experimental-strip-types", ...tests]);
-runNpm(["--prefix", "extensions/file-search", "test"]);
+// Bound file-level concurrency: SDK/loader tests spawn additional processes,
+// and using every CPU oversubscribes Windows startup and timeout fixtures.
+run(process.execPath, [
+  "--test",
+  "--test-concurrency=4",
+  "--experimental-strip-types",
+  ...tests,
+]);

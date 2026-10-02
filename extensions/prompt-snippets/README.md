@@ -14,9 +14,11 @@ standalone instruction — toggle exactly the ones you want per message.
   - The menu is framed with top/bottom border lines and scrolls when the list
     exceeds the viewport (max height adapts to your terminal), with
     `↑ n more` / `↓ n more` indicators when clipped.
-- Active snippets show up as a widget above the editor:
-  - `↑ prepend: ...` (accent color) — inserted before your message
-  - `↓ append: ...` (warning color) — inserted after your message
+- Active snippets show up as a single-line widget above the editor:
+  - `↑ name · name` marks snippets inserted before your message
+  - `↓ name · name` marks snippets inserted after your message
+  - The line is bounded to the terminal width; when it does not fit, the tail
+    is replaced with `+N` so the widget never wraps or overflows.
 - When you send a message, active snippet bodies are merged into the message
   text: prepend group (sorted by `order`) → your text → append group (sorted
   by `order`), separated by blank lines.

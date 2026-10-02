@@ -6,12 +6,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   applyGate,
+  BROWSER_NAMESPACE,
   BROWSER_TOOL_NAMES,
   computeEnabledFromEntries,
   ENABLED_ENTRY_TYPE,
   parseBrowserCommand,
   type GateEntryLike,
 } from "./src/gate.ts";
+import browserExtension from "./index.ts";
 
 function gateEntry(on: boolean): GateEntryLike {
   return { customType: ENABLED_ENTRY_TYPE, data: { on } };
@@ -79,4 +81,119 @@ test("parseBrowserCommand understands on/off aliases and status", () => {
   assert.equal(parseBrowserCommand("close"), "off");
   assert.equal(parseBrowserCommand("kill"), "off");
   assert.equal(parseBrowserCommand("what?"), "status");
+});
+
+/* ---- extension wiring (index.ts) -------------------------------------- */
+
+function setupBrowser(activeTools: readonly string[] = ["read", "bash"]) {
+  const tools = new Map<string, Record<string, unknown>>();
+  const handlers = new Map<string, ((event: unknown, ctx: any) => void)[]>();
+  let active = [...activeTools];
+
+  const pi = {
+    on: (event: string, handler: (event: unknown, ctx: any) => void) => {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+      return () => {};
+    },
+    registerTool: (tool: Record<string, unknown>) => {
+      tools.set(tool.name as string, tool);
+    },
+    registerCommand: () => undefined,
+    appendEntry: () => undefined,
+    getActiveTools: () => [...active],
+    setActiveTools: (next: readonly string[]) => {
+      active = [...next];
+    },
+  };
+
+  browserExtension(pi as never);
+
+  let branch: unknown[] = [];
+  const ctx = {
+    sessionManager: {
+      getBranch: () => branch,
+      getEntries: () => {
+        throw new Error("the gate must read the active branch, not getEntries");
+      },
+    },
+  };
+  const fire = (event: string) => {
+    for (const handler of handlers.get(event) ?? []) handler({}, ctx);
+  };
+
+  return {
+    tools,
+    fire,
+    active: () => active,
+    setBranch: (entries: unknown[]) => {
+      branch = entries;
+    },
+    handlers,
+  };
+}
+
+test("registers every browser tool inactive and gated at registration", () => {
+  const { tools } = setupBrowser();
+
+  assert.deepEqual([...tools.keys()].sort(), [...BROWSER_TOOL_NAMES].sort());
+  for (const name of BROWSER_TOOL_NAMES) {
+    const tool = tools.get(name)!;
+    assert.equal(tool.defaultActive, false, `${name} must not self-activate`);
+    // `direct` (not codemode/deferred): those stay callable via tool_search even
+    // when inactive, which would bypass the off gate.
+    assert.equal(tool.exposure, "direct", `${name} exposure`);
+    assert.deepEqual(tool.namespace, BROWSER_NAMESPACE);
+  }
+});
+
+test("no browser entry on the branch keeps the gate off and strips strays", () => {
+  const { fire, active, setBranch } = setupBrowser([
+    "read",
+    ...BROWSER_TOOL_NAMES,
+  ]);
+
+  setBranch([]);
+  fire("session_start");
+
+  assert.deepEqual(active(), ["read"]);
+});
+
+test("session_start restores the enable bit from the active branch", () => {
+  const { fire, active, setBranch } = setupBrowser(["read"]);
+
+  setBranch([gateEntry(true)]);
+  fire("session_start");
+
+  assert.deepEqual(active(), ["read", ...BROWSER_TOOL_NAMES]);
+});
+
+test("the newest branch entry wins", () => {
+  const { fire, active, setBranch } = setupBrowser(["read"]);
+
+  setBranch([gateEntry(true), gateEntry(false)]);
+  fire("session_start");
+  assert.deepEqual(active(), ["read"]);
+
+  setBranch([gateEntry(false), gateEntry(true)]);
+  fire("session_start");
+  assert.deepEqual(active(), ["read", ...BROWSER_TOOL_NAMES]);
+});
+
+test("session_tree re-evaluates the gate for the newly active branch", () => {
+  const { fire, active, setBranch, handlers } = setupBrowser(["read"]);
+  assert.ok(handlers.has("session_tree"), "session_tree handler registered");
+
+  setBranch([]);
+  fire("session_start");
+  assert.deepEqual(active(), ["read"]);
+
+  setBranch([gateEntry(true)]);
+  fire("session_tree");
+  assert.deepEqual(active(), ["read", ...BROWSER_TOOL_NAMES]);
+
+  setBranch([]);
+  fire("session_tree");
+  assert.deepEqual(active(), ["read"]);
 });

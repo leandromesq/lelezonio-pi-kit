@@ -89,19 +89,33 @@ export async function openRemoteTakeover(
   return false;
 }
 
-class RemoteDashboard implements Component {
+export class RemoteDashboard implements Component {
   private closed = false;
+  /** Id of an active remote job whose cancel is armed (second `x`). */
+  private armedCancelId: string | undefined;
   private readonly ticker: ReturnType<typeof setInterval>;
   private readonly unsubscribe: () => void;
+  private readonly tui: TUI;
+  private readonly theme: Theme;
+  private readonly keybindings: KeybindingsManager;
+  private readonly view: RemoteAgentReadModel;
+  private readonly selection: { index: number; id?: string };
+  private readonly done: (value: string | null) => void;
 
   constructor(
-    private readonly tui: TUI,
-    private readonly theme: Theme,
-    private readonly keybindings: KeybindingsManager,
-    private readonly view: RemoteAgentReadModel,
-    private readonly selection: { index: number; id?: string },
-    private readonly done: (value: string | null) => void,
+    tui: TUI,
+    theme: Theme,
+    keybindings: KeybindingsManager,
+    view: RemoteAgentReadModel,
+    selection: { index: number; id?: string },
+    done: (value: string | null) => void,
   ) {
+    this.tui = tui;
+    this.theme = theme;
+    this.keybindings = keybindings;
+    this.view = view;
+    this.selection = selection;
+    this.done = done;
     this.ticker = setInterval(() => tui.requestRender(), 1_000);
     this.unsubscribe = view.subscribe(() => tui.requestRender());
   }
@@ -135,6 +149,10 @@ class RemoteDashboard implements Component {
   handleInput(data: string) {
     const jobs = this.view.list();
     this.reconcile(jobs);
+    // The destructive `x` is armed by its first press and confirmed by the
+    // second; any other key (including close) disarms it.
+    const wasArmed = this.armedCancelId;
+    if (data !== "x") this.armedCancelId = undefined;
     if (this.keybindings.matches(data, "tui.select.cancel"))
       return this.close(null);
     if (this.keybindings.matches(data, "tui.select.confirm")) {
@@ -154,8 +172,13 @@ class RemoteDashboard implements Component {
         this.selection.index = (this.selection.index + 1) % jobs.length;
     } else if (data === "x") {
       const selected = jobs[this.selection.index];
-      if (selected && isRemoteAgentActive(selected.status))
-        this.view.requestCancel(selected.id);
+      if (selected && isRemoteAgentActive(selected.status)) {
+        if (wasArmed === selected.id) {
+          this.view.requestCancel(selected.id);
+        } else {
+          this.armedCancelId = selected.id;
+        }
+      }
     } else if (data === "r") {
       const selected = jobs[this.selection.index];
       if (selected) this.view.requestRefresh(selected.id);
@@ -213,10 +236,21 @@ class RemoteDashboard implements Component {
     lines.push(this.theme.fg("border", "─".repeat(width)));
     lines.push(
       truncateToWidth(
-        this.theme.fg(
-          "dim",
-          `${configuredKeys(this.keybindings, "tui.select.confirm")} open Herdr · x cancel · d delete · r refresh · ${configuredKeys(this.keybindings, "tui.select.cancel")} close`,
-        ),
+        [
+          this.theme.fg(
+            "dim",
+            configuredKeys(this.keybindings, "tui.select.confirm"),
+          ) + this.theme.fg("muted", " open Herdr"),
+          this.armedCancelId !== undefined
+            ? this.theme.fg("error", "x again to cancel")
+            : this.theme.fg("dim", "x") + this.theme.fg("muted", " cancel"),
+          this.theme.fg("dim", "d") + this.theme.fg("muted", " delete"),
+          this.theme.fg("dim", "r") + this.theme.fg("muted", " refresh"),
+          this.theme.fg(
+            "dim",
+            configuredKeys(this.keybindings, "tui.select.cancel"),
+          ) + this.theme.fg("muted", " close"),
+        ].join(this.theme.fg("dim", " · ")),
         width,
         "…",
       ),
@@ -229,16 +263,24 @@ class RemoteDashboard implements Component {
 
 const SCROLL_STEP = 6;
 
-class RemoteTakeover implements Component, Focusable {
+export class RemoteTakeover implements Component, Focusable {
   private readonly input = new Input();
   private scrollOffset = 0;
   private closed = false;
+  /** True while `app.clear` is armed and awaiting a second press to cancel. */
+  private cancelArmed = false;
   private readonly unsubscribe: () => void;
   private readonly ticker: ReturnType<typeof setInterval>;
   private refreshTimer?: ReturnType<typeof setInterval>;
   private renderTimer?: ReturnType<typeof setTimeout>;
   private readonly transcriptCache = createTranscriptCache();
   private _focused = false;
+  private readonly tui: TUI;
+  private readonly theme: Theme;
+  private readonly keybindings: KeybindingsManager;
+  private readonly id: string;
+  private readonly view: RemoteAgentReadModel;
+  private readonly done: (value: null) => void;
 
   get focused() {
     return this._focused;
@@ -249,13 +291,19 @@ class RemoteTakeover implements Component, Focusable {
   }
 
   constructor(
-    private readonly tui: TUI,
-    private readonly theme: Theme,
-    private readonly keybindings: KeybindingsManager,
-    private readonly id: string,
-    private readonly view: RemoteAgentReadModel,
-    private readonly done: (value: null) => void,
+    tui: TUI,
+    theme: Theme,
+    keybindings: KeybindingsManager,
+    id: string,
+    view: RemoteAgentReadModel,
+    done: (value: null) => void,
   ) {
+    this.tui = tui;
+    this.theme = theme;
+    this.keybindings = keybindings;
+    this.id = id;
+    this.view = view;
+    this.done = done;
     this.unsubscribe = view.subscribeTo(id, () => this.scheduleRender());
     this.ticker = setInterval(() => tui.requestRender(), 1_000);
     this.refreshTimer = setInterval(() => view.requestRefresh(id), 2_000);
@@ -295,10 +343,27 @@ class RemoteTakeover implements Component, Focusable {
   }
 
   handleInput(data: string) {
-    // Check the explicit remote-cancel binding before generic overlay cancel:
-    // ctrl+c can match both under the default keymap.
-    if (this.keybindings.matches(data, "app.clear")) {
-      this.view.requestCancel(this.id);
+    const clearPressed = this.keybindings.matches(data, "app.clear");
+    const wasArmed = this.cancelArmed;
+    if (!clearPressed) this.cancelArmed = false;
+    // `app.clear` (ctrl+c by default) arms the cancel on the first press and
+    // confirms it on the second; it is checked before the generic overlay
+    // cancel because ctrl+c matches both under the default keymap. Closing
+    // (escape) must never cancel the remote job.
+    if (clearPressed) {
+      const job = this.view.get(this.id);
+      if (job && isRemoteAgentActive(job.status)) {
+        if (wasArmed) {
+          this.cancelArmed = false;
+          this.view.requestCancel(this.id);
+        } else {
+          this.cancelArmed = true;
+        }
+      } else {
+        this.close();
+        return;
+      }
+      this.tui.requestRender();
       return;
     }
     if (
@@ -389,15 +454,35 @@ class RemoteTakeover implements Component, Focusable {
       body.push(this.theme.fg("dim", `… ${this.scrollOffset} lines below`));
     while (body.length < viewport) body.push("");
     lines.push(...body.slice(0, viewport), border, ...this.input.render(width));
+    const hintParts = [
+      this.theme.fg(
+        "dim",
+        configuredKeys(this.keybindings, "tui.input.submit"),
+      ) + this.theme.fg("muted", " send"),
+      this.theme.fg("dim", configuredKeys(this.keybindings, "app.interrupt")) +
+        this.theme.fg("muted", " back"),
+    ];
+    if (isRemoteAgentActive(job.status)) {
+      hintParts.push(
+        this.cancelArmed
+          ? this.theme.fg(
+              "error",
+              `${configuredKeys(this.keybindings, "app.clear")} again to cancel`,
+            )
+          : this.theme.fg(
+              "dim",
+              configuredKeys(this.keybindings, "app.clear"),
+            ) + this.theme.fg("muted", " cancel"),
+      );
+    }
+    hintParts.push(
+      this.theme.fg(
+        "dim",
+        `${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")}`,
+      ) + this.theme.fg("muted", " scroll"),
+    );
     lines.push(
-      truncateToWidth(
-        this.theme.fg(
-          "dim",
-          `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} cancel · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll`,
-        ),
-        width,
-        "…",
-      ),
+      truncateToWidth(hintParts.join(this.theme.fg("dim", " · ")), width, "…"),
     );
     lines.push(border);
     return lines;

@@ -83,10 +83,25 @@ test("childToolLoadout leaves the default coder surface denylist-based", () => {
   assert.equal(coder.exclude.includes(CHILD_ASK_TOOL), false);
   assert.deepEqual(coder.exclude, [...CHILD_ORCHESTRATION_TOOLS]);
 
+  // The same exclude array feeds the Herdr worker `--exclude-tools` argv, so
+  // the remote_* surface is denied on BOTH child launch paths, not just SDK.
+  for (const remote of [
+    "remote_spawn",
+    "remote_send",
+    "remote_wait",
+    "remote_cancel",
+    "remote_check",
+    "remote_list",
+  ] as const) {
+    assert.equal(coder.exclude.includes(remote), true, `${remote} denied`);
+  }
+
   const nesting = childToolLoadout(undefined, { nestedSpawn: true });
   assert.equal(nesting.tools, undefined);
   assert.equal(nesting.exclude.includes("subagent_spawn"), false);
   assert.equal(nesting.exclude.includes("subagent_wait"), true);
+  // A nesting-capable child still must not reach remote orchestration.
+  assert.equal(nesting.exclude.includes("remote_spawn"), true);
 });
 
 test("childToolLoadout fails closed for an explicit empty allowlist", () => {
@@ -197,7 +212,6 @@ test("a real default coder child keeps powershell and extension tools", async ()
   );
   for (const kept of [
     "bg_start",
-    "remote_spawn",
     "git_status",
     "read",
     "bash",
@@ -212,10 +226,17 @@ test("a real default coder child keeps powershell and extension tools", async ()
     "subagent_spawn",
     "subagent_send",
     "subagent_wait",
+    "remote_spawn",
+    "remote_send",
+    "remote_wait",
+    "remote_cancel",
+    "remote_check",
+    "remote_list",
     "workflow",
     "ask_user",
   ]) {
     assert.equal(all.has(blocked), false, `${blocked} must not be registered`);
+    assert.equal(active.has(blocked), false, `${blocked} must not be active`);
   }
 });
 

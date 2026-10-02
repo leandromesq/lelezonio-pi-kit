@@ -8,9 +8,22 @@
  * session entry so `/reload` and pi restarts keep it on for the same
  * session; a fresh session (no entries) defaults to off.
  *
+ * The tools stay `direct` exposure with `defaultActive: false`. Do NOT move
+ * them to `deferred` (or `codemode`): those exposures are callable/listable
+ * from codemode and `tool_search` even while inactive, which would bypass the
+ * off gate. `defaultActive: false` keeps registration unactivated without
+ * making the tools reachable.
+ *
  * Everything in this module is pure/structural so the gate logic can be
  * unit-tested without a pi runtime.
  */
+
+/** Codemode namespace grouping the browser tools. Metadata only; no effect on the off gate. */
+export const BROWSER_NAMESPACE = {
+  name: "browser",
+  description:
+    "Playwright-driven headless browser tools, enabled per session with /browser on",
+} as const;
 
 /** The eight tool names registered by this extension. */
 export const BROWSER_TOOL_NAMES = [
@@ -38,12 +51,14 @@ export interface GateEntryLike {
 }
 
 /**
- * Recompute the desired gate from a session's entries. The newest entry
- * wins; any entry without a boolean `on` payload leaves the previous value
- * unchanged, so unrelated/broken entries never flip the gate.
+ * Recompute the desired gate from the entries on the active branch. The
+ * newest entry wins; any entry without a boolean `on` payload leaves the
+ * previous value unchanged, so unrelated/broken entries never flip the gate.
  *
- * Accepts plain objects (structural) so it works directly on pi's
- * `sessionManager.getEntries()` output without importing the pi package.
+ * Callers must pass the active branch (`sessionManager.getBranch()`), not
+ * every persisted entry: an opt-in on an abandoned branch must not leak into
+ * the current one. Accepts plain objects (structural) so it works directly
+ * on pi's entry output without importing the pi package.
  */
 export function computeEnabledFromEntries(
   entries: readonly unknown[],

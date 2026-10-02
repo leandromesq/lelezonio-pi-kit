@@ -6,9 +6,12 @@ import { loadNamingConfig, saveNamingConfig } from "./src/config.ts";
 import { generateTaskTitle } from "./src/title-generator.ts";
 import { openModelPicker, openReasoningPicker } from "./src/ui.ts";
 
-function hasUserMessage(ctx: ExtensionContext) {
+export function hasUserMessage(ctx: ExtensionContext) {
+  // Branch-sensitive: a user message on an abandoned branch must not suppress
+  // naming for the active branch (it is also what pi's resume/fork flows mean
+  // by "this session already has a conversation").
   return ctx.sessionManager
-    .getEntries()
+    .getBranch()
     .some((entry) => entry.type === "message" && entry.message.role === "user");
 }
 

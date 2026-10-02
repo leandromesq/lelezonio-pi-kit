@@ -17,8 +17,8 @@ const READ_ONLY_TOOLS = new Set([
   "remote_list",
 ]);
 
-/** Interactive footer cadence: fast enough to feel live next to the editor. */
-export const POLL_INTERVAL_MS = 15_000;
+/** Mutation/input events refresh eagerly; polling is a fallback for external changes. */
+export const POLL_INTERVAL_MS = 60_000;
 
 /**
  * Subagent footer cadence. Children launched through the Herdr worker carry
@@ -27,7 +27,7 @@ export const POLL_INTERVAL_MS = 15_000;
  * mutation/s does not pay hundreds of `git` spawns per minute for a pane
  * nobody watches continuously.
  */
-export const SUBAGENT_POLL_INTERVAL_MS = 60_000;
+export const SUBAGENT_POLL_INTERVAL_MS = 120_000;
 
 /**
  * Detect a subagent child. Takes the env as an argument (instead of reading
@@ -62,6 +62,17 @@ export function shouldRefreshAfterTool(
  */
 export function shouldRefreshOnInput(isSubagent: boolean): boolean {
   return !isSubagent;
+}
+
+/** Idle sessions need only a slow fallback for changes made outside Pi. */
+export const IDLE_POLL_INTERVAL_MS = 300_000;
+
+export function shouldPollGit(
+  now: number,
+  lastPoll: number,
+  idle: boolean,
+): boolean {
+  return !idle || now - lastPoll >= IDLE_POLL_INTERVAL_MS;
 }
 
 /** Poll cadence; a child polls slower than an interactive process. */

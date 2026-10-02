@@ -276,14 +276,63 @@ export function buildFallbackRecap(entries: readonly SessionEntry[]) {
   const tools = [...new Set(toolNames)];
   const activity =
     tools.length > 0
-      ? ` It used ${toolNames.length} tool call${toolNames.length === 1 ? "" : "s"} (${tools.join(", ")}).`
+      ? ` Foram usadas ${toolNames.length} chamada${toolNames.length === 1 ? "" : "s"} de ferramenta (${tools.join(", ")}).`
       : "";
   const result = finalAssistantText
-    ? ` ${capped(finalAssistantText.replace(/\s+/g, " "), 700, "final answer truncated")}`
+    ? ` ${capped(finalAssistantText.replace(/\s+/g, " "), 700, "resposta final truncada")}`
     : "";
 
+  // Generated content follows the pt-BR language of the model prompt; the UI
+  // that frames it stays English (see docs/ui-conventions.md §11).
   return {
-    recap: `The main agent run finished.${activity}${result}`.trim(),
-    next: "Review the completed work above and continue if anything is still pending.",
+    recap:
+      `A execução principal do agente foi concluída.${activity}${result}`.trim(),
+    next: "Revise o trabalho concluído acima e continue se algo ainda estiver pendente.",
   };
+}
+
+/** Number of tool calls recorded by assistant messages in a run. */
+export function countRunToolCalls(entries: readonly SessionEntry[]) {
+  let toolCalls = 0;
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.message.role !== "assistant")
+      continue;
+    for (const block of entry.message.content) {
+      if (block.type === "toolCall") toolCalls++;
+    }
+  }
+  return toolCalls;
+}
+
+/**
+ * A run is worth an automatic recap only when it did at least
+ * `minToolCalls` tool work. Pure conversational turns are trivial: they have
+ * no investigation or edits to summarize, and recapping them wastes a model
+ * request. On-demand `/recap` deliberately ignores this gate.
+ */
+export function isMeaningfulRun(
+  entries: readonly SessionEntry[],
+  minToolCalls: number,
+) {
+  const threshold =
+    Number.isFinite(minToolCalls) && minToolCalls > 0
+      ? Math.floor(minToolCalls)
+      : 0;
+  return countRunToolCalls(entries) >= threshold;
+}
+
+/**
+ * Entries of the most recent run on the branch, for an on-demand `/recap`:
+ * everything from the last user message through the branch tip. The prompt is
+ * kept so the recap can say what was asked. Empty when the branch has no user
+ * turn yet.
+ */
+export function getLastRunEntries(branch: readonly SessionEntry[]) {
+  for (let index = branch.length - 1; index >= 0; index--) {
+    const entry = branch[index];
+    if (entry.type === "message" && entry.message.role === "user") {
+      return branch.slice(index);
+    }
+  }
+  return [];
 }

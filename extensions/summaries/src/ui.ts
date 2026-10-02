@@ -64,7 +64,14 @@ class RecapCard {
       ),
     );
     if (this.expanded) {
-      const source = `${this.data.provider}/${this.data.model} · ${this.data.reasoning}${this.data.fallback ? " · local fallback" : ""}`;
+      // Auxiliary recap spend is reported by the recap model itself and is not
+      // part of the footer's session total; it is shown only here, in explicit
+      // detail, and only when the model reported a positive cost.
+      const auxCost =
+        this.data.auxCost !== undefined && this.data.auxCost > 0
+          ? ` · recap $${this.data.auxCost.toFixed(4)}`
+          : "";
+      const source = `${this.data.provider}/${this.data.model} · ${this.data.reasoning}${this.data.fallback ? " · local fallback" : ""}${auxCost}`;
       box.addChild(new Text(this.theme.fg("dim", source), 0, 1));
     }
     return box.render(width);
@@ -147,7 +154,10 @@ class ModelPickerComponent extends Container {
     this.addChild(new Spacer(1));
     this.addChild(
       new Text(
-        this.theme.fg("dim", "  ↑↓ navigate · type to filter · enter select · esc cancel"),
+        this.theme.fg(
+          "dim",
+          "  ↑↓ navigate · type to filter · enter select · esc cancel",
+        ),
         1,
         0,
       ),
@@ -243,30 +253,32 @@ export async function openModelPicker(
     description: model.name && model.name !== model.id ? model.name : undefined,
   }));
 
-  return ctx.ui.custom<Model<Api> | undefined>((tui, theme, _keybindings, done) => {
-    const picker = new ModelPickerComponent({
-      theme,
-      items,
-      modelsByKey,
-      currentValue: modelKey(config.provider, config.model),
-      onSelect: (model) => done(model),
-      onCancel: () => done(undefined),
-    });
-    return {
-      render: (width) => picker.render(width),
-      invalidate: () => picker.invalidate(),
-      handleInput: (data) => {
-        picker.handleInput(data);
-        tui.requestRender();
-      },
-      get focused() {
-        return picker.focused;
-      },
-      set focused(value: boolean) {
-        picker.focused = value;
-      },
-    };
-  });
+  return ctx.ui.custom<Model<Api> | undefined>(
+    (tui, theme, _keybindings, done) => {
+      const picker = new ModelPickerComponent({
+        theme,
+        items,
+        modelsByKey,
+        currentValue: modelKey(config.provider, config.model),
+        onSelect: (model) => done(model),
+        onCancel: () => done(undefined),
+      });
+      return {
+        render: (width) => picker.render(width),
+        invalidate: () => picker.invalidate(),
+        handleInput: (data) => {
+          picker.handleInput(data);
+          tui.requestRender();
+        },
+        get focused() {
+          return picker.focused;
+        },
+        set focused(value: boolean) {
+          picker.focused = value;
+        },
+      };
+    },
+  );
 }
 
 export function openReasoningPicker(

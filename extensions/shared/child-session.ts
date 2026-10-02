@@ -1,15 +1,20 @@
 import * as path from "node:path";
 import {
+  createCodemodeExtension,
+  createMcpExtension,
+  createToolSearchExtension,
   DefaultResourceLoader,
   getAgentDir,
   ProjectTrustStore,
   SettingsManager,
   type AgentSession,
+  type InlineExtension,
   type LoadExtensionsResult,
   type SessionShutdownEvent,
 } from "@earendil-works/pi-coding-agent";
 
-const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
+/** Bound shared by the child abort wait and the child shutdown hook. */
+export const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 
 /** Tools that headless children must not receive. Everything else stays enabled. */
 export const CHILD_EXCLUDED_TOOL_NAMES = [
@@ -19,6 +24,12 @@ export const CHILD_EXCLUDED_TOOL_NAMES = [
   "subagent_cancel",
   "subagent_check",
   "subagent_list",
+  "remote_spawn",
+  "remote_send",
+  "remote_wait",
+  "remote_cancel",
+  "remote_check",
+  "remote_list",
   "workflow",
   "ask_user",
 ] as const;
@@ -44,10 +55,19 @@ export function childToolPolicy() {
  */
 export const CHILD_EXCLUDED_EXTENSION_PATHS = [
   "pi-observational-memory",
+  "observational-memory",
+  // DonSeTch eagerly starts a process-wide transport/daemon on session_start
+  // and tears it down on session_shutdown. In-process SDK children share the
+  // parent process, so a child dispose could cross-kill the transport the
+  // parent still uses. Exclude it from EVERY in-process child (not just
+  // narrowed ones); the parent keeps its own web tools, and native-MCP
+  // children still get the full supported surface from `childNativeExtensionFactories`.
+  "donsetch",
 ] as const;
 
 export function withoutChildExcludedExtensions(
   base: LoadExtensionsResult,
+  extraExcludedPaths: readonly string[] = [],
 ): LoadExtensionsResult {
   return {
     ...base,
@@ -56,11 +76,29 @@ export function withoutChildExcludedExtensions(
       // Match a whole path segment so `pi-observational-memory-extra` is not
       // caught by the `pi-observational-memory` rule.
       const segments = resolved.split(/[\\/]/);
-      return !CHILD_EXCLUDED_EXTENSION_PATHS.some((needle) =>
-        segments.includes(needle),
+      return ![...CHILD_EXCLUDED_EXTENSION_PATHS, ...extraExcludedPaths].some(
+        (needle) => segments.includes(needle),
       );
     }),
   };
+}
+
+/**
+ * Pi's native SDK extensions: `codemode`, `tool_search`, and MCP. The CLI
+ * loads them as built-in extensions, but an SDK session — every in-process
+ * child — must add them explicitly (docs/sdk.md).
+ *
+ * `codemode` and `tool_search` register inactive; the MCP extension activates
+ * them when a server with `codemode`/`deferred` exposure connects. MCP reads
+ * `mcp.json` from the agent directory and, only when the child's project is
+ * trusted, from the child project.
+ */
+export function childNativeExtensionFactories(): InlineExtension[] {
+  return [
+    createCodemodeExtension(),
+    createToolSearchExtension(),
+    createMcpExtension(),
+  ];
 }
 
 export interface ChildResourceOptions {
@@ -68,6 +106,20 @@ export interface ChildResourceOptions {
   projectTrusted: boolean;
   appendSystemPrompt?: string[];
   agentDir?: string;
+  /**
+   * Add Pi's native SDK extensions (`codemode`, `tool_search`, MCP).
+   *
+   * Only enable this for a child that keeps the default full tool surface.
+   * A narrowed child (an explicit `tools` allowlist, such as a read-only
+   * profile) must not register these at all: `codemode`/`deferred` tools stay
+   * callable through scripts regardless of the active set, and connecting MCP
+   * servers spawns processes the profile did not ask for. Excluding the names
+   * from the active set is not enough — the session-level `tools`/`excludeTools`
+   * options are what remove a tool from the callable registry.
+   */
+  nativeBuiltins?: boolean;
+  /** Omit session hooks for optional services a narrowed child cannot use. */
+  excludedExtensionPaths?: readonly string[];
 }
 
 /** Load normal global/package resources and trust-gated project resources. */
@@ -82,7 +134,11 @@ export async function createChildResources(options: ChildResourceOptions) {
     settingsManager,
     // Children keep tools and project instructions, but not extensions that
     // only exist to serve an interactive parent session.
-    extensionsOverride: withoutChildExcludedExtensions,
+    extensionsOverride: (base) =>
+      withoutChildExcludedExtensions(base, options.excludedExtensionPaths),
+    ...(options.nativeBuiltins
+      ? { extensionFactories: childNativeExtensionFactories() }
+      : {}),
     ...(options.appendSystemPrompt
       ? { appendSystemPrompt: options.appendSystemPrompt }
       : {}),
@@ -132,7 +188,7 @@ export interface DisposableChildSession {
 
 const childShutdowns = new WeakMap<object, Promise<void>>();
 
-function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
+export function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<void>((resolve) => {
     timer = setTimeout(resolve, timeoutMs);

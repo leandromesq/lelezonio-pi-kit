@@ -3,7 +3,7 @@ import type { RemoteAgentsConfig } from "./config.ts";
 import type { RemoteAgentSnapshot, RemoteAgentStatus } from "./domain.ts";
 import { isRemoteAgentActive } from "./domain.ts";
 import type { HerdrAgent, HerdrClient } from "./herdr-client.ts";
-import type { RemoteJobStore } from "./persistence.ts";
+import type { DeliveryKind, RemoteJobStore } from "./persistence.ts";
 
 const TRANSCRIPT_MAX_CHARS = 256 * 1024;
 const FINAL_TEXT_MAX_CHARS = 64 * 1024;
@@ -37,7 +37,20 @@ interface MutableSnapshot {
   cancelRequested?: boolean;
   completionDelivered?: boolean;
   blockedDelivered?: boolean;
+  ownerSessionId?: string;
+  completionDeliveredTo?: string;
+  blockedDeliveredTo?: string;
 }
+
+export interface RemoteAgentManagerOptions {
+  /** Pi session that owns the jobs this manager spawns and delivers. Absent
+   * (legacy/tests) keeps the pre-ownership behavior for unowned registries. */
+  readonly sessionId?: string;
+  /** Live window for a cross-process delivery claim before it can be stolen. */
+  readonly deliveryLeaseMs?: number;
+}
+
+const DEFAULT_DELIVERY_LEASE_MS = 30_000;
 
 export interface RemoteAgentReadModel {
   list(): ReadonlyArray<RemoteAgentSnapshot>;
@@ -64,6 +77,15 @@ export class RemoteAgentManager {
   private onBlocked?: (snapshot: RemoteAgentSnapshot) => void;
   private onWarning?: (message: string) => void;
   private readonly config: RemoteAgentsConfig;
+  /** Owner session for spawned jobs and delivery decisions. */
+  readonly sessionId: string | undefined;
+  /**
+   * Unique per manager instance. A delivery lease records it, so two managers
+   * that share a session id (a resumed session overlapping its old process)
+   * still cannot both claim the same result.
+   */
+  readonly instanceId: string = randomBytes(8).toString("hex");
+  private readonly deliveryLeaseMs: number;
   private readonly client: Pick<
     HerdrClient,
     | "start"
@@ -118,10 +140,13 @@ export class RemoteAgentManager {
       | "close"
     >,
     store: RemoteJobStore,
+    options: RemoteAgentManagerOptions = {},
   ) {
     this.config = config;
     this.client = client;
     this.store = store;
+    this.sessionId = options.sessionId;
+    this.deliveryLeaseMs = options.deliveryLeaseMs ?? DEFAULT_DELIVERY_LEASE_MS;
     for (const snapshot of store.load())
       this.jobs.set(snapshot.id, {
         ...snapshot,
@@ -220,6 +245,9 @@ export class RemoteAgentManager {
       transcript: "",
       transcriptVersion: 0,
       generation: 1,
+      // The spawning session owns the result; a resumed session with the same
+      // id recovers delivery, while any other session must not deliver it.
+      ownerSessionId: this.sessionId,
     };
     this.jobs.set(id, snapshot);
     this.changed(id);
@@ -349,6 +377,9 @@ export class RemoteAgentManager {
     snapshot.cancelRequested = false;
     snapshot.completionDelivered = false;
     snapshot.blockedDelivered = false;
+    // A new generation invalidates the previous run's per-session deliveries.
+    snapshot.completionDeliveredTo = undefined;
+    snapshot.blockedDeliveredTo = undefined;
     snapshot.generation++;
     this.deliveryPending.delete(id);
     this.blockedPending.delete(id);
@@ -394,28 +425,173 @@ export class RemoteAgentManager {
     }
   }
 
-  markCompletionDelivered(id: string) {
+  /**
+   * True when this manager may deliver the job's result: its Pi session owns
+   * the job, or the manager has no session at all (legacy/tests). A legacy job
+   * with no recorded owner is never auto-delivered to an arbitrary session —
+   * the user adopts it explicitly with `adopt`.
+   */
+  owns(snapshot: RemoteAgentSnapshot): boolean {
+    if (this.sessionId === undefined) return true;
+    return snapshot.ownerSessionId === this.sessionId;
+  }
+
+  /**
+   * Explicitly adopt an unowned (legacy) job so this session receives its
+   * result. A job already owned by this session is a no-op; a job owned by
+   * another Pi session is left untouched and returns false. Adoption goes
+   * through the registry lock, so concurrent adopters cannot both win.
+   */
+  async adopt(id: string): Promise<boolean> {
     const snapshot = this.jobs.get(id);
-    if (!snapshot) return;
-    snapshot.completionDelivered = true;
-    this.deliveryPending.delete(id);
+    if (!snapshot || this.sessionId === undefined) return false;
+    if (snapshot.ownerSessionId === this.sessionId) return true;
+    if (snapshot.ownerSessionId !== undefined) return false;
+    if (!(await this.store.adopt(id, this.sessionId))) return false;
+    snapshot.ownerSessionId = this.sessionId;
+    this.changed(id);
+    return true;
+  }
+
+  private deliveredTo(snapshot: RemoteAgentSnapshot, kind: DeliveryKind) {
+    if (this.sessionId === undefined) {
+      return kind === "completion"
+        ? snapshot.completionDelivered === true
+        : snapshot.blockedDelivered === true;
+    }
+    return (
+      (kind === "completion"
+        ? snapshot.completionDeliveredTo
+        : snapshot.blockedDeliveredTo) === this.sessionId
+    );
+  }
+
+  /**
+   * Cross-process claim for one delivery. The registry lock makes the claim
+   * atomic across Pi sessions, so two processes sharing the registry cannot
+   * both deliver the same run. An undefined session (legacy/tests) always
+   * wins, keeping the pre-ownership behavior.
+   */
+  claimCompletionDelivery(id: string, generation: number): Promise<boolean> {
+    return this.claimDelivery(id, "completion", generation);
+  }
+
+  claimBlockedDelivery(id: string, generation: number): Promise<boolean> {
+    return this.claimDelivery(id, "blocked", generation);
+  }
+
+  private async claimDelivery(
+    id: string,
+    kind: DeliveryKind,
+    generation: number,
+  ) {
+    if (this.sessionId === undefined) return true;
+    return this.store.claimDelivery(
+      id,
+      kind,
+      this.sessionId,
+      this.instanceId,
+      generation,
+      this.deliveryLeaseMs,
+    );
+  }
+
+  /** Record a durable per-session delivery and drop its lease. */
+  async settleCompletionDelivery(
+    id: string,
+    generation: number,
+  ): Promise<void> {
+    await this.settleDelivery(id, "completion", generation);
+  }
+
+  async settleBlockedDelivery(id: string, generation: number): Promise<void> {
+    await this.settleDelivery(id, "blocked", generation);
+  }
+
+  private async settleDelivery(
+    id: string,
+    kind: DeliveryKind,
+    generation: number,
+  ) {
+    if (this.sessionId === undefined) {
+      if (kind === "completion") this.markCompletionDelivered(id);
+      else this.markBlockedDelivered(id);
+      return;
+    }
+    await this.store.settleDelivery(
+      id,
+      kind,
+      this.sessionId,
+      this.instanceId,
+      generation,
+    );
+    const snapshot = this.jobs.get(id);
+    if (!snapshot || (snapshot.generation ?? 1) !== generation) return;
+    if (kind === "completion") {
+      snapshot.completionDelivered = true;
+      snapshot.completionDeliveredTo = this.sessionId;
+      this.deliveryPending.delete(id);
+    } else {
+      snapshot.blockedDelivered = true;
+      snapshot.blockedDeliveredTo = this.sessionId;
+      this.blockedPending.delete(id);
+    }
     this.changed(id);
   }
 
-  releaseCompletionDelivery(id: string) {
+  /**
+   * Release an in-flight delivery: clear the in-process pending guard and any
+   * cross-process lease this session still holds, so a later retry is not
+   * blocked until the lease expires.
+   */
+  async releaseCompletionDelivery(id: string): Promise<void> {
+    await this.releaseDelivery(id, "completion");
+  }
+
+  async releaseBlockedDelivery(id: string): Promise<void> {
+    await this.releaseDelivery(id, "blocked");
+  }
+
+  private async releaseDelivery(id: string, kind: DeliveryKind) {
+    if (kind === "completion") this.deliveryPending.delete(id);
+    else this.blockedPending.delete(id);
+    if (this.sessionId === undefined) return;
+    await this.store.releaseDelivery(id, kind, this.sessionId, this.instanceId);
+  }
+
+  /**
+   * Synchronous per-session mark used by the checking tools. The durable
+   * settle happens through `settle*Delivery`; the lease is released
+   * best-effort so it cannot outlive a completed delivery.
+   */
+  markCompletionDelivered(id: string) {
+    const snapshot = this.jobs.get(id);
+    // Only the owning session (or a session-less legacy manager) may record a
+    // delivery: checking another session's job must not steal its marker.
+    if (!snapshot || !this.owns(snapshot)) return;
+    snapshot.completionDelivered = true;
+    if (this.sessionId !== undefined)
+      snapshot.completionDeliveredTo = this.sessionId;
     this.deliveryPending.delete(id);
+    this.changed(id);
+    if (this.sessionId !== undefined)
+      void this.store
+        .releaseDelivery(id, "completion", this.sessionId, this.instanceId)
+        .catch(() => {});
   }
 
   markBlockedDelivered(id: string) {
     const snapshot = this.jobs.get(id);
-    if (!snapshot) return;
+    if (!snapshot || !this.owns(snapshot)) return;
     snapshot.blockedDelivered = true;
+    if (this.sessionId !== undefined)
+      snapshot.blockedDeliveredTo = this.sessionId;
     this.blockedPending.delete(id);
     this.changed(id);
-  }
-
-  releaseBlockedDelivery(id: string) {
-    this.blockedPending.delete(id);
+    if (this.sessionId !== undefined)
+      void this.store
+        .releaseDelivery(id, "blocked", this.sessionId, this.instanceId)
+        .catch(() => {});
   }
 
   /**
@@ -501,6 +677,10 @@ export class RemoteAgentManager {
     this.store.save(this.list());
     // Deterministic teardown flush: the process can exit right after dispose.
     this.store.flushSync();
+    // A session replacement/reload must not strand a job behind a live lease
+    // held by the session that is going away.
+    if (this.sessionId !== undefined)
+      this.store.releaseSessionLeases(this.sessionId);
     this.disposed = true;
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = undefined;
@@ -557,6 +737,7 @@ export class RemoteAgentManager {
     snapshot.status = nextStatus;
     if (previousStatus === "blocked" && nextStatus !== "blocked") {
       snapshot.blockedDelivered = false;
+      snapshot.blockedDeliveredTo = undefined;
       this.blockedPending.delete(snapshot.id);
     }
     snapshot.workspaceId = agent.workspace_id;
@@ -578,7 +759,8 @@ export class RemoteAgentManager {
 
   private notifyBlocked(snapshot: MutableSnapshot) {
     if (
-      snapshot.blockedDelivered ||
+      !this.owns(snapshot) ||
+      this.deliveredTo(snapshot, "blocked") ||
       this.blockedPending.has(snapshot.id) ||
       (this.waitInterest.get(snapshot.id) ?? 0) > 0
     ) {
@@ -594,7 +776,8 @@ export class RemoteAgentManager {
 
   private notifySettlement(snapshot: MutableSnapshot) {
     if (
-      snapshot.completionDelivered ||
+      !this.owns(snapshot) ||
+      this.deliveredTo(snapshot, "completion") ||
       this.deliveryPending.has(snapshot.id) ||
       (this.waitInterest.get(snapshot.id) ?? 0) > 0
     ) {

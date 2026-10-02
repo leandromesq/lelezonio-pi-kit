@@ -1,6 +1,12 @@
 {
   "theme": "noctalia",
   "tuiMode": "fullscreen",
-  "quietStartup": true,
+  "quietStartup": "header",
+  "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 24000,
+    "keepRecentTokens": 20000
+  },
   "packages": []
 }

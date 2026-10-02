@@ -12,6 +12,7 @@ import {
   CONTEXT_MINI_BAR_CELLS,
   decorateThinkingBorder,
   footerLayout,
+  formatSessionCost,
   isDetachedGit,
   MEDIUM_MIN_WIDTH,
   thinkingBadgeLabel,
@@ -265,7 +266,10 @@ describe("buildFooterContent", () => {
     assert.match(result.directory, /demo/);
     assert.equal(result.git, "main · +2 · PR #42");
     assert.equal(result.model, "openai/gpt-4o");
-    assert.equal(result.usage, "▓▓▓▓░░░░░░ 42% · 84k/200k · $0.12");
+    assert.equal(
+      result.usage,
+      "▓▓▓▓░░░░░░ 42% · 84k/200k · est. session $0.12",
+    );
     assert.equal(result.context, "▓▓▓▓░░░░░░ 42% · 84k/200k");
     assert.equal(result.contextPercent, "42% ▓▓▓░░░");
   });
@@ -305,6 +309,39 @@ describe("buildFooterContent", () => {
         `footer must not contain thinking level ${thinking}`,
       );
     }
+  });
+
+  it("labels the canonical total as session-scoped and estimated", () => {
+    assert.equal(formatSessionCost(0.12, false), "est. session $0.12");
+    assert.equal(formatSessionCost(0, true), "sub · est. session $0.00");
+  });
+
+  it("marks a subscription only when the registry reports OAuth", () => {
+    const modelInfo: ModelInfoState = {
+      ...emptyModelInfoState(),
+      provider: "openai",
+      modelId: "gpt-4o",
+      cost: 0.5,
+    };
+    const subscription = buildFooterContent(
+      "C:\\src\\demo",
+      emptyGitInfoState(),
+      modelInfo,
+      plainTheme,
+      false,
+      { subscription: true, provider: "openai" },
+    );
+    const apiKey = buildFooterContent(
+      "C:\\src\\demo",
+      emptyGitInfoState(),
+      modelInfo,
+      plainTheme,
+      false,
+      { subscription: false, provider: "openai" },
+    );
+    assert.match(subscription.usage, /sub · est\. session \$0\.50/);
+    assert.doesNotMatch(apiKey.usage, /sub ·/);
+    assert.match(apiKey.usage, /est\. session \$0\.50/);
   });
 
   it("omits git and PR parts when there is no branch", () => {
@@ -358,7 +395,7 @@ describe("buildFooterContent", () => {
       plainTheme,
       false,
     );
-    assert.equal(result.usage, "░░░░░░░░░░ ?% · ?/? · $0.00");
+    assert.equal(result.usage, "░░░░░░░░░░ ?% · ?/? · est. session $0.00");
     assert.equal(result.context, "░░░░░░░░░░ ?% · ?/?");
     assert.equal(result.contextPercent, "?% ░░░░░░");
   });

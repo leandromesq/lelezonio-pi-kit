@@ -56,6 +56,8 @@ function openPicker(modelCount: number) {
     provider: "alpha",
     model: "model-00",
     reasoning: "off",
+    mode: "auto",
+    minToolCalls: 1,
   });
 
   assert.ok(component, "picker component was not created");

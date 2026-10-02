@@ -6,9 +6,15 @@
  * summary that almost always lives in the last few hundred bytes. The scan is
  * therefore tail-first: a small read is enough when it already contains a
  * terminal assistant message, and only otherwise does it widen to the old cap.
+ *
+ * Every read here goes through `node:fs/promises`: `restoreWorkers` is a
+ * detached startup task, and a synchronous directory walk or JSONL tail read
+ * would block the event loop while the session is still coming up.
  */
 
-import * as fs from "node:fs";
+import type { Dirent } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
 /** First read: enough for a normal final assistant message. */
 export const WORKER_TAIL_BYTES = 8 * 1024;
@@ -16,14 +22,17 @@ export const WORKER_TAIL_BYTES = 8 * 1024;
 export const WORKER_FULL_TAIL_BYTES = 256 * 1024;
 
 /** Read at most `maxBytes` from the end, dropping a partial first line. */
-export function readFileTail(filePath: string, maxBytes: number): string {
-  const fd = fs.openSync(filePath, "r");
+export async function readFileTail(
+  filePath: string,
+  maxBytes: number,
+): Promise<string> {
+  const handle = await fs.open(filePath, "r");
   try {
-    const size = fs.fstatSync(fd).size;
+    const { size } = await handle.stat();
     const start = Math.max(0, size - maxBytes);
     const length = size - start;
     const buffer = Buffer.alloc(length);
-    fs.readSync(fd, buffer, 0, length, start);
+    await handle.read(buffer, 0, length, start);
     const tail = buffer.toString("utf8");
     // A tail read starting mid-file begins inside a line: drop that partial
     // first line (truncated mid-entry) — the rest is intact. A read from byte
@@ -32,7 +41,7 @@ export function readFileTail(filePath: string, maxBytes: number): string {
     const newline = tail.indexOf("\n");
     return newline >= 0 ? tail.slice(newline + 1) : tail;
   } finally {
-    fs.closeSync(fd);
+    await handle.close();
   }
 }
 
@@ -47,16 +56,17 @@ export interface WorkerSummary {
 }
 
 /** Parse the final assistant text/error from a persisted worker session JSONL. */
-export function summaryFromSessionFile(
+export async function summaryFromSessionFile(
   filePath: string,
   maxBytes: number,
-): WorkerSummary {
+): Promise<WorkerSummary> {
   let finalText = "";
   let errorText: string | undefined;
   let settledAt = 0;
   let found = false;
   try {
-    for (const line of readFileTail(filePath, maxBytes).split("\n")) {
+    const tail = await readFileTail(filePath, maxBytes);
+    for (const line of tail.split("\n")) {
       if (!line.trim()) continue;
       let entry: unknown;
       try {
@@ -99,8 +109,49 @@ export function summaryFromSessionFile(
  * Tail-first summary: the small read stands on its own when it already holds a
  * terminal assistant message; otherwise widen once to the full tail budget.
  */
-export function readWorkerSummary(filePath: string): WorkerSummary {
-  const small = summaryFromSessionFile(filePath, WORKER_TAIL_BYTES);
+export async function readWorkerSummary(
+  filePath: string,
+): Promise<WorkerSummary> {
+  const small = await summaryFromSessionFile(filePath, WORKER_TAIL_BYTES);
   if (small.found) return small;
   return summaryFromSessionFile(filePath, WORKER_FULL_TAIL_BYTES);
+}
+
+/** One restorable worker session directory and the newest JSONL inside it. */
+export interface WorkerSessionFile {
+  readonly id: string;
+  readonly filePath: string;
+}
+
+/**
+ * Discover restorable worker sessions under a parent's worker root. Runs
+ * entirely on the promise API so startup discovery never blocks the event loop.
+ * A missing root simply means the parent has no persisted children.
+ */
+export async function discoverWorkerSessions(
+  root: string,
+): Promise<WorkerSessionFile[]> {
+  let dirents: Dirent[];
+  try {
+    dirents = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const found: WorkerSessionFile[] = [];
+  for (const dirent of dirents) {
+    if (!dirent.isDirectory()) continue;
+    const directory = path.join(root, dirent.name);
+    let files: string[];
+    try {
+      files = (await fs.readdir(directory))
+        .filter((file) => file.endsWith(".jsonl"))
+        .sort();
+    } catch {
+      continue;
+    }
+    const newest = files[files.length - 1];
+    if (newest === undefined) continue;
+    found.push({ id: dirent.name, filePath: path.join(directory, newest) });
+  }
+  return found;
 }
