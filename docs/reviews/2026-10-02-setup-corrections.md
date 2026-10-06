@@ -66,6 +66,43 @@
 - Changed-file formatting passed. Global `npm run format:check` still reports style drift in
   76 existing unrelated files; no repo-wide cosmetic rewrite was performed.
 
+## Codemode setup follow-up
+
+- Enabled codemode in `on` mode alongside direct tool calls in private and example settings.
+- `planner` and `reviewer` explicitly allow `read`, `grep`, `find`, `ls`, and `codemode`;
+  their model-only clarification tool remains available.
+- Narrowed SDK children load codemode separately from native MCP/tool search. Narrowed Herdr
+  launches disable native MCP; both backends must prevent unlisted MCP tools from remaining
+  callable, since Pi's ordinary non-MCP allowlist intentionally preserves MCP registrations.
+- Full-surface coders and workflow children keep native MCP support. No MCP server was added,
+  and no upstream package was patched.
+- Integrated `npm run check && npm test`: exit 0, **831 passed / 0 failed / 2 skipped**.
+  This includes a fresh/resume Herdr regression for the read-only codemode allowlist.
+- Also ran five native-extension/codemode security tests against the installed Pi **1.0.4**
+  SDK, not just the repository's **1.0.0** dependency: all passed. Actual scripts can read,
+  but cannot call shell/mutation, unlisted extension/deferred, or unauthorized MCP tools.
+  A real MCP process fixture verifies no narrowed-child startup, with a full-child positive control.
+- Global and changed-file formatting checks passed; private settings JSON was separately
+  validated and formatted because it is gitignored.
+
+## Pi 1.0.4 maintenance follow-up
+
+- Aligned the four Pi development dependencies and the lockfile with the installed 1.0.4
+  runtime, including its native MCP/codemode and security-related transitive updates.
+- Personal `defaultTools` now adds `grep`, `find`, `ls`, and `codemode` while retaining
+  inherited defaults. Preserved `defaultProjectTrust: "always"` at the user's request.
+- Added `npm run test:runtime`, also included in `npm test`, to smoke-test isolated child
+  lifecycle, native-extension loading, and callable-tool restrictions against the installed SDK.
+- Dependency audit still reports four development-tooling advisories (three moderate and one
+  high, via Vitest/Vite/source-map-js). No unrelated automatic audit fix was applied.
+- Integrated `npm run check && npm test`: exit 0, **834 passed / 0 failed / 2 skipped**.
+  The installed-runtime wrapper adds three tests and verifies six actual SDK child tests against
+  `/usr/bin/pi`'s 1.0.4 package, not npm's prepended local `.bin/pi`.
+- Required-runtime smoke test passed. Missing-runtime skip, required-runtime failure, and
+  invalid-override failure were also exercised independently; none silently used the local SDK.
+- Typechecks, global formatting, private-settings formatting, and `git diff --check` passed.
+  No real model requests, remote execution, trust changes, or upstream package patches were used.
+
 ## Limitations intentionally retained
 
 - DonSeTch upstream remains unchanged and may still start daemons in independent Herdr processes.

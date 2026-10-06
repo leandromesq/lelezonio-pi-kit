@@ -37,6 +37,7 @@ import { randomUUID } from "node:crypto";
 import {
   bindChildSessionExtensions,
   CHILD_SHUTDOWN_TIMEOUT_MS,
+  childNativeExtensionsFor,
   createChildResources,
   shutdownAndDisposeChildSession,
   waitBounded,
@@ -234,12 +235,14 @@ const makePiSession = (
         const { loader, settingsManager } = await createChildResources({
           cwd: task.cwd,
           projectTrusted: task.parent.projectTrusted,
-          // Native MCP/codemode/tool_search parity with the CLI, but only for
-          // a full default-surface child. A narrowed profile uses a real
-          // `tools` allowlist, and those tools must not even be registered:
-          // codemode/deferred tools are callable from scripts regardless of
-          // the active set (see shared/child-session.ts).
-          nativeBuiltins: loadout.tools === undefined,
+          // Native MCP/codemode/tool_search parity with the CLI, but selected
+          // for this child's surface. A full default-surface child gets all
+          // three; a narrowed child (real `tools` allowlist) gets `codemode`
+          // alone, and only when the allowlist names it — never MCP (its
+          // servers would bypass the allowlist through codemode) and never
+          // `tool_search` unless it is explicitly named (see
+          // shared/child-session.ts).
+          nativeExtensions: childNativeExtensionsFor(loadout),
           // DonSeTch is always excluded by the shared child loader
           // (`CHILD_EXCLUDED_EXTENSION_PATHS` in shared/child-session.ts): its
           // session_start daemon/transport is process-wide and an in-process

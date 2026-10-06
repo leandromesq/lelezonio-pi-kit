@@ -22,6 +22,7 @@ function runNpm(args) {
   run("npm", args, process.platform === "win32");
 }
 
+run(process.execPath, ["--test", "scripts/pi-installed-runtime.test.mjs"]);
 run(process.execPath, ["--test", "scripts/native-search.test.mjs"]);
 run(process.execPath, ["--test", "scripts/observational-memory.test.mjs"]);
 runNpm(["--prefix", "vendor/pi-observational-memory", "test"]);

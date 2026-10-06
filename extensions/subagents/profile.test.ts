@@ -14,6 +14,7 @@ import { Type } from "typebox";
 import {
   buildChildPrompt,
   CHILD_ASK_TOOL,
+  CHILD_MCP_TOOL_EXCLUSIONS,
   CHILD_ORCHESTRATION_TOOLS,
   childToolLoadout,
   type ChildToolLoadout,
@@ -42,7 +43,18 @@ test("childToolLoadout gives narrowed profiles a real allowlist", () => {
     "ls",
     "ask_question",
   ]);
-  assert.deepEqual(readOnly.exclude, []);
+  // A narrowed child also removes the whole MCP surface from the callable
+  // registry. `--no-mcp`/factory selection only covers NATIVE MCP; the
+  // allowlist alone keeps `mcp__*` callable from codemode scripts on newer Pi.
+  assert.deepEqual(readOnly.exclude, [...CHILD_MCP_TOOL_EXCLUSIONS]);
+  assert.equal(readOnly.exclude.includes("mcp__*"), true);
+  for (const mcpResource of [
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+  ] as const) {
+    assert.equal(readOnly.exclude.includes(mcpResource), true);
+  }
   // Everything not named is denied: a new/unknown built-in cannot leak in,
   // and neither can extension-backed execution/remote tools.
   for (const blocked of [
@@ -66,7 +78,7 @@ test("childToolLoadout gives narrowed profiles a real allowlist", () => {
     "git_status",
     CHILD_ASK_TOOL,
   ]);
-  assert.deepEqual(custom.exclude, []);
+  assert.deepEqual(custom.exclude, [...CHILD_MCP_TOOL_EXCLUSIONS]);
 
   // A genuinely nesting-capable child keeps its spawn bridge.
   const nested = childToolLoadout(toolPolicyFor({ readOnly: true }), {
@@ -105,7 +117,9 @@ test("childToolLoadout leaves the default coder surface denylist-based", () => {
 });
 
 test("childToolLoadout fails closed for an explicit empty allowlist", () => {
-  assert.deepEqual(childToolLoadout({ tools: [] }).tools, [CHILD_ASK_TOOL]);
+  const empty = childToolLoadout({ tools: [] });
+  assert.deepEqual(empty.tools, [CHILD_ASK_TOOL]);
+  assert.deepEqual(empty.exclude, [...CHILD_MCP_TOOL_EXCLUSIONS]);
 });
 
 /** Extension tools registered into the fixture session: real execution/remote

@@ -89,7 +89,17 @@ test("piWorkerLaunch narrows readOnly and custom profiles with a --tools allowli
     task({ parent: { ...task().parent, toolPolicy: { readOnly: true } } }),
     base,
   );
-  assert.equal(readOnly.argv.includes("--exclude-tools"), false);
+  // Narrowed workers also disable native MCP and exclude the MCP surface from
+  // the callable registry (`--tools` alone keeps `mcp__*` codemode-callable).
+  assert.ok(readOnly.argv.includes("--no-mcp"), readOnly.argv.join(" "));
+  const readOnlyDenied =
+    readOnly.argv[readOnly.argv.indexOf("--exclude-tools") + 1].split(",");
+  assert.deepEqual(readOnlyDenied, [
+    "mcp__*",
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+  ]);
   const allows = readOnly.argv[readOnly.argv.indexOf("--tools") + 1];
   assert.deepEqual(allows.split(","), [
     "read",
@@ -109,8 +119,41 @@ test("piWorkerLaunch narrows readOnly and custom profiles with a --tools allowli
     }),
     base,
   );
+  assert.ok(narrow.argv.includes("--no-mcp"), narrow.argv.join(" "));
   const narrowAllows = narrow.argv[narrow.argv.indexOf("--tools") + 1];
   assert.deepEqual(narrowAllows.split(","), ["read", "grep", "ask_question"]);
+});
+
+test("read-only codemode stays allowlisted with MCP disabled on launch and resume", () => {
+  const child = task({
+    parent: {
+      ...task().parent,
+      toolPolicy: {
+        readOnly: true,
+        tools: ["read", "grep", "find", "ls", "codemode"],
+      },
+    },
+  });
+  const base = { nodePath: "node", piCliPath: "cli.js", sessionDir: "s" };
+  const fresh = piWorkerLaunch(child, { ...base, sessionId: "id" });
+  const resumed = piResumeLaunch(child, {
+    ...base,
+    sessionFilePath: "s/session.jsonl",
+  });
+  for (const argv of [fresh.argv, resumed]) {
+    assert.deepEqual(argv[argv.indexOf("--tools") + 1].split(","), [
+      "read",
+      "grep",
+      "find",
+      "ls",
+      "codemode",
+      "ask_question",
+    ]);
+    assert.ok(argv.includes("--no-mcp"));
+    assert.ok(
+      argv[argv.indexOf("--exclude-tools") + 1].split(",").includes("mcp__*"),
+    );
+  }
 });
 
 test("piWorkerLaunch omits model/thinking when unset and flips trust when untrusted", () => {

@@ -84,21 +84,64 @@ export function withoutChildExcludedExtensions(
 }
 
 /**
- * Pi's native SDK extensions: `codemode`, `tool_search`, and MCP. The CLI
- * loads them as built-in extensions, but an SDK session — every in-process
- * child — must add them explicitly (docs/sdk.md).
+ * Pi's native SDK extensions, selected for one child surface. The CLI loads
+ * them as built-in extensions, but an SDK session — every in-process child —
+ * must add them explicitly (docs/sdk.md).
  *
  * `codemode` and `tool_search` register inactive; the MCP extension activates
  * them when a server with `codemode`/`deferred` exposure connects. MCP reads
  * `mcp.json` from the agent directory and, only when the child's project is
  * trusted, from the child project.
  */
-export function childNativeExtensionFactories(): InlineExtension[] {
-  return [
-    createCodemodeExtension(),
-    createToolSearchExtension(),
-    createMcpExtension(),
-  ];
+export interface ChildNativeExtensionSelection {
+  readonly codemode?: boolean;
+  readonly toolSearch?: boolean;
+  readonly mcp?: boolean;
+}
+
+/** Full default surface: what an unnarrowed child has always received. */
+export const FULL_CHILD_NATIVE_EXTENSIONS: ChildNativeExtensionSelection = {
+  codemode: true,
+  toolSearch: true,
+  mcp: true,
+};
+
+/**
+ * The native SDK extension factories for one selection. MCP is added last:
+ * it activates `codemode`/`tool_search` when a server with that exposure
+ * connects. An empty selection yields no factories.
+ */
+export function childNativeExtensionFactories(
+  selection: ChildNativeExtensionSelection = FULL_CHILD_NATIVE_EXTENSIONS,
+): InlineExtension[] {
+  const factories: InlineExtension[] = [];
+  if (selection.codemode) factories.push(createCodemodeExtension());
+  if (selection.toolSearch) factories.push(createToolSearchExtension());
+  if (selection.mcp) factories.push(createMcpExtension());
+  return factories;
+}
+
+/**
+ * The native extensions a child's tool surface justifies.
+ *
+ * A narrowed child (`tools` allowlist present) never connects native MCP, so
+ * this is decoupled from `codemode`: naming `codemode` loads ONLY codemode.
+ * The allowlist keeps `mcp__*` tools registered and codemode-callable unless
+ * an entry starts with `mcp__`, and connecting servers spawns processes the
+ * profile did not ask for (docs/cli.md, docs/mcp.md). `tool_search` is loaded
+ * only when the allowlist explicitly names it. A full-surface child (`tools`
+ * undefined) keeps all three.
+ */
+export function childNativeExtensionsFor(loadout: {
+  readonly tools?: readonly string[];
+}): ChildNativeExtensionSelection {
+  if (loadout.tools === undefined) return FULL_CHILD_NATIVE_EXTENSIONS;
+  const named = new Set(loadout.tools);
+  return {
+    codemode: named.has("codemode"),
+    toolSearch: named.has("tool_search"),
+    mcp: false,
+  };
 }
 
 export interface ChildResourceOptions {
@@ -107,17 +150,25 @@ export interface ChildResourceOptions {
   appendSystemPrompt?: string[];
   agentDir?: string;
   /**
-   * Add Pi's native SDK extensions (`codemode`, `tool_search`, MCP).
+   * Add the full native SDK extension set (`codemode`, `tool_search`, MCP).
    *
    * Only enable this for a child that keeps the default full tool surface.
    * A narrowed child (an explicit `tools` allowlist, such as a read-only
-   * profile) must not register these at all: `codemode`/`deferred` tools stay
-   * callable through scripts regardless of the active set, and connecting MCP
-   * servers spawns processes the profile did not ask for. Excluding the names
-   * from the active set is not enough — the session-level `tools`/`excludeTools`
-   * options are what remove a tool from the callable registry.
+   * profile) must not register MCP at all: connecting servers spawns processes
+   * the profile did not ask for, and `mcp__*` tools stay callable from
+   * codemode scripts regardless of the active set. Excluding the names from
+   * the active set is not enough — the session-level `tools`/`excludeTools`
+   * options are what remove a tool from the callable registry. Use
+   * `nativeExtensions` to give a narrowed child `codemode` alone.
    */
   nativeBuiltins?: boolean;
+  /**
+   * Explicit native-extension selection; when present it overrides
+   * `nativeBuiltins`. Narrowed children pass
+   * `childNativeExtensionsFor(loadout)`, which never loads MCP and loads
+   * `codemode`/`tool_search` only when the allowlist names each tool.
+   */
+  nativeExtensions?: ChildNativeExtensionSelection;
   /** Omit session hooks for optional services a narrowed child cannot use. */
   excludedExtensionPaths?: readonly string[];
 }
@@ -128,6 +179,11 @@ export async function createChildResources(options: ChildResourceOptions) {
   const settingsManager = SettingsManager.create(options.cwd, agentDir, {
     projectTrusted: options.projectTrusted,
   });
+  const nativeFactories = options.nativeExtensions
+    ? childNativeExtensionFactories(options.nativeExtensions)
+    : options.nativeBuiltins
+      ? childNativeExtensionFactories()
+      : [];
   const loader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir,
@@ -136,8 +192,8 @@ export async function createChildResources(options: ChildResourceOptions) {
     // only exist to serve an interactive parent session.
     extensionsOverride: (base) =>
       withoutChildExcludedExtensions(base, options.excludedExtensionPaths),
-    ...(options.nativeBuiltins
-      ? { extensionFactories: childNativeExtensionFactories() }
+    ...(nativeFactories.length > 0
+      ? { extensionFactories: nativeFactories }
       : {}),
     ...(options.appendSystemPrompt
       ? { appendSystemPrompt: options.appendSystemPrompt }

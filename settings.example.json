@@ -2,7 +2,19 @@
   "theme": "noctalia",
   "tuiMode": "fullscreen",
   "quietStartup": "header",
-  "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
+  "defaultTools": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "codemode"
+  ],
+  "codemode": {
+    "mode": "on"
+  },
   "compaction": {
     "enabled": true,
     "reserveTokens": 24000,

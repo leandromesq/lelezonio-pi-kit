@@ -393,11 +393,18 @@ function piLaunchArgs(
   // A narrowed profile (read-only or explicit `tools`) launches with a real
   // `--tools` allowlist that the CLI applies to built-in, extension, and
   // custom tools, so PowerShell and extension-backed execution tools cannot
-  // survive an incomplete exclusion universe. Herdr workers are never
-  // nesting-capable (nested children are always headless), so no spawn
-  // bridge is granted. The same policy feeds fresh launches and resumes.
+  // survive an incomplete exclusion universe. It also disables native MCP
+  // (`--no-mcp`) and excludes the MCP surface: `--tools` alone keeps `mcp__*`
+  // tools registered and codemode-callable unless an allowlist entry starts
+  // with `mcp__` (docs/cli.md), and an alternate MCP extension would bypass
+  // `--no-mcp`. Herdr workers are never nesting-capable (nested children are
+  // always headless), so no spawn bridge is granted. The same policy feeds
+  // fresh launches and resumes.
   const loadout = childToolLoadout(task.parent.toolPolicy);
-  if (loadout.tools) argv.push("--tools", [...loadout.tools].join(","));
+  if (loadout.tools) {
+    argv.push("--tools", [...loadout.tools].join(","));
+    argv.push("--no-mcp");
+  }
   if (loadout.exclude.length > 0)
     argv.push("--exclude-tools", [...loadout.exclude].join(","));
   return argv;

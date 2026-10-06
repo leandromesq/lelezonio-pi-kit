@@ -126,7 +126,7 @@ Run `/codex` to select an account. These are **Pi authentication snapshots**, no
 
 ## Pi 1.0 integration
 
-The CLI provides native MCP, codemode and deferred tool discovery. Full-surface SDK children explicitly load these built-ins; read-only/allowlisted SDK children do not connect native MCP. Configure servers in `mcp.json` deliberately — no server is added by the kit.
+Codemode is enabled in `on` mode alongside direct tool calls. The CLI provides native MCP and deferred tool discovery; full-surface SDK children explicitly load these built-ins. The `planner` and `reviewer` profiles also support codemode, restricted to their read/search allowlist. Narrowed SDK children load codemode alone when allowed, and narrowed Herdr workers disable native MCP. Configure servers in `mcp.json` deliberately — no server is added by the kit.
 
 Interactive/orchestrating tools such as `ask_user`, `workflow` and `subagent_*` are `model-only`: the model calls them directly, not through codemode scripts. Native `grep`/`find`/`ls` replace the archived file-search extension and return textual results. Browser tools remain direct and default-off; `/browser on` is required, and the opt-in follows the active history branch.
 
@@ -185,7 +185,10 @@ npm test
 npm run format:check
 ```
 
-Individual extensions also expose focused `check` and `test` scripts.
+Individual extensions also expose focused `check` and `test` scripts. Pi development
+packages are pinned to 1.0.4; keep them aligned with the installed runtime when upgrading.
+`npm run test:runtime` runs isolated SDK child smoke tests against the installed Pi rather
+than the local dependency. It is also part of `npm test`.
 
 To rebuild the bundled themes after editing the palette table:
 

@@ -20,7 +20,7 @@
 - Delegate per the subagents skill with a self-contained prompt (paths, constraints, context, and expected output). Use `planner` to design a future approach, `coder` for substantial implementation, and `reviewer` for independent evaluation of an existing plan, diff, or implementation. A `coder` should spawn a nested `reviewer` only for nontrivial changes where independent validation is materially useful.
 - Spawn up to 3 subagents in parallel only for genuinely independent tracks; this is a ceiling, not a target. While they run, continue useful review, planning, or integration work instead of idling. Use Herdr panes when the user wants to watch agents work side by side.
 - Keep critical review of delegated results before integrating. Never apply a subagent's output blindly — check it against the task first.
-- Profile routing (`subagents.json`): all named profiles run on the Pi harness and use `opencode-go/deepseek-v4.1-flash` (`planner`, `coder`, `reviewer`); profile-less spawns also default to the Pi harness and that model. The Codex harness keeps `gpt-5.6-luna` and is the only exception, reserved for subagents that call Codex CLI. Override the harness to Codex only when the task specifically requires Codex CLI or a capability genuinely unavailable in Pi. Pi 1.0 has native MCP; MCP alone is not a reason to choose Codex. SDK children load native built-ins explicitly only with a full tool surface; narrowed/read-only profiles must keep their callable-tool policy intact.
+- Profile routing (`subagents.json`): all named profiles run on the Pi harness and use `opencode-go/deepseek-v4.1-flash` (`planner`, `coder`, `reviewer`); profile-less spawns also default to the Pi harness and that model. The Codex harness keeps `gpt-5.6-luna` and is the only exception, reserved for subagents that call Codex CLI. Override the harness to Codex only when the task specifically requires Codex CLI or a capability genuinely unavailable in Pi. Pi 1.0 has native MCP; MCP alone is not a reason to choose Codex. Full-surface SDK children load native built-ins explicitly. Narrowed/read-only Pi profiles may opt into codemode through their tool allowlist, but must not connect native MCP; SDK and Herdr launches must preserve the same callable-tool restrictions.
 - This file overrides the herdr skill's "use only when explicitly mentioned" gating (that skill is installed externally from the herdr repo). Treat herdr as the default for visible side-by-side agents.
 
 ---
@@ -51,6 +51,7 @@
 # Verify after change
 
 - After any change, run the project's check/format/lint/test suite and report results. If none exists, say so and suggest adding one.
+- When updating Pi, align the kit's pinned development dependencies with the installed runtime and run `npm run test:runtime` as well as the local suite; never silently substitute the local SDK for the installed-runtime smoke test.
 
 ---
 

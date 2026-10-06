@@ -17,7 +17,8 @@
       "harness": "pi",
       "model": "opencode-go/deepseek-v4.1-flash",
       "thinking": "high",
-      "readOnly": true
+      "readOnly": true,
+      "tools": ["read", "grep", "find", "ls", "codemode"]
     },
     "coder": {
       "harness": "pi",
@@ -30,7 +31,8 @@
       "harness": "pi",
       "model": "opencode-go/deepseek-v4.1-flash",
       "thinking": "high",
-      "readOnly": true
+      "readOnly": true,
+      "tools": ["read", "grep", "find", "ls", "codemode"]
     }
   }
 }

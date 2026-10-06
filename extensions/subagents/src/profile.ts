@@ -42,6 +42,25 @@ export const CHILD_ORCHESTRATION_TOOLS = [
 /** Ask-the-orchestrator tool kept in every child, allowlist or default. */
 export const CHILD_ASK_TOOL = "ask_question";
 
+/**
+ * MCP tools a narrowed child must never reach, on BOTH launch paths.
+ *
+ * An explicit `tools` allowlist is not enough: Pi keeps `mcp__*` tools in the
+ * callable registry (and reachable from codemode scripts) unless an allowlist
+ * entry starts with `mcp__` (docs/cli.md). `mcp__*` covers server tools; the
+ * three resource tools are reached through their own names. Newer Pi matches
+ * these patterns in `tools`/`excludeTools`; under an exact-name-only matcher
+ * the allowlist already drops every tool that is not named. `--no-mcp` only
+ * disables NATIVE MCP, so these exclusions also cover alternate-registered MCP
+ * servers in a Herdr worker.
+ */
+export const CHILD_MCP_TOOL_EXCLUSIONS = [
+  "mcp__*",
+  "list_mcp_resources",
+  "list_mcp_resource_templates",
+  "read_mcp_resource",
+] as const;
+
 /** Nesting bridge kept only for genuinely nesting-capable children. */
 export const CHILD_NESTED_SPAWN_TOOL = "subagent_spawn";
 
@@ -65,7 +84,8 @@ export interface ChildToolLoadout {
    * built-in, extension-registered, or SDK custom. `undefined` keeps the
    * normal default surface minus `exclude`. */
   readonly tools?: readonly string[];
-  /** Names disabled after the allowlist/default surface is applied. */
+  /** Names/patterns disabled after the allowlist/default surface is applied.
+   * A narrowed child always excludes the MCP surface here. */
   readonly exclude: readonly string[];
 }
 
@@ -91,7 +111,10 @@ export function childToolLoadout(
   if (allowlist) {
     return {
       tools: [...new Set([...allowlist, CHILD_ASK_TOOL, ...nested])],
-      exclude: [],
+      // A narrowed child never reaches MCP, even when its allowlist names
+      // codemode: the exclusions remove native and alternate-registered MCP
+      // tools from the callable registry (see CHILD_MCP_TOOL_EXCLUSIONS).
+      exclude: [...CHILD_MCP_TOOL_EXCLUSIONS],
     };
   }
   return {

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import test from "node:test";
 import {
   createAgentSession,
+  createCodemodeExtension,
   DefaultResourceLoader,
   defineTool,
   ProjectTrustStore,
@@ -16,13 +17,20 @@ import { Type } from "typebox";
 import {
   bindChildSessionExtensions,
   CHILD_EXCLUDED_TOOL_NAMES,
+  childNativeExtensionFactories,
+  childNativeExtensionsFor,
   childToolPolicy,
   createChildResources,
+  FULL_CHILD_NATIVE_EXTENSIONS,
   resolveStandaloneChildProjectTrust,
   shutdownAndDisposeChildSession,
   withoutChildExcludedExtensions,
   type DisposableChildSession,
 } from "./child-session.ts";
+import {
+  CHILD_MCP_TOOL_EXCLUSIONS,
+  childToolLoadout,
+} from "../subagents/src/profile.ts";
 
 async function withTempDir(run: (directory: string) => Promise<void>) {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-child-policy-"));
@@ -40,6 +48,20 @@ async function pathExists(candidate: string) {
   } catch {
     return false;
   }
+}
+
+/** Poll until `check` is true or the deadline passes (process fixtures). */
+async function waitFor(
+  check: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+  label: string,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`timed out waiting for ${label}`);
 }
 
 test("child denylist keeps extension and workflow structured tools available", async () => {
@@ -486,6 +508,112 @@ test("native builtins are opt-in and register codemode plus tool_search", async 
       .extensions.flatMap((extension) => [...extension.tools.keys()]);
     assert.equal(nativeTools.includes("codemode"), true);
     assert.equal(nativeTools.includes("tool_search"), true);
+
+    // The factory selection is additive and independent: codemode can be
+    // requested without tool_search or MCP.
+    assert.deepEqual(FULL_CHILD_NATIVE_EXTENSIONS, {
+      codemode: true,
+      toolSearch: true,
+      mcp: true,
+    });
+    assert.equal(childNativeExtensionFactories({ codemode: true }).length, 1);
+    assert.equal(childNativeExtensionFactories({}).length, 0);
+    assert.equal(childNativeExtensionFactories().length, 3);
+  });
+});
+
+test("narrowed SDK children load codemode alone; full children keep MCP", async () => {
+  await withTempDir(async (directory) => {
+    const agentDir = path.join(directory, "agent");
+    const cwd = path.join(directory, "project");
+    await mkdir(cwd, { recursive: true });
+
+    // A narrowed profile that names codemode: exactly codemode, no
+    // tool_search and no MCP extension.
+    assert.deepEqual(
+      childNativeExtensionsFor({ tools: ["read", "codemode"] }),
+      {
+        codemode: true,
+        toolSearch: false,
+        mcp: false,
+      },
+    );
+    assert.deepEqual(childNativeExtensionsFor({ tools: ["read"] }), {
+      codemode: false,
+      toolSearch: false,
+      mcp: false,
+    });
+    // A full-surface child (no allowlist) keeps the whole native set.
+    assert.deepEqual(
+      childNativeExtensionsFor({ tools: undefined }),
+      FULL_CHILD_NATIVE_EXTENSIONS,
+    );
+
+    const narrowed = await createChildResources({
+      cwd,
+      agentDir,
+      projectTrusted: false,
+      nativeExtensions: childNativeExtensionsFor({
+        tools: ["read", "codemode"],
+      }),
+    });
+    const narrowedTools = narrowed.loader
+      .getExtensions()
+      .extensions.flatMap((extension) => [...extension.tools.keys()]);
+    assert.equal(narrowedTools.includes("codemode"), true);
+    assert.equal(narrowedTools.includes("tool_search"), false);
+    const narrowedSession = (
+      await createAgentSession({
+        cwd,
+        agentDir,
+        resourceLoader: narrowed.loader,
+        settingsManager: narrowed.settingsManager,
+        sessionManager: SessionManager.inMemory(directory),
+        tools: ["read", "codemode"],
+        excludeTools: [...CHILD_MCP_TOOL_EXCLUSIONS],
+      })
+    ).session;
+    try {
+      await bindChildSessionExtensions(narrowedSession);
+      // The MCP extension owns this handler; its absence is what guarantees no
+      // server process can start for a narrowed child.
+      assert.equal(
+        narrowedSession.extensionRunner.hasHandlers("mcp_servers_change"),
+        false,
+      );
+    } finally {
+      await shutdownAndDisposeChildSession(narrowedSession);
+    }
+
+    const full = await createChildResources({
+      cwd,
+      agentDir,
+      projectTrusted: false,
+      nativeExtensions: childNativeExtensionsFor({ tools: undefined }),
+    });
+    const fullTools = full.loader
+      .getExtensions()
+      .extensions.flatMap((extension) => [...extension.tools.keys()]);
+    assert.equal(fullTools.includes("codemode"), true);
+    assert.equal(fullTools.includes("tool_search"), true);
+    const fullSession = (
+      await createAgentSession({
+        cwd,
+        agentDir,
+        resourceLoader: full.loader,
+        settingsManager: full.settingsManager,
+        sessionManager: SessionManager.inMemory(directory),
+      })
+    ).session;
+    try {
+      await bindChildSessionExtensions(fullSession);
+      assert.equal(
+        fullSession.extensionRunner.hasHandlers("mcp_servers_change"),
+        true,
+      );
+    } finally {
+      await shutdownAndDisposeChildSession(fullSession);
+    }
   });
 });
 
@@ -555,5 +683,257 @@ test("script exposure never escapes the exclusion or allowlist", async () => {
     );
 
     await shutdownAndDisposeChildSession(session);
+  });
+});
+
+/** A minimal assistant message so codemode's nested calls have an issuer. */
+function fakeAssistantMessage() {
+  return {
+    role: "assistant",
+    content: [],
+    api: "test",
+    provider: "test",
+    model: "test",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  } as never;
+}
+
+function codemodeResultText(result: {
+  content: ReadonlyArray<{ type: string; text?: string }>;
+}) {
+  return result.content
+    .map((block) => (block.type === "text" ? (block.text ?? "") : ""))
+    .join("\n");
+}
+
+test("codemode executes allowlisted reads and denies every other surface", async () => {
+  await withTempDir(async (directory) => {
+    const agentDir = path.join(directory, "agent");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(path.join(directory, "sample.txt"), "hello codemode\n");
+    const loadout = childToolLoadout({ tools: ["read", "codemode"] });
+    const settingsManager = SettingsManager.inMemory(undefined, {
+      projectTrusted: false,
+    });
+    const loader = new DefaultResourceLoader({
+      cwd: directory,
+      agentDir,
+      settingsManager,
+      extensionFactories: [
+        createCodemodeExtension(),
+        (pi) => {
+          for (const [name, exposure] of [
+            ["fixture_extension_tool", "codemode"],
+            ["fixture_deferred", "deferred"],
+            // An alternate MCP server: `mcp__*` must not survive the narrowed
+            // allowlist even though native-MCP selection/`--no-mcp` only
+            // covers the built-in extension.
+            ["mcp__unauthorized", "codemode"],
+          ] as const) {
+            pi.registerTool({
+              name,
+              label: name,
+              description: name,
+              exposure,
+              parameters: Type.Object({}),
+              async execute() {
+                return {
+                  content: [{ type: "text", text: "should never run" }],
+                  details: {},
+                };
+              },
+            });
+          }
+        },
+      ],
+    });
+    await loader.reload();
+
+    const { session } = await createAgentSession({
+      cwd: directory,
+      agentDir,
+      resourceLoader: loader,
+      settingsManager,
+      sessionManager: SessionManager.inMemory(directory),
+      tools: [...loadout.tools!],
+      excludeTools: [...loadout.exclude],
+    });
+    try {
+      await bindChildSessionExtensions(session);
+
+      const callable = new Set(session.getCallableToolNames());
+      assert.equal(callable.has("read"), true);
+      // Denied by the allowlist/exclusion, not merely left inactive: these
+      // names are absent from the registry a codemode script can reach.
+      for (const denied of [
+        "write",
+        "bash",
+        "edit",
+        "fixture_extension_tool",
+        "fixture_deferred",
+        "mcp__unauthorized",
+      ]) {
+        assert.equal(
+          callable.has(denied),
+          false,
+          `${denied} must not be callable`,
+        );
+        assert.equal(
+          session.getAllTools().some((tool) => tool.name === denied),
+          false,
+          `${denied} must not be registered`,
+        );
+      }
+
+      // A fake assistant message gives nested calls their issuer; the nested
+      // tool pipeline, registry filter, and tool execution are the real ones.
+      session.state.messages.push(fakeAssistantMessage());
+      const codemode = session.getToolDefinition("codemode");
+      assert.ok(codemode, "codemode must be registered for this child");
+      const run = (code: string) =>
+        codemode.execute(
+          "cm-1",
+          { code },
+          undefined,
+          undefined,
+          session.extensionRunner.createToolContext("cm-1", undefined),
+        );
+
+      const ok = await run(
+        'const text = await tools.read({ path: "sample.txt" }); return text;',
+      );
+      assert.equal(ok.isError ?? false, false, codemodeResultText(ok));
+      assert.match(codemodeResultText(ok), /hello codemode/);
+
+      for (const [label, code] of [
+        ["write", 'await tools.write({ path: "x.txt", content: "nope" });'],
+        ["bash", 'await tools.bash({ command: "echo nope" });'],
+        ["extension", "await tools.fixture_extension_tool({});"],
+        ["deferred", "await tools.fixture_deferred({});"],
+        ["mcp", "await tools.mcp__unauthorized({});"],
+      ] as const) {
+        const denied = await run(code);
+        assert.equal(denied.isError, true, `${label} must be denied`);
+        assert.match(
+          codemodeResultText(denied),
+          /does not exist|not a function|not found/i,
+          `${label}: ${codemodeResultText(denied)}`,
+        );
+      }
+      // The denied write script never created its file.
+      assert.equal(await pathExists(path.join(directory, "x.txt")), false);
+    } finally {
+      await shutdownAndDisposeChildSession(session);
+    }
+  });
+});
+
+test("a narrowed child starts no configured MCP server process", async () => {
+  await withTempDir(async (directory) => {
+    const agentDir = path.join(directory, "agent");
+    await mkdir(agentDir, { recursive: true });
+    const marker = path.join(directory, "mcp-started");
+    // A fake stdio server: it writes a marker the instant it is spawned and
+    // then stays alive (self-exiting as a safety net), so a real connection
+    // attempt is observable without speaking MCP.
+    const serverScript =
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "started");` +
+      "process.stdin.resume();" +
+      "setTimeout(() => process.exit(0), 10000);";
+    await writeFile(
+      path.join(agentDir, "mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          fixture: { command: process.execPath, args: ["-e", serverScript] },
+        },
+      }),
+    );
+
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      const narrowed = await createChildResources({
+        cwd: directory,
+        agentDir,
+        projectTrusted: false,
+        nativeExtensions: childNativeExtensionsFor({
+          tools: ["read", "codemode"],
+        }),
+      });
+      const narrowedSession = (
+        await createAgentSession({
+          cwd: directory,
+          agentDir,
+          resourceLoader: narrowed.loader,
+          settingsManager: narrowed.settingsManager,
+          sessionManager: SessionManager.inMemory(directory),
+          tools: ["read", "codemode"],
+          excludeTools: [...CHILD_MCP_TOOL_EXCLUSIONS],
+        })
+      ).session;
+      try {
+        await bindChildSessionExtensions(narrowedSession);
+        assert.equal(
+          narrowedSession.extensionRunner.hasHandlers("mcp_servers_change"),
+          false,
+        );
+        // Give a would-be spawn ample time to write the marker.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        assert.equal(
+          await pathExists(marker),
+          false,
+          "a narrowed child must not start an MCP server",
+        );
+      } finally {
+        await shutdownAndDisposeChildSession(narrowedSession);
+      }
+
+      // Positive control: the same fixture DOES start for a full-surface
+      // child, so the assertion above cannot pass vacuously.
+      const full = await createChildResources({
+        cwd: directory,
+        agentDir,
+        projectTrusted: false,
+        nativeBuiltins: true,
+      });
+      const fullSession = (
+        await createAgentSession({
+          cwd: directory,
+          agentDir,
+          resourceLoader: full.loader,
+          settingsManager: full.settingsManager,
+          sessionManager: SessionManager.inMemory(directory),
+        })
+      ).session;
+      try {
+        await bindChildSessionExtensions(fullSession);
+        assert.equal(
+          fullSession.extensionRunner.hasHandlers("mcp_servers_change"),
+          true,
+        );
+        await waitFor(
+          () => pathExists(marker),
+          5000,
+          "full-surface child to start the configured MCP server",
+        );
+      } finally {
+        await shutdownAndDisposeChildSession(fullSession);
+      }
+    } finally {
+      if (previousAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+    }
   });
 });

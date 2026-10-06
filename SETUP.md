@@ -208,9 +208,9 @@ Snapshots are stored under `~/.pi/agent/codex-accounts/`, or the configured `PI_
 
 Pi 1.0 supports MCP without Codex CLI or an external MCP adapter. Configure user servers in `~/.pi/agent/mcp.json` and trusted-project servers in `.pi/mcp.json`; use `/mcp` for status and authentication. No MCP server is created by this kit.
 
-The CLI loads native MCP/codemode/tool-search built-ins. Full-surface in-process subagents and workflow children explicitly add the same built-ins; narrowed/read-only SDK profiles omit them. Server tools still obey the session's callable-tool restrictions and project trust. Do not use removal from the active set as a security boundary for `codemode`/`deferred` tools.
+The CLI loads native MCP/codemode/tool-search built-ins. Full-surface in-process subagents and workflow children explicitly add the same built-ins. Narrowed SDK profiles load codemode alone when their tool allowlist includes it; narrowed Herdr workers disable native MCP with `--no-mcp`. Do not use removal from the active set as a security boundary for `codemode`/`deferred` tools: the session's callable-tool allowlist must exclude unauthorized extension tools too.
 
-Codemode is opt-in unless a configured MCP server activates it. Add `"codemode"` to your existing `defaultTools` list, or use `["+codemode"]` when inheriting defaults. Keep the other tools you need. `ask_user`, `workflow` and `subagent_*` stay model-only and are invoked directly, never inside a script. Browser tools remain default-off behind `/browser on` and follow the current history branch.
+This setup enables codemode with `codemode.mode: "on"`, retaining direct tool calls alongside scripts. Private settings use `"defaultTools": ["+grep", "+find", "+ls", "+codemode"]` to add native search and codemode while preserving inherited defaults; the example settings include it in their explicit tool list. The `planner` and `reviewer` profiles allow only `read`, `grep`, `find`, `ls`, and `codemode` (plus their model-only clarification tool), without shell, mutation tools, or native MCP. Codemode is a tool-composition sandbox, not an OS security sandbox. `ask_user`, `workflow` and `subagent_*` stay model-only and are invoked directly, never inside a script. Browser tools remain default-off behind `/browser on` and follow the current history branch.
 
 ## Remote agents
 
@@ -429,3 +429,20 @@ npm run check
 npm test
 npm run format:check
 ```
+
+The Pi development dependencies are pinned to 1.0.4, matching the current installed runtime.
+When updating Pi, align these versions and the lockfile, then run both the local suite and
+`npm run test:runtime`. The installed-runtime smoke test is also included in `npm test`;
+it exercises isolated child lifecycle, native-extension loading, and callable-tool restrictions
+without real model requests or personal credentials. Detection scans the `pi` launchers on
+`PATH`, skipping this repository's local SDK even when npm prepends `node_modules/.bin`.
+Set `PI_INSTALLED_RUNTIME_PATH` to the installed package directory for custom or Windows
+installations. If no importable installed SDK is available, the smoke test explicitly skips;
+set `PI_INSTALLED_RUNTIME_REQUIRED=1` in CI to fail instead. An invalid explicit path fails.
+
+```sh
+PI_INSTALLED_RUNTIME_REQUIRED=1 npm run test:runtime
+```
+
+The subprocess runs offline in a temporary agent directory, with a 60-second deadline.
+No change to project trust is required; personal `defaultProjectTrust` remains `"always"`.

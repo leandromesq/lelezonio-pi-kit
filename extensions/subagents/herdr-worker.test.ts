@@ -1517,6 +1517,27 @@ test("pi launch: read-only profiles get a real --tools allowlist on fresh AND re
         `${blocked} must be denied`,
       );
     }
+    // Narrowed workers disable native MCP AND remove the MCP surface from the
+    // callable registry: `--tools` alone keeps `mcp__*` callable from codemode
+    // scripts, and `--no-mcp` does not disable alternate MCP extensions.
+    assert.ok(
+      argv.includes("--no-mcp"),
+      `--no-mcp missing from ${argv.join(" ")}`,
+    );
+    const excludeIndex = argv.indexOf("--exclude-tools");
+    assert.ok(
+      excludeIndex >= 0,
+      `--exclude-tools missing from ${argv.join(" ")}`,
+    );
+    const denied = argv[excludeIndex + 1].split(",");
+    for (const mcp of [
+      "mcp__*",
+      "list_mcp_resources",
+      "list_mcp_resource_templates",
+      "read_mcp_resource",
+    ]) {
+      assert.ok(denied.includes(mcp), `${mcp} must be excluded`);
+    }
   }
   // Fresh launch and resume carry the exact same tool policy.
   assert.deepEqual(toolPolicyArgs(fresh.argv), toolPolicyArgs(resume));
@@ -1542,7 +1563,16 @@ test("pi launch: custom tools profiles also launch with an allowlist on fresh AN
       "git_status",
       "ask_question",
     ]);
-    assert.equal(argv.includes("--exclude-tools"), false);
+    assert.ok(
+      argv.includes("--no-mcp"),
+      `--no-mcp missing from ${argv.join(" ")}`,
+    );
+    const excludeIndex = argv.indexOf("--exclude-tools");
+    assert.ok(
+      excludeIndex >= 0,
+      `--exclude-tools missing from ${argv.join(" ")}`,
+    );
+    assert.equal(argv[excludeIndex + 1].split(",").includes("mcp__*"), true);
   }
   assert.deepEqual(toolPolicyArgs(fresh.argv), toolPolicyArgs(resume));
 });
@@ -1578,6 +1608,15 @@ test("pi launch: a normal coder keeps the default surface plus the orchestration
     // The child keeps its one orchestration channel and its full coder tools.
     assert.equal(denied.includes("ask_question"), false);
     assert.equal(denied.includes("powershell"), false);
+    // A full-surface coder keeps native MCP: no `--no-mcp`, and the MCP
+    // surface is not excluded.
+    assert.equal(
+      argv.includes("--no-mcp"),
+      false,
+      "the default surface must keep native MCP",
+    );
+    assert.equal(denied.includes("mcp__*"), false);
+    assert.equal(denied.includes("list_mcp_resources"), false);
   }
   assert.deepEqual(toolPolicyArgs(fresh.argv), toolPolicyArgs(resume));
 });
