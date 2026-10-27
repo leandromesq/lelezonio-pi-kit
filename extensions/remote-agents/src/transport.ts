@@ -10,6 +10,32 @@ function shellQuote(value: string) {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
 }
 
+const NIX_PROFILE_BIN = "/etc/profiles/per-user/$(id -un)/bin";
+const LEGACY_BIN = "$HOME/.local/bin";
+
+/**
+ * POSIX prologue for the remote helper's tool path.
+ *
+ * On NixOS the user profile is authoritative and ahead of the legacy
+ * `~/.local/bin` copy; elsewhere the legacy directory is the only portable
+ * fallback. Kept as a separate function so the ordering can be tested against
+ * fixture directories.
+ */
+export function remoteToolPathPrologue(
+  profileBin = NIX_PROFILE_BIN,
+  legacyBin = LEGACY_BIN,
+) {
+  return [
+    `nix_bin="${profileBin}"`,
+    `legacy_bin="${legacyBin}"`,
+    'if [ -d "$nix_bin" ]; then',
+    '  export PATH="$nix_bin:$legacy_bin:$PATH"',
+    "else",
+    '  export PATH="$legacy_bin:$PATH"',
+    "fi",
+  ].join("\n");
+}
+
 interface ExecuteOptions {
   readonly input?: string;
   readonly signal?: AbortSignal;
@@ -108,13 +134,13 @@ export class SshTransport {
   }
 
   /**
-   * The command that runs the remote helper with the homelab `herdr` on PATH.
+   * The command that runs the remote helper with the host's tool path.
    * Shared by the install handshake and every follow-up request: both go
    * through the login shell, so both must be routed through `sh`.
    */
   private helperCommand() {
     return this.posix(
-      `export PATH="$HOME/.local/bin:$PATH"; exec python3 ${shellQuote(this.config.remoteHelper)}`,
+      `${remoteToolPathPrologue()}; exec python3 ${shellQuote(this.config.remoteHelper)}`,
     );
   }
 

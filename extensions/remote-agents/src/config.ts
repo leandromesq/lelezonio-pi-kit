@@ -25,7 +25,7 @@ export function defaultRemoteAgentsConfig(): RemoteAgentsConfig {
     openRemoteUiOnSpawn: true,
     terminalExecutable: "kitty",
     pollIntervalMs: 3_000,
-    maxConcurrent: 3,
+    maxConcurrent: 2,
   };
 }
 

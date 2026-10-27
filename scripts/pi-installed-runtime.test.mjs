@@ -15,7 +15,14 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -125,6 +132,77 @@ function sanitizeChildEnv(overrides) {
   }
   return env;
 }
+
+test(
+  "resolver honors Nix/Home Manager wrappers before old npm launchers",
+  { skip: process.platform === "win32" },
+  async () => {
+    await withTempDir(async (directory) => {
+      const prefix = path.join(directory, "nix-output");
+      const packageRoot = path.join(
+        prefix,
+        "lib",
+        "node_modules",
+        "pi-monorepo",
+      );
+      await writeFakePiPackage(packageRoot, "1.3.0");
+      const wrapper = path.join(prefix, "bin", "pi");
+      await mkdir(path.dirname(wrapper), { recursive: true });
+      await writeFile(
+        wrapper,
+        "#!/bin/sh\nexit 55 # Must not execute launchers\n",
+      );
+      const profileBin = path.join(directory, "profile", "bin");
+      await mkdir(profileBin, { recursive: true });
+      await symlink(wrapper, path.join(profileBin, "pi"));
+      const oldBin = path.join(directory, "old", "bin");
+      await writeFakePiPackage(
+        packageUnder(path.join(directory, "old")),
+        "0.84.3",
+      );
+      await writePiShim(path.join(oldBin, "pi"), `../node_modules/${CLI_TAIL}`);
+      const resolve = (projectDir) =>
+        findInstalledRuntime({
+          env: { PATH: [profileBin, oldBin].join(":") },
+          platform: "linux",
+          projectRoot: projectDir,
+        });
+      const result = resolve(path.join(directory, "project"));
+      assert.equal(result.ok, true);
+      assert.equal(result.version, "1.3.0");
+      assert.equal(result.packageRoot, packageRoot);
+      assert.equal(result.source, `path:${path.join(profileBin, "pi")}`);
+
+      // A Nix-shaped layout under the project's node_modules is still local.
+      const localProject = path.join(directory, "local-project");
+      const localPrefix = path.join(localProject, "node_modules", "nix-output");
+      const localRoot = path.join(
+        localPrefix,
+        "lib",
+        "node_modules",
+        "pi-monorepo",
+      );
+      await writeFakePiPackage(localRoot);
+      await mkdir(path.join(localPrefix, "bin"), { recursive: true });
+      await writeFile(
+        path.join(localPrefix, "bin", "pi"),
+        "#!/bin/sh\nexit 55\n",
+      );
+      const local = findInstalledRuntime({
+        env: { PATH: path.join(localPrefix, "bin") },
+        platform: "linux",
+        projectRoot: localProject,
+      });
+      assert.equal(local.ok, false);
+      assert.deepEqual(local.localCandidates, [localRoot]);
+      await writeFile(
+        path.join(packageRoot, "package.json"),
+        JSON.stringify({ name: "not-pi", version: "1.3.0" }),
+      );
+      assert.equal(resolve(directory).version, "0.84.3");
+    });
+  },
+);
 
 test("resolver rejects bad input and never picks the local .bin", async () => {
   await withTempDir(async (directory) => {

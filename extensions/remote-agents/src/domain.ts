@@ -34,6 +34,13 @@ export interface RemoteAgentSnapshot {
   readonly generation: number;
   readonly promptBaselineSeq?: number;
   readonly promptObservedActivity?: boolean;
+  /** Digest of the exact prompt text for the current generation and the
+   * session line cursor recorded before it was sent. Together they bind a
+   * result to this prompt instead of the latest recorded user message. */
+  readonly promptDigest?: string;
+  /** Random marker embedded in the sent prompt: the authoritative binding. */
+  readonly promptMarker?: string;
+  readonly promptCursor?: number;
   readonly resultMissingSince?: number;
   readonly cancelRequested?: boolean;
   /** Legacy shared delivery flag, kept for older registries and the in-process

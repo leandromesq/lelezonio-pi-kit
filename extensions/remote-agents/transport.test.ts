@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import type { RemoteAgentsConfig } from "./src/config.ts";
-import { SshTransport } from "./src/transport.ts";
+import { remoteToolPathPrologue, SshTransport } from "./src/transport.ts";
 
 /**
  * `ssh host <command>` runs that command through the account's login shell,
@@ -32,9 +33,11 @@ test(
       ssh,
       [
         "#!/bin/sh",
-        // The remote command is the last argv element; log only that.
+        // The remote command is the last argv element; log only that. Keep it
+        // on one line so multi-line scripts still count as one SSH invocation.
         "for last; do :; done",
-        'printf "%s\\n" "$last" >> "$FAKE_SSH_LOG"',
+        'printf "%s\\n" "$last" | tr "\\n" " " >> "$FAKE_SSH_LOG"',
+        'printf "\\n" >> "$FAKE_SSH_LOG"',
         // Drain the payload the transport pipes to stdin.
         "cat > /dev/null",
         'n=$(wc -l < "$FAKE_SSH_LOG")',
@@ -82,9 +85,60 @@ test(
       // Both the install ping and the follow-up request run the helper.
       assert.match(commands[1]!, /exec python3/);
       assert.match(commands[2]!, /exec python3/);
+      // The helper must resolve Nix-profile tools before the legacy copy.
+      for (const command of [commands[1]!, commands[2]!]) {
+        assert.match(command, /\/etc\/profiles\/per-user\/\$\(id -un\)\/bin/);
+        assert.ok(
+          command.indexOf("/etc/profiles") <
+            command.indexOf("$HOME/.local/bin"),
+          `Nix profile is not ahead of the legacy bin directory: ${command}`,
+        );
+      }
     } finally {
       if (previousLog === undefined) delete process.env.FAKE_SSH_LOG;
       else process.env.FAKE_SSH_LOG = previousLog;
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "remote tool path prefers an existing Nix profile and falls back portably",
+  {
+    skip:
+      process.platform === "win32"
+        ? "Requires a POSIX shebang executable fixture"
+        : false,
+  },
+  () => {
+    const directory = fs.mkdtempSync(
+      path.join(os.tmpdir(), "remote-transport-path-test-"),
+    );
+    const profileBin = path.join(directory, "profile", "bin");
+    const legacyBin = path.join(directory, "legacy", "bin");
+    fs.mkdirSync(profileBin, { recursive: true });
+    fs.mkdirSync(legacyBin, { recursive: true });
+    for (const bin of [profileBin, legacyBin]) {
+      const tool = path.join(bin, "python3");
+      fs.writeFileSync(tool, "#!/bin/sh\nexit 0\n");
+      fs.chmodSync(tool, 0o700);
+    }
+    const resolve = (profile: string) =>
+      execFileSync(
+        "sh",
+        [
+          "-c",
+          `${remoteToolPathPrologue(profile, legacyBin)}; command -v python3`,
+        ],
+        { encoding: "utf8" },
+      ).trim();
+    try {
+      assert.equal(resolve(profileBin), path.join(profileBin, "python3"));
+      assert.equal(
+        resolve(path.join(directory, "absent-profile", "bin")),
+        path.join(legacyBin, "python3"),
+      );
+    } finally {
       fs.rmSync(directory, { recursive: true, force: true });
     }
   },

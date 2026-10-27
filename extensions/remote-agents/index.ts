@@ -24,7 +24,7 @@ import {
   redactSensitiveText,
 } from "./src/context.ts";
 import { isRemoteAgentActive, type RemoteAgentSnapshot } from "./src/domain.ts";
-import { HerdrClient } from "./src/herdr-client.ts";
+import { HerdrClient, type RemotePreflight } from "./src/herdr-client.ts";
 import { RemoteAgentManager } from "./src/manager.ts";
 import { RemoteJobStore } from "./src/persistence.ts";
 import { detectLocalGitProject, remoteProjectLocation } from "./src/project.ts";
@@ -75,6 +75,27 @@ function completionMessage(snapshot: RemoteAgentSnapshot) {
     "(no result captured)";
   const heading = structured ? "Remote result" : "Remote transcript tail";
   return `Remote agent ${snapshot.id} "${snapshot.title}" ${snapshot.status} after ${formatElapsed(snapshot.createdAt, snapshot.settledAt)}.\nWorkspace: ${snapshot.host}:${snapshot.remoteCwd}${snapshot.workspaceId ? ` (${snapshot.workspaceId})` : ""}\n\n## ${heading}\n\n${output}`;
+}
+
+function describePreflight(report: RemotePreflight) {
+  const tool = (
+    label: string,
+    info: { path: string; version?: string } | null | undefined,
+    missing = "missing",
+  ) =>
+    info
+      ? `${label} ${info.version ?? "unknown"} (${info.path})`
+      : `${label} ${missing}`;
+  const server = report.server
+    ? `server ${report.server.running ? "running" : "not running"}${report.server.version ? ` ${report.server.version}` : ""}`
+    : "server unknown";
+  return [
+    tool("python", report.python, "unknown"),
+    tool("pi", report.pi),
+    tool("herdr", report.herdr),
+    server,
+    `cwd ${report.cwd}`,
+  ].join(" · ");
 }
 
 /**
@@ -546,6 +567,23 @@ export default function (pi: ExtensionAPI) {
     prepared: Awaited<ReturnType<typeof prepareRemote>>,
     ctx: ExtensionContext,
   ) => {
+    // Read-only preflight before the workspace exists: report the environment
+    // the job will actually use (resolved paths and server health, no env
+    // dump), and never reject a spawn on a version mismatch.
+    const preflight = await prepared.remote
+      .preflight(prepared.spawn.signal)
+      .catch((error) => {
+        ctx.ui.notify(
+          `Remote preflight unavailable: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
+        return undefined;
+      });
+    if (preflight)
+      ctx.ui.notify(
+        `Remote preflight: ${describePreflight(preflight)}`,
+        "info",
+      );
     const snapshot = await prepared.remote.spawn(prepared.spawn);
     await openRemoteWindow(snapshot, ctx);
     return snapshot;

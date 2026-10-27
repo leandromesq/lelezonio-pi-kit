@@ -2,11 +2,13 @@ import { randomBytes } from "node:crypto";
 import type { RemoteAgentsConfig } from "./config.ts";
 import type { RemoteAgentSnapshot, RemoteAgentStatus } from "./domain.ts";
 import { isRemoteAgentActive } from "./domain.ts";
-import type { HerdrAgent, HerdrClient } from "./herdr-client.ts";
+import type { HerdrAgent, HerdrClient, RemoteResult } from "./herdr-client.ts";
 import type { DeliveryKind, RemoteJobStore } from "./persistence.ts";
+import { redactSensitiveText } from "../../shared/sensitive-text.ts";
 
 const TRANSCRIPT_MAX_CHARS = 256 * 1024;
 const FINAL_TEXT_MAX_CHARS = 64 * 1024;
+const RESULT_ERROR_MAX_CHARS = 2_000;
 const RESULT_GRACE_MS = 120_000;
 
 interface MutableSnapshot {
@@ -33,6 +35,9 @@ interface MutableSnapshot {
   generation: number;
   promptBaselineSeq?: number;
   promptObservedActivity?: boolean;
+  promptDigest?: string;
+  promptMarker?: string;
+  promptCursor?: number;
   resultMissingSince?: number;
   cancelRequested?: boolean;
   completionDelivered?: boolean;
@@ -93,6 +98,7 @@ export class RemoteAgentManager {
     | "get"
     | "read"
     | "result"
+    | "preflight"
     | "pathInfo"
     | "cloneProject"
     | "prompt"
@@ -133,6 +139,7 @@ export class RemoteAgentManager {
       | "get"
       | "read"
       | "result"
+      | "preflight"
       | "pathInfo"
       | "cloneProject"
       | "prompt"
@@ -198,6 +205,10 @@ export class RemoteAgentManager {
     );
   }
 
+  preflight(signal?: AbortSignal) {
+    return this.client.preflight(signal);
+  }
+
   async spawn(options: {
     title: string;
     prompt: string;
@@ -261,6 +272,9 @@ export class RemoteAgentManager {
       snapshot.workspaceId = started.workspaceId;
       snapshot.paneId = started.paneId;
       snapshot.promptBaselineSeq = started.prompted.agent.state_change_seq;
+      snapshot.promptDigest = started.promptDigest;
+      snapshot.promptMarker = started.promptMarker;
+      snapshot.promptCursor = started.promptCursor ?? undefined;
       snapshot.promptObservedActivity =
         started.prompted.agent.agent_status === "working" ||
         started.prompted.agent.agent_status === "blocked" ||
@@ -295,52 +309,23 @@ export class RemoteAgentManager {
     options: { transcript?: boolean; signal?: AbortSignal } = {},
   ) {
     const snapshot = this.require(id);
+    const generation = snapshot.generation;
     try {
       const agent = await this.client.get(snapshot.name, options.signal);
+      if (snapshot.generation !== generation)
+        return snapshot as RemoteAgentSnapshot;
       this.applyAgent(snapshot, agent);
       if (options.transcript) {
-        const transcript = await this.client.read(
-          snapshot.name,
-          400,
-          options.signal,
-        );
-        snapshot.transcript = transcript.slice(-TRANSCRIPT_MAX_CHARS);
-        snapshot.transcriptVersion++;
-        if (snapshot.status === "done" || snapshot.status === "blocked") {
-          const structured = await this.client
-            .result(snapshot.name, options.signal)
-            .catch(() => undefined);
-          if (structured?.text) {
-            snapshot.finalText = structured.text.slice(-FINAL_TEXT_MAX_CHARS);
-            snapshot.sessionPath = structured.sessionPath;
-            snapshot.resultMissingSince = undefined;
-          } else if (
-            snapshot.status === "done" &&
-            !snapshot.promptObservedActivity
-          ) {
-            snapshot.resultMissingSince ??= Date.now();
-            if (Date.now() - snapshot.resultMissingSince < RESULT_GRACE_MS) {
-              // Pi can briefly appear idle/done while its startup prompt is
-              // still queued. Once activity was observed, Herdr's settled
-              // state is authoritative even when it omits agent_session.
-              snapshot.status = "working";
-              snapshot.settledAt = undefined;
-            } else {
-              snapshot.status = "failed";
-              snapshot.errorText =
-                "Remote agent settled without producing an assistant result";
-            }
-          } else {
-            // Herdr versions that do not expose agent_session cannot provide a
-            // structured result. Keep the settled state and use the captured
-            // terminal transcript as the completion fallback.
-            snapshot.resultMissingSince = undefined;
-          }
-        }
+        await this.collectTranscript(snapshot, options.signal, generation);
+        if (snapshot.generation !== generation)
+          return snapshot as RemoteAgentSnapshot;
+        await this.collectResult(snapshot, options.signal, generation);
       }
       this.changed(id);
       return snapshot as RemoteAgentSnapshot;
     } catch (error) {
+      if (snapshot.generation !== generation)
+        return snapshot as RemoteAgentSnapshot;
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes("agent_not_found")) {
         const wasActive = isRemoteAgentActive(snapshot.status);
@@ -351,7 +336,9 @@ export class RemoteAgentManager {
         this.changed(id);
         return snapshot as RemoteAgentSnapshot;
       }
-      if (isRemoteAgentActive(snapshot.status)) {
+      // A failed refresh cannot verify a settled result: never leave the job
+      // `done`/`blocked` with possibly stale output, and never settle it.
+      if (snapshot.status !== "failed" && snapshot.status !== "cancelled") {
         snapshot.status = "unreachable";
         snapshot.errorText = message;
         this.changed(id);
@@ -360,11 +347,144 @@ export class RemoteAgentManager {
     }
   }
 
+  /**
+   * Best-effort terminal capture. Herdr refuses `recent-unwrapped` history
+   * while an alternate-screen agent is busy (`agent_not_idle`); the helper
+   * falls back to the visible screen for that one error. Only that busy error
+   * is tolerated here: any other read failure (SSH loss, helper failure, a
+   * vanished agent) propagates so `refresh` classifies the job instead of
+   * masking it as healthy.
+   */
+  private async collectTranscript(
+    snapshot: MutableSnapshot,
+    signal?: AbortSignal,
+    generation = snapshot.generation,
+  ) {
+    try {
+      const transcript = await this.client.read(snapshot.name, 400, signal);
+      if (snapshot.generation !== generation) return;
+      snapshot.transcript = transcript.slice(-TRANSCRIPT_MAX_CHARS);
+      snapshot.transcriptVersion++;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("agent_not_idle")) return;
+      throw error;
+    }
+  }
+
+  /**
+   * Resolve the answer bound to the current generation's prompt and classify
+   * how it ended. A session that does not yet hold the anchored prompt or its
+   * finalized answer is `pending`: the manager keeps the run open (and fails it
+   * after the grace window) instead of accepting stale terminal output. Only a
+   * genuinely older Herdr without a session path, or a job persisted before
+   * prompt anchors existed, may use the terminal transcript as its fallback.
+   */
+  private async collectResult(
+    snapshot: MutableSnapshot,
+    signal?: AbortSignal,
+    generation = snapshot.generation,
+  ) {
+    if (snapshot.status !== "done" && snapshot.status !== "blocked") return;
+    if (!snapshot.promptMarker && !snapshot.promptDigest) {
+      // Legacy pre-anchor job: never claim an extracted result that could
+      // belong to an earlier submission.
+      snapshot.finalText = undefined;
+      snapshot.resultMissingSince = undefined;
+      return;
+    }
+    let structured: RemoteResult | undefined;
+    try {
+      structured = await this.client.result(snapshot.name, signal, {
+        promptDigest: snapshot.promptDigest,
+        promptMarker: snapshot.promptMarker,
+        promptCursor: snapshot.promptCursor,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (snapshot.generation !== generation) return;
+      if (message.includes("does not expose a Pi session path")) {
+        // Older Herdr cannot provide a structured result; the captured terminal
+        // transcript remains the documented completion fallback.
+        snapshot.resultMissingSince = undefined;
+        return;
+      }
+      throw error;
+    }
+    if (snapshot.generation !== generation) return;
+    if (structured?.sessionPath) snapshot.sessionPath = structured.sessionPath;
+    if (structured?.status === "pending") {
+      this.awaitBoundResult(snapshot);
+      return;
+    }
+    const outcome = structured?.status ?? (structured?.text ? "ok" : undefined);
+    if (
+      outcome === "error" ||
+      outcome === "aborted" ||
+      outcome === "truncated"
+    ) {
+      snapshot.resultMissingSince = undefined;
+      snapshot.finalText = undefined;
+      // A blocked job keeps its clarification behavior and falls back to the
+      // terminal transcript. Only a settled turn becomes a failure.
+      if (snapshot.status === "done") {
+        const cancelled = outcome === "aborted" && snapshot.cancelRequested;
+        snapshot.status = cancelled ? "cancelled" : "failed";
+        snapshot.settledAt ??= Date.now();
+        snapshot.errorText = this.resultFailureText(outcome, structured);
+      }
+      return;
+    }
+    if (structured?.text) {
+      snapshot.finalText = structured.text.slice(-FINAL_TEXT_MAX_CHARS);
+      snapshot.resultMissingSince = undefined;
+      return;
+    }
+    // A payload without a usable answer is still an unbound submission, not a
+    // success with a terminal fallback.
+    this.awaitBoundResult(snapshot);
+  }
+
+  /** Keep a settled-but-unbound run open, then fail it after the grace window. */
+  private awaitBoundResult(snapshot: MutableSnapshot) {
+    snapshot.finalText = undefined;
+    if (snapshot.status === "blocked") return;
+    snapshot.resultMissingSince ??= Date.now();
+    if (Date.now() - snapshot.resultMissingSince < RESULT_GRACE_MS) {
+      snapshot.status = "working";
+      snapshot.settledAt = undefined;
+      return;
+    }
+    snapshot.status = "failed";
+    snapshot.settledAt ??= Date.now();
+    snapshot.errorText =
+      "Remote agent settled without a bound assistant result for the current prompt";
+  }
+
+  private resultFailureText(
+    outcome: "error" | "aborted" | "truncated",
+    result: RemoteResult,
+  ) {
+    const reason = result.stopReason ? ` (${result.stopReason})` : "";
+    const detail = result.errorMessage
+      ? `: ${redactSensitiveText(result.errorMessage).slice(0, RESULT_ERROR_MAX_CHARS)}`
+      : "";
+    if (outcome === "truncated") {
+      return `Remote Pi turn was truncated by its output-token limit${reason}${detail}`;
+    }
+    return outcome === "error"
+      ? `Remote Pi turn failed${reason}${detail}`
+      : `Remote Pi turn was aborted${reason}${detail}`;
+  }
+
   async send(id: string, text: string, signal?: AbortSignal) {
     const snapshot = this.require(id);
     if (!text.trim()) throw new Error("Follow-up message must not be empty");
     const prompted = await this.client.prompt(snapshot.name, text, signal);
     snapshot.promptBaselineSeq = prompted.agent.state_change_seq;
+    snapshot.promptDigest = prompted.promptDigest;
+    snapshot.promptMarker = prompted.promptMarker;
+    snapshot.promptCursor = prompted.promptCursor ?? undefined;
     snapshot.promptObservedActivity =
       prompted.agent.agent_status === "working" ||
       prompted.agent.agent_status === "blocked" ||
@@ -406,8 +526,15 @@ export class RemoteAgentManager {
         if (
           snapshot.status === "blocked" ||
           !isRemoteAgentActive(snapshot.status)
-        )
-          return this.refresh(id, { transcript: true, signal });
+        ) {
+          const final = await this.refresh(id, { transcript: true, signal });
+          // Herdr can become idle before this submission's answer is flushed.
+          // Result validation may put it back into working: keep waiting and
+          // never let remote_wait mark that pending generation delivered.
+          if (final.status === "blocked" || !isRemoteAgentActive(final.status))
+            return final;
+        }
+        if (signal?.aborted) throw new Error("Remote wait was aborted");
         await new Promise<void>((resolve, reject) => {
           const abort = () => {
             clearTimeout(timer);

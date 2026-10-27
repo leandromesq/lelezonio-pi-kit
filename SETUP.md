@@ -6,7 +6,7 @@ Lelezonio Pi Kit is installed as the Pi agent directory itself. Do not install i
 
 Required:
 
-- [Pi](https://github.com/earendil-works/pi) 1.0
+- [Pi](https://github.com/earendil-works/pi) 1.3.0
 - Git
 - Node.js 22.19 or newer
 - A Bash-compatible shell available to Pi
@@ -430,12 +430,14 @@ npm test
 npm run format:check
 ```
 
-The Pi development dependencies are pinned to 1.0.4, matching the current installed runtime.
+The Pi development dependencies are pinned to 1.3.0, matching the current installed runtime.
 When updating Pi, align these versions and the lockfile, then run both the local suite and
 `npm run test:runtime`. The installed-runtime smoke test is also included in `npm test`;
 it exercises isolated child lifecycle, native-extension loading, and callable-tool restrictions
 without real model requests or personal credentials. Detection scans the `pi` launchers on
 `PATH`, skipping this repository's local SDK even when npm prepends `node_modules/.bin`.
+Nix/Home Manager wrappers resolve through their canonical store prefix to the packaged SDK,
+so a later legacy npm launcher cannot silently replace the earlier Nix runtime on `PATH`.
 Set `PI_INSTALLED_RUNTIME_PATH` to the installed package directory for custom or Windows
 installations. If no importable installed SDK is available, the smoke test explicitly skips;
 set `PI_INSTALLED_RUNTIME_REQUIRED=1` in CI to fail instead. An invalid explicit path fails.

@@ -30,6 +30,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    // Pi 1.3 also starts runs from custom messages, which have no user prompt.
+    // Ignore them before consuming the one-time naming opportunity.
+    if (!("prompt" in event)) return;
+
     // Print/JSON child sessions either have no useful selector or already
     // receive an explicit name from their owning integration.
     if (ctx.mode === "print" || ctx.mode === "json") return;

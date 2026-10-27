@@ -37,6 +37,9 @@ const config: RemoteAgentsConfig = {
   maxConcurrent: 3,
 };
 
+/** Minimal preflight used by every fake client; spawn tests do not inspect it. */
+const preflight = async () => ({ cwd: "/remote" });
+
 test("manager redelivers an undelivered completion recovered after restart", async () => {
   const directory = fs.mkdtempSync(
     path.join(os.tmpdir(), "remote-manager-recovery-test-"),
@@ -63,6 +66,7 @@ test("manager redelivers an undelivered completion recovered after restart", asy
     },
   ]);
   const client = {
+    preflight,
     async start() {
       throw new Error("not used");
     },
@@ -126,6 +130,7 @@ test("missing remote workspaces can still be forgotten and cleaned", async () =>
   }));
   store.save(snapshots);
   const client = {
+    preflight,
     async start() {
       throw new Error("not used");
     },
@@ -197,6 +202,7 @@ test("a job whose host is unreachable can still be forgotten", async () => {
     })),
   );
   const client = {
+    preflight,
     async start() {
       throw new Error("not used");
     },
@@ -262,6 +268,7 @@ test("manager does not settle on the unchanged idle state before a prompt starts
   let current = agent("", "idle", 10);
   let resultAvailable = false;
   const client = {
+    preflight,
     async start(options: { name: string }) {
       current = agent(options.name, "idle", 10);
       return {
@@ -269,6 +276,7 @@ test("manager does not settle on the unchanged idle state before a prompt starts
         paneId: "w3:p1",
         agent: current,
         prompted: { agent: current },
+        promptDigest: "race-digest",
       };
     },
     async list() {
@@ -281,7 +289,13 @@ test("manager does not settle on the unchanged idle state before a prompt starts
       return "";
     },
     async result() {
-      if (!resultAvailable) throw new Error("no result yet");
+      if (!resultAvailable)
+        return {
+          text: "",
+          sessionPath: "/remote/session.jsonl",
+          status: "pending" as const,
+          reason: "response-not-finalized",
+        };
       return { text: "finished", sessionPath: "/remote/session.jsonl" };
     },
     async pathInfo() {
@@ -325,7 +339,9 @@ test("manager does not settle on the unchanged idle state before a prompt starts
     const transcriptFallback = await manager.refresh(snapshot.id, {
       transcript: true,
     });
-    assert.equal(transcriptFallback.status, "done");
+    // The session does not yet hold the anchored answer: stay pending instead
+    // of accepting a terminal fallback as success.
+    assert.equal(transcriptFallback.status, "working");
     assert.equal(transcriptFallback.finalText, undefined);
 
     resultAvailable = true;
@@ -342,6 +358,7 @@ test("manager does not settle on the unchanged idle state before a prompt starts
 function trackedClient() {
   let current: HerdrAgent | undefined;
   return {
+    preflight,
     async start(options: { name: string }) {
       current = agent(options.name, "working");
       return {
@@ -462,6 +479,7 @@ test("manager tracks settlement and never cancels remote work on dispose", async
   let cancelCalls = 0;
   let closeCalls = 0;
   const client = {
+    preflight,
     async start(options: { name: string }) {
       startedName = options.name;
       return {
@@ -469,6 +487,7 @@ test("manager tracks settlement and never cancels remote work on dispose", async
         paneId: "w2:p1",
         agent: agent(options.name, "idle"),
         prompted: { agent: agent(options.name, "working") },
+        promptDigest: "initial-digest",
       };
     },
     async list() {
@@ -493,7 +512,10 @@ test("manager tracks settlement and never cancels remote work on dispose", async
       return { path: "/remote/project", output: "" };
     },
     async prompt() {
-      return { agent: agent(startedName, currentStatus) };
+      return {
+        agent: agent(startedName, currentStatus),
+        promptDigest: "follow-up-digest",
+      };
     },
     async cancel() {
       cancelCalls++;
@@ -569,6 +591,7 @@ test("manager tracks settlement and never cancels remote work on dispose", async
 function settledClient(id: string) {
   const name = `pi-remote-${id}`;
   return {
+    preflight,
     async start() {
       throw new Error("not used");
     },
@@ -760,6 +783,538 @@ test("marking delivered never steals another session's delivery marker", async (
     const persisted = store.load().find((job) => job.id === "ra-owned");
     assert.equal(persisted?.completionDeliveredTo, undefined);
     assert.equal(persisted?.blockedDeliveredTo, undefined);
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+type ResultOutcome = {
+  text: string;
+  sessionPath: string;
+  status?: "ok" | "error" | "aborted" | "pending" | "truncated";
+  stopReason?: string;
+  errorMessage?: string;
+};
+
+interface ClientScript {
+  read?: () => string;
+  result?: (anchor?: {
+    promptDigest?: string;
+    promptMarker?: string;
+    promptCursor?: number;
+  }) => ResultOutcome | Promise<ResultOutcome>;
+  get?: (name: string) => HerdrAgent;
+  list?: () => HerdrAgent[];
+}
+
+/**
+ * Spawn-capable fake whose reads can fail on demand, so a busy terminal read
+ * can be distinguished from a real SSH failure.
+ */
+function scriptedJobClient(script: ClientScript) {
+  let promptCount = 0;
+  const client = {
+    preflight,
+    script,
+    currentStatus: "working" as HerdrAgentStatus,
+    currentName: "",
+    lastAnchor: undefined as
+      | { promptDigest?: string; promptMarker?: string; promptCursor?: number }
+      | undefined,
+    async start(options: { name: string }) {
+      client.currentName = options.name;
+      client.currentStatus = "working";
+      promptCount++;
+      return {
+        workspaceId: "w9",
+        paneId: "w9:p1",
+        agent: agent(options.name, "idle"),
+        prompted: { agent: agent(options.name, "working") },
+        promptDigest: `digest-${promptCount}`,
+        promptMarker: `marker-${promptCount}`,
+        promptCursor: 0,
+      };
+    },
+    async list() {
+      if (script.list) return script.list();
+      return client.currentName
+        ? [agent(client.currentName, client.currentStatus)]
+        : [];
+    },
+    async get() {
+      if (script.get) return script.get(client.currentName);
+      return agent(client.currentName, client.currentStatus);
+    },
+    async read() {
+      return script.read ? script.read() : "tail";
+    },
+    async result(
+      _target: string,
+      _signal?: AbortSignal,
+      anchor?: {
+        promptDigest?: string;
+        promptMarker?: string;
+        promptCursor?: number;
+      },
+    ) {
+      client.lastAnchor = anchor;
+      if (script.result) return script.result(anchor);
+      return { text: "answer", sessionPath: "/remote/session.jsonl" };
+    },
+    async pathInfo() {
+      return { exists: true, isGitRepository: true };
+    },
+    async cloneProject() {
+      return { path: "/remote/project", output: "" };
+    },
+    async prompt() {
+      client.currentStatus = "working";
+      promptCount++;
+      return {
+        agent: agent(client.currentName, "working"),
+        promptDigest: `digest-${promptCount}`,
+        promptMarker: `marker-${promptCount}`,
+        promptCursor: 0,
+      };
+    },
+    async cancel() {},
+    async close() {},
+  };
+  return client;
+}
+
+async function spawnScriptedJob(
+  client: ReturnType<typeof scriptedJobClient>,
+  directory: string,
+) {
+  const manager = new RemoteAgentManager(
+    config,
+    client,
+    new RemoteJobStore(path.join(directory, "jobs.json")),
+  );
+  await manager.initialize();
+  const snapshot = await manager.spawn({
+    title: "scripted",
+    prompt: "work",
+    localCwd: "/local/project",
+    remoteCwd: "/remote/project",
+  });
+  return { manager, id: snapshot.id };
+}
+
+test("a delayed result from an older generation cannot overwrite a follow-up", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-old-result-"),
+  );
+  let manager: RemoteAgentManager | undefined;
+  let release!: (value: ResultOutcome) => void;
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const deferred = new Promise<ResultOutcome>((resolve) => {
+    release = resolve;
+  });
+  try {
+    const client = scriptedJobClient({
+      result: () => {
+        entered();
+        return deferred;
+      },
+    });
+    const spawned = await spawnScriptedJob(client, directory);
+    manager = spawned.manager;
+    client.currentStatus = "done";
+    const oldRefresh = manager.refresh(spawned.id, { transcript: true });
+    await started;
+    await manager.send(spawned.id, "new request");
+    release({
+      text: "old answer",
+      sessionPath: "/remote/session.jsonl",
+      status: "ok",
+    });
+    await oldRefresh;
+    assert.equal(manager.get(spawned.id)?.status, "working");
+    assert.equal(manager.get(spawned.id)?.finalText, undefined);
+    assert.equal(manager.get(spawned.id)?.promptMarker, "marker-2");
+  } finally {
+    manager?.dispose();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("wait does not settle before the current submission result is finalized", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-wait-pending-test-"),
+  );
+  let manager: RemoteAgentManager | undefined;
+  try {
+    let reads = 0;
+    const client = scriptedJobClient({
+      result: () => {
+        reads++;
+        return reads === 1
+          ? {
+              text: "",
+              sessionPath: "/remote/session.jsonl",
+              status: "pending",
+            }
+          : {
+              text: "current answer",
+              sessionPath: "/remote/session.jsonl",
+              status: "ok",
+            };
+      },
+    });
+    const spawned = await spawnScriptedJob(client, directory);
+    manager = spawned.manager;
+    client.currentStatus = "done";
+    const snapshot = await manager.wait(spawned.id);
+    assert.equal(snapshot.status, "done");
+    assert.equal(snapshot.finalText, "current answer");
+    assert.equal(reads, 2);
+    assert.notEqual(snapshot.completionDelivered, true);
+  } finally {
+    manager?.dispose();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a busy alternate-screen read is best-effort, not a health failure", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-busy-read-test-"),
+  );
+  try {
+    const client = scriptedJobClient({
+      read: () => {
+        throw new Error(
+          '{"error":{"code":"agent_not_idle","message":"agent is busy"}}',
+        );
+      },
+      result: () => ({
+        text: "current answer",
+        sessionPath: "/remote/session.jsonl",
+        status: "ok",
+      }),
+    });
+    const { manager, id } = await spawnScriptedJob(client, directory);
+    client.currentStatus = "done";
+    const snapshot = await manager.refresh(id, { transcript: true });
+    assert.equal(snapshot.status, "done");
+    assert.equal(snapshot.errorText, undefined);
+    assert.equal(snapshot.transcript, "");
+    assert.equal(snapshot.finalText, "current answer");
+    assert.deepEqual(client.lastAnchor, {
+      promptDigest: "digest-1",
+      promptMarker: "marker-1",
+      promptCursor: 0,
+    });
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a transcript transport failure is not masked as a healthy job", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-transcript-health-test-"),
+  );
+  try {
+    const client = scriptedJobClient({
+      read: () => {
+        throw new Error("ssh: connect to host macmini port 22: Broken pipe");
+      },
+    });
+    const { manager, id } = await spawnScriptedJob(client, directory);
+    await assert.rejects(
+      () => manager.refresh(id, { transcript: true }),
+      /Broken pipe/,
+    );
+    const snapshot = manager.get(id)!;
+    assert.equal(snapshot.status, "unreachable");
+    assert.match(snapshot.errorText ?? "", /Broken pipe/);
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a true SSH failure still marks the job unreachable and rejects", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-ssh-failure-test-"),
+  );
+  try {
+    const client = scriptedJobClient({});
+    const { manager, id } = await spawnScriptedJob(client, directory);
+    client.script.get = () => {
+      throw new Error("ssh: connect to host macmini port 22: No route to host");
+    };
+    await assert.rejects(
+      () => manager.refresh(id, { transcript: true }),
+      /No route to host/,
+    );
+    const snapshot = manager.get(id)!;
+    assert.equal(snapshot.status, "unreachable");
+    assert.match(snapshot.errorText ?? "", /No route to host/);
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a follow-up prompt never reuses the previous answer as its result", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-stale-answer-test-"),
+  );
+  try {
+    const client = scriptedJobClient({
+      result: (anchor) => ({
+        text:
+          anchor?.promptDigest === "digest-1" ? "first answer" : "wrong run",
+        sessionPath: "/remote/session.jsonl",
+        status: "ok",
+      }),
+    });
+    const { manager, id } = await spawnScriptedJob(client, directory);
+    client.currentStatus = "done";
+    assert.equal(
+      (await manager.refresh(id, { transcript: true })).finalText,
+      "first answer",
+    );
+
+    // The new generation accepted its prompt but the session file still holds
+    // only the first answer: the helper reports pending, and the manager must
+    // not fall back to success or the previous text.
+    client.script.result = () => ({
+      text: "",
+      sessionPath: "/remote/session.jsonl",
+      status: "pending",
+      reason: "prompt-not-recorded",
+    });
+    await manager.send(id, "continue with the follow-up");
+    assert.equal(manager.get(id)?.finalText, undefined);
+    client.currentStatus = "done";
+    const snapshot = await manager.refresh(id, { transcript: true });
+    assert.equal(snapshot.status, "working");
+    assert.equal(snapshot.settledAt, undefined);
+    assert.equal(snapshot.finalText, undefined);
+    assert.equal(snapshot.transcript, "tail");
+    assert.deepEqual(client.lastAnchor, {
+      promptDigest: "digest-2",
+      promptMarker: "marker-2",
+      promptCursor: 0,
+    });
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an unbound submission fails after the grace window instead of using the terminal fallback", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-pending-expired-test-"),
+  );
+  const store = new RemoteJobStore(path.join(directory, "jobs.json"));
+  seedJob(store, "ra-pending", {
+    status: "done",
+    promptDigest: "pending-digest",
+    promptCursor: 0,
+    resultMissingSince: Date.now() - 200_000,
+  });
+  const client = scriptedJobClient({
+    result: () => ({
+      text: "",
+      sessionPath: "/remote/session.jsonl",
+      status: "pending",
+      reason: "response-not-finalized",
+    }),
+  });
+  client.currentStatus = "done";
+  try {
+    const manager = new RemoteAgentManager(config, client, store);
+    await manager.initialize();
+    const snapshot = await manager.refresh("ra-pending", { transcript: true });
+    assert.equal(snapshot.status, "failed");
+    assert.equal(snapshot.finalText, undefined);
+    assert.match(snapshot.errorText ?? "", /bound assistant result/);
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a legacy pre-anchor job never claims an extracted result", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-legacy-anchor-test-"),
+  );
+  const store = new RemoteJobStore(path.join(directory, "jobs.json"));
+  seedJob(store, "ra-legacy-anchor", { status: "done" });
+  const client = scriptedJobClient({
+    result: () => ({
+      text: "possibly stale answer",
+      sessionPath: "/remote/session.jsonl",
+      status: "ok",
+    }),
+  });
+  client.currentStatus = "done";
+  try {
+    const manager = new RemoteAgentManager(config, client, store);
+    await manager.initialize();
+    const snapshot = await manager.refresh("ra-legacy-anchor", {
+      transcript: true,
+    });
+    assert.equal(snapshot.status, "done");
+    assert.equal(snapshot.finalText, undefined);
+    assert.equal(client.lastAnchor, undefined);
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a truncated response is a failure, not a successful result", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-truncated-test-"),
+  );
+  try {
+    const client = scriptedJobClient({
+      result: () => ({
+        text: "half an answer",
+        sessionPath: "/remote/session.jsonl",
+        status: "truncated",
+        stopReason: "length",
+      }),
+    });
+    const { manager, id } = await spawnScriptedJob(client, directory);
+    client.currentStatus = "done";
+    const snapshot = await manager.refresh(id, { transcript: true });
+    assert.equal(snapshot.status, "failed");
+    assert.equal(snapshot.finalText, undefined);
+    assert.match(snapshot.errorText ?? "", /truncated/);
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a structured-result transport failure marks the job unreachable", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-result-transport-test-"),
+  );
+  try {
+    const client = scriptedJobClient({
+      result: () => {
+        throw new Error(
+          "ssh: connect to host macmini port 22: No route to host",
+        );
+      },
+    });
+    const { manager, id } = await spawnScriptedJob(client, directory);
+    client.currentStatus = "done";
+    await assert.rejects(
+      () => manager.refresh(id, { transcript: true }),
+      /No route to host/,
+    );
+    assert.equal(manager.get(id)?.status, "unreachable");
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("failed and aborted responses are never accepted as successful results", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-failed-result-test-"),
+  );
+  try {
+    const client = scriptedJobClient({
+      result: () => ({
+        text: "",
+        sessionPath: "/remote/session.jsonl",
+        status: "error",
+        stopReason: "error",
+        errorMessage: "provider unavailable",
+      }),
+    });
+    const { manager, id } = await spawnScriptedJob(client, directory);
+    client.currentStatus = "done";
+    const failed = await manager.refresh(id, { transcript: true });
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.finalText, undefined);
+    assert.match(failed.errorText ?? "", /provider unavailable/);
+
+    client.script.result = () => ({
+      text: "partial answer",
+      sessionPath: "/remote/session.jsonl",
+      status: "aborted",
+      stopReason: "aborted",
+    });
+    await manager.send(id, "try again");
+    client.currentStatus = "done";
+    const aborted = await manager.refresh(id, { transcript: true });
+    assert.equal(aborted.status, "failed");
+    assert.equal(aborted.finalText, undefined);
+    assert.match(aborted.errorText ?? "", /aborted/);
+
+    await manager.send(id, "try once more");
+    client.currentStatus = "done";
+    const cancelled = await manager.cancel(id);
+    assert.equal(cancelled.status, "cancelled");
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a disconnect-marked job reconciles back to its live state", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-reconnect-test-"),
+  );
+  const store = new RemoteJobStore(path.join(directory, "jobs.json"));
+  seedJob(store, "ra-offline", {
+    status: "unreachable",
+    promptDigest: "recovered-digest",
+    promptCursor: 0,
+  });
+  const client = scriptedJobClient({
+    list: () => [agent("pi-remote-ra-offline", "done")],
+    result: () => ({
+      text: "recovered answer",
+      sessionPath: "/remote/session.jsonl",
+      status: "ok",
+    }),
+  });
+  client.currentStatus = "done";
+  try {
+    const manager = new RemoteAgentManager(config, client, store);
+    const settled: string[] = [];
+    manager.setOnSettled((snapshot) => settled.push(snapshot.id));
+    await manager.initialize();
+    assert.equal(manager.get("ra-offline")?.status, "done");
+    assert.deepEqual(settled, ["ra-offline"]);
+    const snapshot = await manager.refresh("ra-offline", { transcript: true });
+    assert.equal(snapshot.finalText, "recovered answer");
+    manager.dispose();
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a job whose agent vanished after a reboot stays unknown without a completion", async () => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "remote-manager-reboot-test-"),
+  );
+  const store = new RemoteJobStore(path.join(directory, "jobs.json"));
+  seedJob(store, "ra-gone", { status: "working", settledAt: undefined });
+  const client = scriptedJobClient({ list: () => [] });
+  try {
+    const manager = new RemoteAgentManager(config, client, store);
+    const settled: string[] = [];
+    manager.setOnSettled((snapshot) => settled.push(snapshot.id));
+    await manager.initialize();
+    assert.equal(manager.get("ra-gone")?.status, "unknown");
+    assert.deepEqual(settled, []);
     manager.dispose();
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });

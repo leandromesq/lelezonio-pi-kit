@@ -331,7 +331,11 @@ test("dispose during a slow attach settles the late pane and never publishes it"
   assert.equal(await coordinator.takeOver("bt-1"), false);
 });
 
-test("the attach deadline bounds a hung open, stops the late pane, and blocks re-attach", async () => {
+test("the attach deadline bounds a hung open, stops the late pane, and blocks re-attach", async (t) => {
+  // The production deadline is intentionally unref'ed. This fake controller
+  // has no real process/socket to keep Node alive while we await that timer.
+  const keepAlive = setInterval(() => {}, 1_000);
+  t.after(() => clearInterval(keepAlive));
   const late = fakeHandle();
   const gated = gatedController();
   const coordinator = createTerminalObserverCoordinator({

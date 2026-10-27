@@ -23,6 +23,33 @@ test("registers the session hook and title model command", () => {
   assert.deepEqual(commands, new Set(["title-model", "title-naming"]));
 });
 
+test("custom-message runs do not attempt automatic naming", () => {
+  let beforeStart: ((event: unknown, ctx: unknown) => void) | undefined;
+  const api = {
+    on: (event: string, handler: (event: unknown, ctx: unknown) => void) => {
+      if (event === "before_agent_start") beforeStart = handler;
+    },
+    registerCommand: () => {},
+    getSessionName: () => {
+      throw new Error("custom messages must not enter the naming flow");
+    },
+  } as unknown as ExtensionAPI;
+  autoNamingExtension(api);
+  assert.ok(beforeStart);
+  beforeStart(
+    {
+      type: "before_agent_start",
+      messageType: "custom",
+      message: {
+        customType: "background-result",
+        content: "Done",
+        display: true,
+      },
+    },
+    { mode: "tui" },
+  );
+});
+
 const userMessage = { type: "message", message: { role: "user" } } as const;
 const assistantMessage = {
   type: "message",

@@ -186,7 +186,7 @@ npm run format:check
 ```
 
 Individual extensions also expose focused `check` and `test` scripts. Pi development
-packages are pinned to 1.0.4; keep them aligned with the installed runtime when upgrading.
+packages are pinned to 1.3.0; keep them aligned with the installed runtime when upgrading.
 `npm run test:runtime` runs isolated SDK child smoke tests against the installed Pi rather
 than the local dependency. It is also part of `npm test`.
 

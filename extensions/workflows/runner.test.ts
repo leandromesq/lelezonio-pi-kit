@@ -180,7 +180,11 @@ test("in-flight aborted tool calls retain start timing without completion", () =
   );
 });
 
-test("first-response watchdog aborts a silent provider request", async () => {
+test("first-response watchdog aborts a silent provider request", async (t) => {
+  // A mocked request owns no socket; keep the loop alive for the production
+  // watchdog's intentionally unref'ed timer, even when this test runs alone.
+  const keepAlive = setInterval(() => {}, 1_000);
+  t.after(() => clearInterval(keepAlive));
   let aborted = false;
   const watchdog = createFirstResponseWatchdog(
     async () => {

@@ -2,31 +2,29 @@
 
 Persistent remote Pi agents on the Tailscale-connected `macmini`, managed through Herdr.
 
-## Verified environment
+## Runtime environment
 
-- SSH alias: `macmini`
-- Local SSH client: `ssh`
-- Remote OS: NixOS Linux (`x86_64`) reached through the `macmini` Tailscale/SSH alias
-- Remote Herdr: `~/.local/bin/herdr` (`0.8.2`, protocol 20), kept running by the enabled `herdr-server.service` user unit
-- Remote Python and Git: resolved from the SSH environment's `PATH`
-- Remote Pi: `~/.local/bin/pi` (`0.84.3`), authenticated from the remote machine's existing Codex OAuth session
-- The SSH helper prepends `~/.local/bin` so NixOS batch shells can find Herdr and Pi.
+The extension does not pin remote versions. Before every spawn it runs a
+read-only preflight through the helper and reports the resolved Python, Pi and
+Herdr paths and versions, the Herdr server state (running, version, protocol),
+and the helper's working directory. Nothing from the remote environment is
+dumped, and no version mismatch rejects a job; the report exists so a stale or
+shadowed binary is visible instead of silently used.
 
-The Phase 0 spike verified this sequence over batch-mode SSH:
+The helper's tool path prefers the NixOS user profile
+(`/etc/profiles/per-user/<user>/bin`) when it exists and otherwise falls back to
+`~/.local/bin`, so the helper uses the same Python/Pi/Herdr as the login shell
+instead of a legacy copy. Both directories stay on `PATH`, so older hosts keep
+working.
 
-1. `herdr workspace create --cwd ... --label ... --no-focus`
-2. Wait for the root pane to reach an available shell.
-3. `herdr agent start <name> --kind pi --pane <id>`
-4. `herdr agent prompt <name> <text>`
-5. `herdr agent get/read/wait`
-6. `herdr workspace close <id>`
-
-Herdr workspace creation can return before its root pane is ready. The remote helper retries only the `agent_pane_busy` failure for up to 15 seconds.
+Remote OS, SSH alias and the authentication of the remote Pi are host
+configuration, not extension configuration; see the host setup for their
+current values.
 
 ## Architecture
 
 - `transport.ts`: bounded, cancellable, batch-mode SSH with JSON stdin.
-- `remote/helper.py`: owner-only remote adapter that invokes Herdr without interpolating prompts into a shell.
+- `remote/helper.py`: owner-only remote adapter that invokes Herdr without interpolating prompts into a shell, extracts the current submission's result from the Pi session file, and reports the preflight environment.
 - `herdr-client.ts`: typed Herdr operations.
 - `manager.ts`: persistent job registry, polling, reconciliation, structured result collection, completion delivery, and synchronous UI read model.
 - `context.ts`: bounded context capsule with common credential redaction.
@@ -48,9 +46,15 @@ Optional global configuration: `~/.pi/agent/remote-agents.json`.
   "openRemoteUiOnSpawn": true,
   "terminalExecutable": "kitty",
   "pollIntervalMs": 3000,
-  "maxConcurrent": 3
+  "maxConcurrent": 2
 }
 ```
+
+`maxConcurrent` defaults to `2`; an explicit value in the file is honored. The
+limit is a conservative default for a small host: each job is a full Pi process
+and its tools may run CPU/RAM-heavy work. It is not a host-wide scheduler;
+coordinate heavy builds separately. Busy alternate-screen history is a Herdr
+read constraint, not evidence that concurrency itself caused overload.
 
 Local Git repositories resolve by repository name beneath `projectsRoot`; working subdirectories are preserved. Missing projects require explicit approval before cloning from the local origin. Non-Git jobs use `worktreesRoot`, and only one active writer is permitted per Git project.
 
@@ -77,7 +81,37 @@ Tools:
 
 - Local and remote project files are not synchronized automatically.
 - No automatic Git worktree, bundle, push, merge, or result import.
-- Completed Pi jobs return the latest finalized assistant text extracted from the remote JSONL session. Sanitized Herdr terminal output remains the fallback and live takeover view.
+- Each new submission carries a random marker in its prompt. That marker,
+  its digest and the session cursor are persisted with the job generation.
+  Extraction selects its user entry on the active session branch and excludes
+  later submissions; delayed replies from an older generation cannot overwrite
+  a follow-up. A prompt/answer not yet flushed stays pending rather than using
+  an older answer. `remote_wait` also waits for this result validation.
+- A normal final response is accepted; `error` fails the job, `length` is a
+  truncated failure, and `aborted` becomes `cancelled` if cancellation was
+  requested or `failed` otherwise. Unfinished tool turns are pending. Legacy
+  sessions lacking stopReason retain the documented text-only policy.
+- Only legacy jobs without anchors or Herdr versions without a session path
+  use sanitized terminal output as a completion fallback; this is unverified
+  terminal evidence, not a submission-bound structured answer. New anchored
+  jobs with pending results never use stale terminal output as success. The
+  terminal also remains available as the live takeover view. A
+  `--source recent-unwrapped` read on a busy alternate-screen agent returns
+  `agent_not_idle`; the helper retries that one error with the visible screen,
+  and the manager keeps the previous transcript and a healthy status if even
+  that read fails. Other Herdr and SSH failures stay failures.
 - Settled workspaces remain available for inspection until deleted with `d` or cleaned with `/remote-clean`.
 - Blocked-agent questions are delivered once to the parent session and can be answered with `remote_send`.
 - Common credential shapes are redacted, but users must still avoid placing secrets in delegated context.
+
+## Disconnect versus reboot
+
+A network or SSH disconnect is not a job failure. The manager keeps polling a job
+it cannot reach, marks it `unreachable` without settling it, and returns it to
+its live `working`/`done` state when the host answers again; reconciliation on
+the next Pi session start does the same from the registry. A reboot is
+different: the Herdr server and the remote Pi processes are gone, so
+reconciliation no longer finds the stable agent name and marks the job
+`unknown`, and the next refresh confirms the agent is gone (`failed`). No
+completion is invented from stale terminal output, and the interrupted run is
+not resumed automatically.

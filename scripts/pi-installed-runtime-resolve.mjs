@@ -139,6 +139,19 @@ function runtimeFromExecutable(executable, source) {
   if (directRoot) {
     return { root: directRoot, runtime: tryBuildRuntime(directRoot, source) };
   }
+  // Nix buildNpmPackage installs a shell/native wrapper in bin/ and the SDK
+  // in this sibling prefix. Resolve after realpath so Home Manager symlinks
+  // work too; validate the manifest rather than executing a launcher.
+  const nixRoot = path.resolve(
+    path.dirname(real),
+    "..",
+    "lib",
+    "node_modules",
+    "pi-monorepo",
+  );
+  if (readManifest(nixRoot)?.name === PI_PACKAGE_NAME) {
+    return { root: nixRoot, runtime: tryBuildRuntime(nixRoot, source) };
+  }
   // npm/scoop shims: a small text wrapper naming the CLI entry.
   if ((statType(executable)?.size ?? 0) > MAX_SHIM_BYTES) return null;
   try {
