@@ -17,7 +17,7 @@ This repository is the setup itself. It is **not an npm package or Pi package**â
 - Native `grep`, `find`, and `ls` tools, with Pi-managed rg/fd provisioning
 - Default-off Playwright browser tools for live web-app debugging
 - Composable one-turn prompt snippets via `Alt+S`
-- YouTube transcript extraction through a cross-platform skill
+- YouTube transcript extraction lives in [agent-skills](https://github.com/leandromesq/agent-skills), which links it into Pi
 - Git status, changed-file browser, PR information, `/yeet`, and guarded `/git <target-branch>` workflows
 - Height-aware multiple-choice `ask_user` tool with scrollable context and expandable descriptions
 - `/kit` control centre and `/perf` lightweight runtime diagnostics
